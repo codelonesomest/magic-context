@@ -187,6 +187,29 @@ describe("subagent-runner pure helpers", () => {
 		).toEqual({ text: null, stopReason: null, errorMessage: null });
 	});
 
+	it("detects OMP from either the command or host CLI prefix", () => {
+		expect(
+			__test.isOmpInvocation({
+				command: "/usr/local/bin/omp",
+				prefixArgs: [],
+			}),
+		).toBe(true);
+		expect(
+			__test.isOmpInvocation({
+				command: "/usr/local/bin/bun",
+				prefixArgs: [
+					"/opt/oh-my-pi-v16.5.0/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+				],
+			}),
+		).toBe(true);
+		expect(
+			__test.isOmpInvocation({
+				command: "/usr/local/bin/pi",
+				prefixArgs: [],
+			}),
+		).toBe(false);
+	});
+
 	it("builds argv with system prompt, primary model, and prompt last", () => {
 		expect(
 			buildArgsForTest({
@@ -1024,6 +1047,51 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		);
 		child.emitClose(0);
 		await resultPromise;
+	});
+
+	it("delivers every OMP user message through a temporary @file", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			piBinary: "/usr/local/bin/omp",
+			platform: "darwin",
+		});
+		const userMessage = "small OMP historian prompt";
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+			userMessage,
+		});
+
+		const spawnArgs = spawnImpl.mock.calls[0]?.[1] as string[] | undefined;
+		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
+			| { stdio?: [string, string, string] }
+			| undefined;
+		expect(spawnArgs).toBeDefined();
+		expect(spawnArgs).not.toContain("--no-prompt-templates");
+		expect(spawnArgs).not.toContain("--no-context-files");
+		expect(spawnArgs).not.toContain(userMessage);
+		const userPromptArg = spawnArgs?.find((arg) => arg.startsWith("@"));
+		const userPromptPath = requirePromptPath(userPromptArg?.slice(1));
+		expect(readFileSync(userPromptPath, "utf8")).toBe(userMessage);
+		expect(spawnOptions?.stdio).toEqual(["ignore", "pipe", "pipe"]);
+		expect(child.stdinText).toBe("");
+
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		expect(await resultPromise).toMatchObject({
+			ok: true,
+			assistantText: "done",
+		});
+		expect(existsSync(userPromptPath)).toBe(false);
 	});
 
 	it("keeps small linux user messages positional", async () => {
