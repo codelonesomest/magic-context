@@ -1,29 +1,65 @@
 /**
  * Unified `setup` command.
  *
- * Resolves the harness target via `--harness` flag or auto-detection
- * (`resolveAdaptersForCommand`), then dispatches to the per-harness
- * setup wizard. We deliberately reuse the existing per-harness
- * setup flows (`setup-opencode.ts` and `setup-pi.ts`) instead of
- * collapsing them into a generic flow because each harness has
- * meaningfully different prompts (OpenCode picks historian models +
- * checks for DCP/OMO conflicts; Pi prompts for Pi version compat
- * + thinking_level for Copilot models).
+ * Resolves the harness target via `--harness` flag or auto-detection. OpenCode
+ * and Pi continue through their existing adapters and setup wizards. OMP is an
+ * explicit fork-only target with its own plugin-link and model-discovery flow,
+ * so none of its installation behavior leaks into native Pi or OpenCode.
  */
 import type { HarnessAdapter } from "../adapters/types";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { intro, log, note, outro } from "../lib/prompts";
 import { runSetup as runOpenCodeSetup } from "./setup-opencode";
 import { runSetup as runPiSetup } from "./setup-pi";
+import { runSetup as runOmpSetup } from "./setup-omp";
+
+export interface OmpSetupOptions {
+    dryRun: boolean;
+    pluginPath: string | undefined;
+}
+
+export function parseOmpSetupOptions(argv: string[]): OmpSetupOptions | null {
+    const harnessIndex = argv.indexOf("--harness");
+    if (harnessIndex === -1 || argv[harnessIndex + 1] !== "omp") return null;
+
+    const pluginPathIndex = argv.indexOf("--plugin-path");
+    const pluginPathValue =
+        pluginPathIndex === -1 ? undefined : argv[pluginPathIndex + 1];
+    return {
+        dryRun: argv.includes("--dry-run"),
+        pluginPath: pluginPathValue?.startsWith("--") ? undefined : pluginPathValue,
+    };
+}
 
 export async function runSetup(argv: string[]): Promise<number> {
     const dryRun = argv.includes("--dry-run");
     intro(dryRun ? "Magic Context setup (dry run)" : "Magic Context setup");
 
+    const ompSetupOptions = parseOmpSetupOptions(argv);
+    if (ompSetupOptions) {
+        log.step("Configuring OMP (@cortexkit/pi-magic-context OMP fork)…");
+        const code = await runOmpSetup(ompSetupOptions);
+        if (code !== 0) {
+            outro("Setup finished with warnings — see above.");
+            return code;
+        }
+        if (!dryRun) {
+            note(
+                [
+                    "Restart your OMP session so the linked extension registers.",
+                    "Verify with: omp plugin doctor, then /ctx-status",
+                ].join("\n"),
+                "Next steps",
+            );
+        }
+        outro(dryRun ? "Dry run done — no changes were made." : "Done.");
+        return 0;
+    }
+
     let adapters: HarnessAdapter[];
     try {
         adapters = await resolveAdaptersForCommand(argv, {
-            // Both harness wizards write the same Magic Context config. Keep setup
+            // Every harness wizard writes the same Magic Context config. Keep setup
             // single-target until shared choices are collected once and registration
             // is split into harness-specific phases.
             allowMulti: false,
