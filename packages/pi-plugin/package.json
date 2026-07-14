@@ -1,6 +1,6 @@
 {
 	"name": "@cortexkit/pi-magic-context",
-	"version": "0.32.0",
+	"version": "0.32.0-omp.1",
 	"type": "module",
 	"description": "Pi coding agent extension for Magic Context — cross-session memory and context management",
 	"main": "dist/index.js",
@@ -18,7 +18,7 @@
 	],
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/cortexkit/magic-context",
+		"url": "https://github.com/codelonesomest/magic-context",
 		"directory": "packages/pi-plugin"
 	},
 	"files": [
