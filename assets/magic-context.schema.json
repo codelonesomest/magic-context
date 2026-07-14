@@ -1223,6 +1223,30 @@
         }
       }
     },
+    "omp": {
+      "default": {
+        "tools": {
+          "ctx_note": true
+        }
+      },
+      "description": "OMP-only tool registration controls. These settings do not change native Pi or OpenCode.",
+      "type": "object",
+      "properties": {
+        "tools": {
+          "default": {
+            "ctx_note": true
+          },
+          "type": "object",
+          "properties": {
+            "ctx_note": {
+              "default": true,
+              "description": "OMP only: register the ctx_note tool. Set false to remove ctx_note from new OMP sessions. Native Pi and OpenCode are unaffected. Requires a new OMP session.",
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
     "todowrite": {
       "default": {
         "enabled": true,
