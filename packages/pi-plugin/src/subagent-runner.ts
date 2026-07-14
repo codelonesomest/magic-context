@@ -70,6 +70,16 @@ interface PiInvocation {
 	prefixArgs: string[];
 }
 
+const OMP_INVOCATION_PATTERN =
+	/(?:oh-my-pi|(?:^|[\\/])omp(?:\.exe)?(?:[\\/]|$))/i;
+
+function isOmpInvocation(invocation: PiInvocation): boolean {
+	return [invocation.command, ...invocation.prefixArgs].some((arg) =>
+		OMP_INVOCATION_PATTERN.test(arg),
+	);
+}
+
+
 /**
  * Resolve how to spawn a Pi subagent, robust across POSIX and Windows.
  *
@@ -727,49 +737,61 @@ export class PiSubagentRunner implements SubagentRunner {
 			);
 		}
 
-		// Large prompts (e.g. a ~50K-token historian chunk ≈ 200 KB) overflow
-		// Linux's per-argv-entry limit (MAX_ARG_STRLEN, 128 KiB) and make spawn()
-		// fail with E2BIG. Windows is stricter: CreateProcess caps the ENTIRE
-		// command line at 32,767 chars, so even small user prompts should stay out
-		// of argv there to leave room for flags and the temp-file system prompt.
-		// Pi's print mode concatenates stdin into the initial message, so when we
-		// pipe the prompt we must omit the positional argv to avoid duplication.
+		// Pi accepts small user messages positionally and oversized messages on
+		// stdin. OMP does not implement that stdin contract reliably and may also
+		// corrupt positional historian prompts. Its supported `@file` input keeps
+		// every prompt byte-exact while avoiding argv limits.
+		const isOmpHost = isOmpInvocation(this.invocation);
 		const promptBytes = Buffer.byteLength(options.userMessage, "utf8");
+		const usePromptFile = isOmpHost;
 		const deliverViaStdin =
-			promptBytes > PROMPT_ARGV_MAX_BYTES || this.platform === "win32";
-		let systemPromptTempDir: string | undefined;
+			!usePromptFile &&
+			(promptBytes > PROMPT_ARGV_MAX_BYTES || this.platform === "win32");
+		let promptTempDir: string | undefined;
 		let systemPromptPath: string | undefined;
-		const cleanupSystemPromptFile = () => {
-			if (!systemPromptTempDir) return;
-			const tempDir = systemPromptTempDir;
-			systemPromptTempDir = undefined;
+		let userPromptPath: string | undefined;
+		const cleanupPromptFiles = () => {
+			if (!promptTempDir) return;
+			const tempDir = promptTempDir;
+			promptTempDir = undefined;
 			systemPromptPath = undefined;
+			userPromptPath = undefined;
 			try {
 				rmSync(tempDir, { recursive: true, force: true });
 			} catch {
 				// Temp-file cleanup is best-effort and must never mask the run result.
 			}
 		};
-		if (options.systemPrompt.length > 0) {
+		if (options.systemPrompt.length > 0 || usePromptFile) {
 			try {
-				systemPromptTempDir = mkdtempSync(join(tmpdir(), "mc-pi-prompt-"));
-				systemPromptPath = join(systemPromptTempDir, "system-prompt.txt");
-				writeFileSync(systemPromptPath, options.systemPrompt, "utf8");
+				promptTempDir = mkdtempSync(join(tmpdir(), "mc-pi-prompt-"));
+				if (options.systemPrompt.length > 0) {
+					systemPromptPath = join(promptTempDir, "system-prompt.txt");
+					writeFileSync(systemPromptPath, options.systemPrompt, "utf8");
+				}
+				if (usePromptFile) {
+					userPromptPath = join(promptTempDir, "user-prompt.txt");
+					writeFileSync(userPromptPath, options.userMessage, "utf8");
+				}
 			} catch (error) {
-				cleanupSystemPromptFile();
+				cleanupPromptFiles();
 				return failBeforeSpawn(
 					"spawn_failed",
-					`failed to prepare pi system prompt file: ${error instanceof Error ? error.message : String(error)}`,
+					`failed to prepare Pi/OMP prompt files: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
 		}
 		const args = buildArgs(options, {
 			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
 			subagentExtensions: this.subagentExtensions,
-			omitPositionalMessage: deliverViaStdin,
+			omitPiOnlyContextFlags: isOmpHost,
+			omitPositionalMessage: deliverViaStdin || usePromptFile,
 			systemPromptPath,
 			modelRef: modelRefOverride,
 		});
+		if (usePromptFile && userPromptPath) {
+			args.push(`@${userPromptPath}`);
+		}
 
 		// The model spec is `provider/model` — Pi accepts that directly via
 		// `--model provider/id` (no separate `--provider` flag needed). When a
@@ -786,7 +808,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
 				settled = true;
-				cleanupSystemPromptFile();
+				cleanupPromptFiles();
 				// recordAccounting must never block resolution: a throw here (e.g.
 				// a DB write failure during token accounting) would leave the
 				// promise unresolved and hang the caller (historian/dreamer/
@@ -837,7 +859,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					},
 				);
 			} catch (error) {
-				cleanupSystemPromptFile();
+				cleanupPromptFiles();
 				settle({
 					ok: false,
 					reason: "spawn_failed",
@@ -1471,15 +1493,15 @@ export const PROMPT_ARGV_MAX_BYTES = 96 * 1024;
  * messages, so the user prompt must come last.
  *
  * When `omitPositionalMessage` is set, the user prompt is NOT appended as a
- * positional — the caller delivers it via piped stdin instead (oversized prompt
- * path, or all win32 runs). Pi concatenates stdin + positional, so the
- * positional MUST be omitted when piping or the prompt would be duplicated.
+ * positional. The caller delivers it through Pi's stdin contract or OMP's
+ * `@file` contract; including both would duplicate the prompt.
  */
 export function buildArgs(
 	options: SubagentRunOptions,
 	opts?: {
 		disableDiscoveredExtensions?: boolean;
 		subagentExtensions?: readonly string[];
+		omitPiOnlyContextFlags?: boolean;
 		omitPositionalMessage?: boolean;
 		subagentEntryPath?: string;
 		systemPromptPath?: string;
@@ -1501,22 +1523,21 @@ export function buildArgs(
 		// real LLM rounds the user pays for.
 		"--no-session",
 		// Extension discovery is enabled by default so provider extensions can
-		// register their models. A configured user allowlist adds --no-extensions
-		// below and explicitly loads only its entries. Prevent recursive startup by
-		// setting MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes
-		// the main entry exit early before registering hooks, tools, or timers.
-		// Disable skills and prompt templates because subagents only need a minimal
-		// startup path.
+		// register their models and the Pi extension can expose optional read tools.
+		// A configured user allowlist adds --no-extensions below and explicitly
+		// loads only its entries. Prevent recursive startup by setting
+		// MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes the
+		// main entry exit early before registering hooks, tools, or timers.
+		// Disable skills for the minimal child startup path; native Pi also disables
+		// prompt templates and context files below, while OMP omits those unsupported
+		// Pi-only flags.
 		"--no-skills",
-		"--no-prompt-templates",
-		// Hidden one-shot subagents must receive EXACTLY the system prompt we built.
-		// Pi otherwise appends AGENTS.md / CLAUDE.md project context files, which
-		// pollutes the prompt and adds avoidable startup work.
-		"--no-context-files",
-		// --no-tools is applied below only for unknown or explicitly zero-tool agents.
-		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
-		// discovered extension registry cannot leak unrelated tools into subagents.
 	];
+	if (!opts?.omitPiOnlyContextFlags) {
+		// Native Pi supports both isolation flags. OMP rejects them, so its host
+		// adapter omits them while retaining the rest of the child isolation.
+		args.push("--no-prompt-templates", "--no-context-files");
+	}
 	if (
 		opts?.disableDiscoveredExtensions ||
 		opts?.subagentExtensions !== undefined
@@ -1766,6 +1787,7 @@ function terminateChild(child: ReturnType<typeof childProcess.spawn>) {
 export const __test = {
 	buildArgs,
 	extractFinalAssistant,
+	isOmpInvocation,
 	parsePiEventLine,
 	terminateChild,
 	DREAMER_ACTION_AGENTS,
