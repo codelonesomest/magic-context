@@ -37,6 +37,27 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 		}
 	});
 
+	it("omits disabled OMP memory and note tool guidance", () => {
+		const db = createTestDb();
+		try {
+			const block = buildMagicContextBlock({
+				db,
+				cwd: tempDir("pi-disabled-tools-"),
+				sessionId: "ses-disabled-tools",
+				memoryEnabled: false,
+				ctxNoteEnabled: false,
+				includeGuidance: true,
+			});
+
+			expect(block).not.toContain("ctx_memory");
+			expect(block).not.toContain("ctx_note");
+			expect(block).toContain("ctx_search");
+			expect(block).toContain("ctx_expand");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("does not render project-docs, user-profile, or key-files in the system prompt", () => {
 		const db = createTestDb();
 		const cwd = tempDir("pi-system-v2-");

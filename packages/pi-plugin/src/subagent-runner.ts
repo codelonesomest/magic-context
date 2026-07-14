@@ -137,6 +137,11 @@ function resolvePiInvocation(): PiInvocation {
 	return { command: "pi", prefixArgs: [] };
 }
 
+/** True when the current in-process Pi extension is hosted by OMP. */
+export function isOmpHostProcess(): boolean {
+	return isOmpInvocation(resolvePiInvocation());
+}
+
 /**
  * Resolve the path to the lean subagent extension entry that gets loaded
  * inside spawned Pi child processes. The bundle ships at

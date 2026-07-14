@@ -36,6 +36,11 @@ describe("MagicContextConfigSchema", () => {
                     enabled: true,
                     overlay: true,
                 },
+                omp: {
+                    tools: {
+                        ctx_note: true,
+                    },
+                },
             });
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
@@ -76,6 +81,11 @@ describe("MagicContextConfigSchema", () => {
                 todowrite: {
                     enabled: false,
                     overlay: false,
+                },
+                omp: {
+                    tools: {
+                        ctx_note: true,
+                    },
                 },
                 smart_drops: false,
                 shadow_embedding: {
@@ -185,6 +195,14 @@ describe("MagicContextConfigSchema", () => {
             expect(MagicContextConfigSchema.parse({ auto_update: false }).auto_update).toBe(false);
             expect(MagicContextConfigSchema.parse({ auto_update: true }).auto_update).toBe(true);
         });
+        it("can disable the OMP ctx_note tool", () => {
+            const result = MagicContextConfigSchema.parse({
+                omp: { tools: { ctx_note: false } },
+            });
+
+            expect(result.omp.tools.ctx_note).toBe(false);
+        });
+
 
         it("accepts an explicitly configured Pi subagent extension allowlist", () => {
             expect(

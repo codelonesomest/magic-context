@@ -92,6 +92,27 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
+	it("can omit ctx_note while retaining other session-scoped tools", () => {
+		const db = createTestDb();
+		try {
+			const registered: string[] = [];
+			const pi = {
+				registerTool: (tool: { name: string }) => registered.push(tool.name),
+				registerCommand: () => undefined,
+			} as never;
+
+			registerMagicContextTools(pi, { db, noteToolEnabled: false });
+
+			expect(registered).toContain("ctx_search");
+			expect(registered).toContain("ctx_memory");
+			expect(registered).not.toContain("ctx_note");
+			expect(registered).toContain("ctx_expand");
+			expect(registered).toContain("ctx_reduce");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("registered tools resolve smart-note gating from the invocation cwd", async () => {
 		const db = createTestDb();
 		try {

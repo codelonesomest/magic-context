@@ -457,6 +457,12 @@ export interface MagicContextConfig {
         enabled: boolean;
         overlay: boolean;
     };
+    /** OMP-only tool registration controls. Changes require a new OMP session. */
+    omp: {
+        tools: {
+            ctx_note: boolean;
+        };
+    };
     /** Pi-only child-process extension controls. */
     pi?: PiConfig;
     /** Content-aware reclaim of tool output that a later call supersedes, added
@@ -760,6 +766,23 @@ export const MagicContextConfigSchema = z
             .default(true)
             .describe(
                 "When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart.",
+            ),
+        omp: z
+            .object({
+                tools: z
+                    .object({
+                        ctx_note: z
+                            .boolean()
+                            .default(true)
+                            .describe(
+                                "OMP only: register the ctx_note tool. Set false to remove ctx_note from new OMP sessions. Native Pi and OpenCode are unaffected. Requires a new OMP session.",
+                            ),
+                    })
+                    .default({ ctx_note: true }),
+            })
+            .default({ tools: { ctx_note: true } })
+            .describe(
+                "OMP-only tool registration controls. These settings do not change native Pi or OpenCode.",
             ),
         todowrite: z
             .object({
