@@ -372,6 +372,12 @@ export interface MagicContextConfig {
         enabled: boolean;
         overlay: boolean;
     };
+    /** OMP-only tool registration controls. Changes require a new OMP session. */
+    omp: {
+        tools: {
+            ctx_note: boolean;
+        };
+    };
     /** Content-aware reclaim of tool output that a later call supersedes, added
      *  to the normal age-based auto-drop: superseded todowrite/ctx_reduce/meta
      *  outputs are dropped, and older edits to a file are compressed to a marker
@@ -630,6 +636,23 @@ export const MagicContextConfigSchema = z
             .default({ enabled: false })
             .describe(
                 "Developer-only shadow transform lane. When enabled, the plugin fire-and-forgets a copy of each finalized transform to the Rust module for comparison; the live output is unchanged.",
+            ),
+        omp: z
+            .object({
+                tools: z
+                    .object({
+                        ctx_note: z
+                            .boolean()
+                            .default(true)
+                            .describe(
+                                "OMP only: register the ctx_note tool. Set false to remove ctx_note from new OMP sessions. Native Pi and OpenCode are unaffected. Requires a new OMP session.",
+                            ),
+                    })
+                    .default({ ctx_note: true }),
+            })
+            .default({ tools: { ctx_note: true } })
+            .describe(
+                "OMP-only tool registration controls. These settings do not change native Pi or OpenCode.",
             ),
         todowrite: z
             .object({
