@@ -3,7 +3,7 @@
  * @cortexkit/magic-context — unified CLI for Magic Context.
  *
  * Subcommands:
- *   setup           Interactive setup wizard for OpenCode and/or Pi.
+ *   setup           Interactive setup wizard for OpenCode, Pi, or OMP.
  *   doctor          Health-check + auto-fix for installed harnesses.
  *     --force         Force-clear plugin cache.
  *     --issue         Bundle a sanitized issue report and submit/open.
@@ -12,7 +12,7 @@
  *   doctor migrate-session  Re-home an OpenCode session to another directory/project.
  *
  * Common flags:
- *   --harness opencode|pi   Target one harness (default: auto-detect / prompt)
+ *   --harness opencode|pi|omp   Target one harness (default: auto-detect / prompt)
  *   --version, -v           Print CLI version and exit
  *   --help, -h              Print help and exit
  */
@@ -66,11 +66,13 @@ function printUsage(): void {
     console.log("  Harness selection:");
     console.log("    --harness opencode    Target OpenCode only");
     console.log("    --harness pi          Target Pi only");
+    console.log("    --harness omp         Target OMP only (local fork; accepts --plugin-path)");
     console.log("    (default: auto-detect, prompt if multiple installed)");
     console.log("");
     console.log("  Usage:");
     console.log("    npx @cortexkit/magic-context@latest setup");
     console.log("        # add --dry-run to preview the wizard without writing any files");
+    console.log("    bun packages/cli/src/index.ts setup --harness omp --plugin-path packages/pi-plugin");
     console.log("    npx @cortexkit/magic-context@latest doctor");
     console.log("    npx @cortexkit/magic-context@latest doctor --issue");
     console.log("    npx @cortexkit/magic-context@latest doctor migrate \\");
