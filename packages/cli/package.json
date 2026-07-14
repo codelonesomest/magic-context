@@ -1,12 +1,13 @@
 {
   "name": "@cortexkit/magic-context",
   "version": "0.33.0",
-  "description": "Unified CLI for Magic Context — setup, doctor, and migration across OpenCode and Pi",
+  "description": "Unified CLI for Magic Context — setup, doctor, and migration across OpenCode, Pi, and OMP",
   "keywords": [
     "opencode",
     "opencode-plugin",
     "pi",
     "pi-extension",
+    "omp",
     "magic-context",
     "cli",
     "setup",
@@ -16,11 +17,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cortexkit/magic-context"
+    "url": "https://github.com/codelonesomest/magic-context"
   },
-  "homepage": "https://github.com/cortexkit/magic-context#readme",
+  "homepage": "https://github.com/codelonesomest/magic-context#readme",
   "bugs": {
-    "url": "https://github.com/cortexkit/magic-context/issues"
+    "url": "https://github.com/codelonesomest/magic-context/issues"
   },
   "type": "module",
   "bin": {
