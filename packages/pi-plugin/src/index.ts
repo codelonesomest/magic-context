@@ -137,11 +137,13 @@ import {
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
+import { resolveOmpToolPolicy } from "./omp-tool-policy";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
 import { readPiSessionMessages } from "./read-session-pi";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 import {
+	isOmpHostProcess,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
@@ -893,6 +895,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
 	const todowriteOverlayEnabled =
 		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
+	const isOmpHost = isOmpHostProcess();
+	const ompToolPolicy = resolveOmpToolPolicy({
+		isOmpHost,
+		memoryEnabled: bootProjectDeps.config.memory.enabled,
+		ctxNoteEnabled: bootProjectDeps.config.omp.tools.ctx_note,
+	});
 
 	// Register the agent-facing tools. Reuses the same business logic
 	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
@@ -911,17 +919,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// loaded via subagent-entry.ts with the
 		// `--magic-context-dreamer-actions` flag.
 		allowDreamerActions: false,
-		// ALWAYS register ctx_memory in the main entry. Pi is a single REPL that
-		// can `/cd` between projects, but tool registration happens once at boot,
-		// so gating registration on the BOOT project's memory.enabled would
-		// mismatch the per-project prompt (which re-resolves memory.enabled each
-		// pass): start in a memory-off project and switch to a memory-on one and
-		// the tool would be absent while the prompt advertises it. The tool's
-		// own per-call guard (ctx-memory.ts, getProjectEmbeddingSnapshot) refuses
-		// when the CURRENT project has memory off, so always-register is correct.
-		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
-		// the retrieval-only sidekick, a separate security concern.)
-		memoryToolEnabled: true,
+		// Native Pi keeps its upstream always-registered ctx_memory surface so /cd
+		// can switch between projects with different memory settings. OMP users
+		// expect memory.enabled=false to remove the tool from the model-visible
+		// registry, so the OMP boot-project policy gates it for the session.
+		memoryToolEnabled: ompToolPolicy.memoryToolEnabled,
+		noteToolEnabled: ompToolPolicy.noteToolEnabled,
 		protectedTags: config.protected_tags ?? 20,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
@@ -933,10 +936,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		todowriteEnabled,
 	});
+	const registeredTools = [
+		"ctx_search",
+		...(ompToolPolicy.memoryToolEnabled ? ["ctx_memory"] : []),
+		...(ompToolPolicy.noteToolEnabled ? ["ctx_note"] : []),
+		"ctx_expand",
+		...(todowriteEnabled ? ["todowrite"] : []),
+		"ctx_reduce",
+	];
 	info(
-		todowriteEnabled
-			? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
-			: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
+		`registered tools: ${registeredTools.join(", ")}${todowriteEnabled ? "; registered /todos" : " (todowrite disabled)"}`,
 	);
 
 	pi.on("session_start", async (event, ctx) => {
@@ -1443,7 +1452,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				db,
 				cwd: currentProject.projectDir,
 				sessionId,
-				memoryEnabled: effectiveConfig.memory.enabled,
+				memoryEnabled:
+					effectiveConfig.memory.enabled && ompToolPolicy.memoryToolEnabled,
+				ctxNoteEnabled: ompToolPolicy.noteToolEnabled,
 				includeGuidance: true,
 				protectedTags: effectiveConfig.protected_tags,
 				ctxReduceCallable: true,

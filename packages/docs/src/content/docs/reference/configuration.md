@@ -39,6 +39,8 @@ Global on/off switches for the plugin and its agent-facing surface.
 | `todowrite` | object | — | Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart. |
 | `todowrite.enabled` | boolean | `true` | Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there. |
 | `todowrite.overlay` | boolean | `true` | Pi only: show the persistent todo overlay above the editor while tasks are active. |
+| `omp` | object | — | OMP-only tool registration controls. These settings do not change native Pi or OpenCode. |
+| `omp.tools.ctx_note` | boolean | `true` | OMP only: register the ctx_note tool. Set false to remove ctx_note from new OMP sessions. Native Pi and OpenCode are unaffected. Requires a new OMP session. |
 
 ## Context management
 

@@ -36,6 +36,8 @@ export interface BuildMagicContextBlockOptions {
 	/** Reserved for compatibility; project memories now live in m[0]/m[1]. */
 	memoryEnabled: boolean;
 	memoryBudgetChars?: number;
+	/** When false, omit all ctx_note guidance because the tool is not registered. */
+	ctxNoteEnabled?: boolean;
 	/** When true (default), emit the `## Magic Context` guidance section. */
 	includeGuidance?: boolean;
 	protectedTags?: number;
@@ -76,6 +78,7 @@ export function buildMagicContextBlock(
 		// Drop ctx_memory guidance when memory is off (the tool is gated via
 		// registerMagicContextTools memoryToolEnabled). ctx_search guidance stays.
 		opts.memoryEnabled !== false,
+		opts.ctxNoteEnabled !== false,
 	);
 }
 
