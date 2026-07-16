@@ -242,6 +242,44 @@ describe("subagent-runner pure helpers", () => {
 		]);
 	});
 
+	it("translates Pi historian tools to OMP's registered tool names", () => {
+		const args = buildArgsForTest(baseOptions, {
+			translateToolNamesForOmp: true,
+		});
+
+		const toolsIndex = args.indexOf("--tools");
+		const tools = args[toolsIndex + 1].split(",");
+		expect(tools).toEqual(["read", "grep", "glob"]);
+		expect(tools).not.toContain("find");
+		expect(tools).not.toContain("ls");
+		expect(tools).not.toContain("aft_search");
+	});
+
+	it("emits only OMP-registered names for every known child allow-list", () => {
+		const ompToolNames = new Set([
+			"read",
+			"bash",
+			"edit",
+			"glob",
+			"grep",
+			"write",
+			"ctx_search",
+			"ctx_memory",
+		]);
+
+		for (const agent of __test.KNOWN_PI_SUBAGENT_AGENTS) {
+			const args = buildArgsForTest(
+				{ ...baseOptions, agent },
+				{ translateToolNamesForOmp: true },
+			);
+			const toolsIndex = args.indexOf("--tools");
+			if (toolsIndex < 0) continue;
+			for (const tool of args[toolsIndex + 1].split(",")) {
+				expect(ompToolNames.has(tool)).toBe(true);
+			}
+		}
+	});
+
 	it("keeps extension discovery enabled so provider and AFT extensions can load", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
@@ -1042,6 +1080,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnArgs).toBeDefined();
 		expect(spawnArgs).not.toContain("--no-prompt-templates");
 		expect(spawnArgs).not.toContain("--no-context-files");
+		const toolsIndex = spawnArgs?.indexOf("--tools") ?? -1;
+		expect(toolsIndex).toBeGreaterThan(-1);
+		expect(spawnArgs?.[toolsIndex + 1]).toBe("read,grep,glob");
 		expect(spawnArgs).not.toContain(userMessage);
 		const userPromptArg = spawnArgs?.find((arg) => arg.startsWith("@"));
 		const userPromptPath = requirePromptPath(userPromptArg?.slice(1));
