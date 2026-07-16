@@ -186,6 +186,20 @@ const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
 const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
 
 /**
+ * OMP 17 validates every --tools entry before starting the agent. Translate
+ * Pi-only built-ins to OMP equivalents and drop optional AFT extension tools,
+ * which OMP rejects when that extension is not registered.
+ */
+function translateToolsForOmp(tools: readonly string[]): readonly string[] {
+	const translated = tools.flatMap((tool) => {
+		if (tool === "find" || tool === "ls") return ["glob"];
+		if (tool.startsWith("aft_")) return [];
+		return [tool];
+	});
+	return [...new Set(translated)];
+}
+
+/**
  * Set of subagent agent ids that get ctx_memory in the lean child extension.
  * Sidekick is retrieval-only and uses ctx_search; only dreamer-equivalent
  * agents need memory mutation/list capabilities.
@@ -622,6 +636,7 @@ export class PiSubagentRunner implements SubagentRunner {
 		const args = buildArgs(options, {
 			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
 			omitPiOnlyContextFlags: isOmpHost,
+			translateToolNamesForOmp: isOmpHost,
 			omitPositionalMessage: deliverViaStdin || usePromptFile,
 			systemPromptPath,
 		});
@@ -1230,6 +1245,7 @@ export function buildArgs(
 	opts?: {
 		disableDiscoveredExtensions?: boolean;
 		omitPiOnlyContextFlags?: boolean;
+		translateToolNamesForOmp?: boolean;
 		omitPositionalMessage?: boolean;
 		subagentEntryPath?: string;
 		systemPromptPath?: string;
@@ -1308,7 +1324,11 @@ export function buildArgs(
 	// the registry, so it strips ALL non-listed built-ins and every non-listed
 	// extension tool. Unknown agent ids fail closed to --no-tools; discovery is on
 	// for provider/AFT extensions, but the subagent registry is still per-agent.
-	const strictTools = STRICT_TOOL_ALLOWLIST.get(options.agent);
+	const configuredTools = STRICT_TOOL_ALLOWLIST.get(options.agent);
+	const strictTools =
+		configuredTools && opts?.translateToolNamesForOmp
+			? translateToolsForOmp(configuredTools)
+			: configuredTools;
 	if (strictTools === undefined) {
 		sessionLog(
 			options.accountingSessionId ?? "pi-subagent",
@@ -1504,6 +1524,7 @@ export const __test = {
 	buildArgs,
 	extractFinalAssistant,
 	isOmpInvocation,
+	translateToolsForOmp,
 	parsePiEventLine,
 	terminateChild,
 	DREAMER_ACTION_AGENTS,
