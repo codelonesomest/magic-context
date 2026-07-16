@@ -1,3 +1,4 @@
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -11,6 +12,7 @@ const recompSessions = new Set<string>();
 export interface StatusLineDeps {
 	db: ContextDatabase;
 	projectIdentity: string;
+	isOmpHost?: boolean;
 }
 
 export function setMagicContextRecompActive(
@@ -26,6 +28,12 @@ type SessionMetaStatus = {
 	historian_failure_count: number | null;
 	historian_last_failure_at: number | null;
 };
+
+interface StatusParts {
+	tokens: string;
+	percentage: number | undefined;
+	state: string;
+}
 
 const lastRenderedBySession = new Map<string, string>();
 
@@ -58,6 +66,10 @@ export function registerStatusLine(
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const sessionId = resolveSessionId(ctx);
 		if (sessionId) lastRenderedBySession.delete(sessionId);
+		if (deps.isOmpHost) {
+			ctx.ui.setWidget(STATUS_KEY, undefined);
+			return;
+		}
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 }
@@ -69,24 +81,77 @@ export function updateStatusLine(
 ): void {
 	const sessionId = resolveSessionId(ctx);
 	if (!sessionId) return;
-	const text = renderStatusText(ctx, deps.db, sessionId);
+	const parts = renderStatusParts(ctx, deps.db, sessionId);
+	const text = renderStatusText(parts);
 	if (!force && lastRenderedBySession.get(sessionId) === text) return;
 	lastRenderedBySession.set(sessionId, text);
+	if (deps.isOmpHost) {
+		ctx.ui.setWidget(
+			STATUS_KEY,
+			(_tui, theme) => ({
+				render: (width: number) => [
+					truncateToWidth(renderThemedStatusText(parts, theme), width, "…"),
+					"",
+				],
+				invalidate: () => {},
+			}),
+			{ placement: "aboveEditor" },
+		);
+		return;
+	}
 	ctx.ui.setStatus(STATUS_KEY, text);
 }
 
-function renderStatusText(
+function renderStatusParts(
 	ctx: ExtensionContext,
 	db: ContextDatabase,
 	sessionId: string,
-): string {
+): StatusParts {
 	const usage = ctx.getContextUsage?.();
 	const inputTokens =
 		typeof usage?.tokens === "number" ? usage.tokens : undefined;
-	const pct = typeof usage?.percent === "number" ? usage.percent : undefined;
+	const percentage =
+		typeof usage?.percent === "number" ? Math.round(usage.percent) : undefined;
 	const meta = readSessionMetaStatus(db, sessionId);
-	const state = renderHistorianState(meta, recompSessions.has(sessionId));
-	return `mc: ${inputTokens === undefined ? "--" : fmt(inputTokens)} (${pct === undefined ? "--" : `${Math.round(pct)}%`}) · ${state}`;
+	return {
+		tokens: inputTokens === undefined ? "--" : fmt(inputTokens),
+		percentage,
+		state: renderHistorianState(meta, recompSessions.has(sessionId)),
+	};
+}
+
+function renderStatusText(parts: StatusParts): string {
+	const percentage =
+		parts.percentage === undefined ? "--" : `${parts.percentage}%`;
+	return `mc: ${parts.tokens} (${percentage}) · ${parts.state}`;
+}
+
+function renderThemedStatusText(
+	parts: StatusParts,
+	theme: ExtensionContext["ui"]["theme"],
+): string {
+	const percentage =
+		parts.percentage === undefined ? "--" : `${parts.percentage}%`;
+	return [
+		theme.fg("accent", theme.bold("mc:")),
+		theme.fg("text", parts.tokens),
+		theme.fg(percentageColor(parts.percentage), `(${percentage})`),
+		theme.fg("muted", "·"),
+		theme.fg(stateColor(parts.state), parts.state),
+	].join(" ");
+}
+
+function percentageColor(percentage: number | undefined) {
+	if (percentage === undefined) return "muted" as const;
+	if (percentage >= 80) return "error" as const;
+	if (percentage >= 50) return "warning" as const;
+	return "success" as const;
+}
+
+function stateColor(state: string) {
+	if (state.includes("failed")) return "error" as const;
+	if (state === "historian" || state === "recomp") return "warning" as const;
+	return "dim" as const;
 }
 
 function renderHistorianState(
