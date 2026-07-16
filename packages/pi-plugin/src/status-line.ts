@@ -49,9 +49,13 @@ export function registerStatusLine(
 ): void {
 	void deps.projectIdentity;
 
-	pi.on("session_start", async (_event, ctx) =>
-		updateStatusLine(ctx, deps, true),
-	);
+	pi.on("session_start", async (_event, ctx) => {
+		// OMP can retain the widget surface across reload/session transitions. Keep
+		// Magic Context on one surface by clearing the widget before rendering the
+		// plain footer status.
+		if (deps.isOmpHost) ctx.ui.setWidget(STATUS_KEY, undefined);
+		updateStatusLine(ctx, deps, true);
+	});
 	pi.on("agent_end", async (_event, ctx) => updateStatusLine(ctx, deps));
 	pi.on("session_compact", async (_event, ctx) =>
 		updateStatusLine(ctx, deps, true),
@@ -67,6 +71,7 @@ export function registerStatusLine(
 		const sessionId = resolveSessionId(ctx);
 		if (sessionId) lastRenderedBySession.delete(sessionId);
 		if (deps.isOmpHost) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
 			ctx.ui.setWidget(STATUS_KEY, undefined);
 			return;
 		}
@@ -85,20 +90,6 @@ export function updateStatusLine(
 	const text = renderStatusText(parts);
 	if (!force && lastRenderedBySession.get(sessionId) === text) return;
 	lastRenderedBySession.set(sessionId, text);
-	if (deps.isOmpHost) {
-		ctx.ui.setWidget(
-			STATUS_KEY,
-			(_tui, theme) => ({
-				render: (width: number) => [
-					truncateToWidth(renderThemedStatusText(parts, theme), width, "…"),
-					"",
-				],
-				invalidate: () => {},
-			}),
-			{ placement: "aboveEditor" },
-		);
-		return;
-	}
 	ctx.ui.setStatus(STATUS_KEY, text);
 }
 

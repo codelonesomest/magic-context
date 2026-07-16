@@ -58,7 +58,7 @@ const theme = {
 };
 
 describe("Magic Context status surface", () => {
-	it("renders an OMP-only themed widget with spacing above and below", async () => {
+	it("keeps OMP on one plain status surface and clears any retained widget", async () => {
 		const { pi, handlers } = createPi();
 		const ctx = createContext();
 		registerStatusLine(pi as never, {
@@ -69,23 +69,14 @@ describe("Magic Context status surface", () => {
 
 		await handlers.get("session_start")?.({}, ctx);
 
-		expect(ctx.statuses).toEqual([]);
-		expect(ctx.widgets).toHaveLength(1);
-		const [key, factory, options] = ctx.widgets[0];
-		expect(key).toBe("magic-context");
-		expect(options).toEqual({ placement: "aboveEditor" });
-		expect(typeof factory).toBe("function");
-
-		const component = (factory as (tui: unknown, theme: typeof theme) => {
-			render(width: number): readonly string[];
-		})(undefined, theme);
-		expect(component.render(200)).toEqual([
-			"<accent><bold>mc:</bold></accent> <text>188.7K</text> <warning>(53%)</warning> <muted>·</muted> <dim>idle</dim>",
-			"",
+		expect(ctx.widgets).toEqual([["magic-context", undefined, undefined]]);
+		expect(ctx.statuses).toEqual([
+			["magic-context", "mc: 188.7K (53%) · idle"],
 		]);
 
 		await handlers.get("session_shutdown")?.({}, ctx);
 		expect(ctx.widgets.at(-1)).toEqual(["magic-context", undefined, undefined]);
+		expect(ctx.statuses.at(-1)).toEqual(["magic-context", undefined]);
 	});
 
 	it("keeps native Pi on the plain setStatus surface", async () => {
