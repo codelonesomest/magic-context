@@ -1110,7 +1110,7 @@ async function startPiMagicContextRuntime(
 		},
 	});
 	info("registered /ctx-status");
-	registerStatusLine(pi, { db, projectIdentity });
+	registerStatusLine(pi, { db, projectIdentity, isOmpHost });
 	info("registered magic-context status line");
 
 	registerCtxFlushCommand(pi, { db });
