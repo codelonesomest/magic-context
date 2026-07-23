@@ -70,7 +70,6 @@ function isOmpInvocation(invocation: PiInvocation): boolean {
 	);
 }
 
-
 /**
  * Resolve how to spawn a Pi subagent, robust across POSIX and Windows.
  *

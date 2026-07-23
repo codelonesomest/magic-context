@@ -52,11 +52,6 @@ const db = {
 	},
 };
 
-const theme = {
-	bold: (text: string) => `<bold>${text}</bold>`,
-	fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
-};
-
 describe("Magic Context status surface", () => {
 	it("keeps OMP on one plain status surface and clears any retained widget", async () => {
 		const { pi, handlers } = createPi();

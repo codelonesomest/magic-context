@@ -52,7 +52,7 @@ describe("registerMagicContextTools", () => {
 			expect(registered).not.toContain("ctx_note");
 			expect(registered).toContain("ctx_expand");
 			expect(registered).toContain("ctx_reduce");
-	} finally {
+		} finally {
 			closeQuietly(db);
 		}
 	});

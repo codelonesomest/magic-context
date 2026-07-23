@@ -80,7 +80,8 @@ function isBuiltOmpPlugin(path: string): boolean {
     if (!existsSync(manifestPath) || !existsSync(join(path, "dist", "index.js"))) return false;
     try {
         const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf-8"));
-        if (manifest === null || typeof manifest !== "object" || !("name" in manifest)) return false;
+        if (manifest === null || typeof manifest !== "object" || !("name" in manifest))
+            return false;
         return manifest.name === "@cortexkit/pi-magic-context";
     } catch {
         return false;
@@ -88,7 +89,8 @@ function isBuiltOmpPlugin(path: string): boolean {
 }
 
 export function resolveOmpPluginPath(requestedPath?: string): string | null {
-    const configuredPath = requestedPath?.trim() || process.env.MAGIC_CONTEXT_OMP_PLUGIN_PATH?.trim();
+    const configuredPath =
+        requestedPath?.trim() || process.env.MAGIC_CONTEXT_OMP_PLUGIN_PATH?.trim();
     if (configuredPath) {
         const absolutePath = resolve(configuredPath);
         return isBuiltOmpPlugin(absolutePath) ? absolutePath : null;
