@@ -12,7 +12,7 @@ import {
     linkOmpPlugin,
     resolveOmpPluginPath,
 } from "../lib/omp-helpers";
-import { promptIO, type PromptIO } from "../lib/prompts";
+import { type PromptIO, promptIO } from "../lib/prompts";
 import { writeMagicContextConfig } from "./setup-pi";
 
 type EmbeddingChoice =
@@ -168,19 +168,16 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
         prompts.log.warn(
             "GitHub Copilot reasoning models require an explicit thinking level to avoid an invalid `minimal` default.",
         );
-        historianThinkingLevel = await prompts.selectOne(
-            "Select thinking level for historian",
-            [
-                {
-                    label: "medium — good quality, moderate cost (Recommended)",
-                    value: "medium",
-                    recommended: true,
-                },
-                { label: "low — faster, less thorough", value: "low" },
-                { label: "high — best quality, slowest", value: "high" },
-                { label: "off — no thinking, fastest", value: "off" },
-            ],
-        );
+        historianThinkingLevel = await prompts.selectOne("Select thinking level for historian", [
+            {
+                label: "medium — good quality, moderate cost (Recommended)",
+                value: "medium",
+                recommended: true,
+            },
+            { label: "low — faster, less thorough", value: "low" },
+            { label: "high — best quality, slowest", value: "high" },
+            { label: "off — no thinking, fastest", value: "off" },
+        ]);
     }
 
     const dreamerEnabled = await prompts.confirm(
@@ -229,7 +226,9 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
     ].join("\n");
     prompts.note(summary, dryRun ? "Configuration (dry run — not written)" : "Configuration");
     prompts.outro(
-        dryRun ? "Dry run complete — nothing was written." : "Start an OMP session and try /ctx-status",
+        dryRun
+            ? "Dry run complete — nothing was written."
+            : "Start an OMP session and try /ctx-status",
     );
     return 0;
 }

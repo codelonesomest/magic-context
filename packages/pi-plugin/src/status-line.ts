@@ -1,4 +1,3 @@
-import { truncateToWidth } from "@earendil-works/pi-tui";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -115,34 +114,6 @@ function renderStatusText(parts: StatusParts): string {
 	const percentage =
 		parts.percentage === undefined ? "--" : `${parts.percentage}%`;
 	return `mc: ${parts.tokens} (${percentage}) · ${parts.state}`;
-}
-
-function renderThemedStatusText(
-	parts: StatusParts,
-	theme: ExtensionContext["ui"]["theme"],
-): string {
-	const percentage =
-		parts.percentage === undefined ? "--" : `${parts.percentage}%`;
-	return [
-		theme.fg("accent", theme.bold("mc:")),
-		theme.fg("text", parts.tokens),
-		theme.fg(percentageColor(parts.percentage), `(${percentage})`),
-		theme.fg("muted", "·"),
-		theme.fg(stateColor(parts.state), parts.state),
-	].join(" ");
-}
-
-function percentageColor(percentage: number | undefined) {
-	if (percentage === undefined) return "muted" as const;
-	if (percentage >= 80) return "error" as const;
-	if (percentage >= 50) return "warning" as const;
-	return "success" as const;
-}
-
-function stateColor(state: string) {
-	if (state.includes("failed")) return "error" as const;
-	if (state === "historian" || state === "recomp") return "warning" as const;
-	return "dim" as const;
 }
 
 function renderHistorianState(

@@ -9,9 +9,9 @@
 import type { HarnessAdapter } from "../adapters/types";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { intro, log, note, outro } from "../lib/prompts";
+import { runSetup as runOmpSetup } from "./setup-omp";
 import { runSetup as runOpenCodeSetup } from "./setup-opencode";
 import { runSetup as runPiSetup } from "./setup-pi";
-import { runSetup as runOmpSetup } from "./setup-omp";
 
 export interface OmpSetupOptions {
     dryRun: boolean;
@@ -23,8 +23,7 @@ export function parseOmpSetupOptions(argv: string[]): OmpSetupOptions | null {
     if (harnessIndex === -1 || argv[harnessIndex + 1] !== "omp") return null;
 
     const pluginPathIndex = argv.indexOf("--plugin-path");
-    const pluginPathValue =
-        pluginPathIndex === -1 ? undefined : argv[pluginPathIndex + 1];
+    const pluginPathValue = pluginPathIndex === -1 ? undefined : argv[pluginPathIndex + 1];
     return {
         dryRun: argv.includes("--dry-run"),
         pluginPath: pluginPathValue?.startsWith("--") ? undefined : pluginPathValue,

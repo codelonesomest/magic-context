@@ -158,10 +158,7 @@ describe("parseOmpModelsOutput", () => {
             ],
         });
 
-        expect(parseOmpModelsOutput(output)).toEqual([
-            "pq/gpt-5.5",
-            "anthropic/claude-sonnet",
-        ]);
+        expect(parseOmpModelsOutput(output)).toEqual(["pq/gpt-5.5", "anthropic/claude-sonnet"]);
         expect(parseOmpModelsOutput("not json")).toEqual([]);
     });
 });
@@ -181,8 +178,9 @@ describe("parseOmpSetupOptions", () => {
             pluginPath: "/tmp/magic-context/packages/pi-plugin",
         });
         expect(parseOmpSetupOptions(["--harness", "pi"])).toBeNull();
-        expect(
-            parseOmpSetupOptions(["--harness", "omp", "--plugin-path", "--dry-run"]),
-        ).toEqual({ dryRun: true, pluginPath: undefined });
+        expect(parseOmpSetupOptions(["--harness", "omp", "--plugin-path", "--dry-run"])).toEqual({
+            dryRun: true,
+            pluginPath: undefined,
+        });
     });
 });

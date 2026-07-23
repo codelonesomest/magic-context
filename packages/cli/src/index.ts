@@ -80,7 +80,9 @@ function printUsage(): void {
     console.log("  Usage:");
     console.log("    npx @cortexkit/magic-context@latest setup");
     console.log("        # add --dry-run to preview the wizard without writing any files");
-    console.log("    bun packages/cli/src/index.ts setup --harness omp --plugin-path packages/pi-plugin");
+    console.log(
+        "    bun packages/cli/src/index.ts setup --harness omp --plugin-path packages/pi-plugin",
+    );
     console.log("    npx @cortexkit/magic-context@latest doctor");
     console.log("    npx @cortexkit/magic-context@latest doctor --issue");
     console.log("    npx @cortexkit/magic-context@latest doctor migrate \\");
