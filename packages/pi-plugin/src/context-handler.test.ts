@@ -2499,6 +2499,71 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("gates task-subagent historian runs on the explicit OMP compaction policy", async () => {
+		const runPass = async (sessionId: string, subagentCompaction: boolean) => {
+			const db = createTestDb();
+			const runner = {
+				harness: "pi",
+				run: mock(async () => ({
+					ok: true as const,
+					assistantText:
+						'<compartment start="1" end="2" title="Task child">OMP task history.</compartment>',
+					durationMs: 1,
+				})),
+			} as unknown as SubagentRunner;
+			try {
+				updateSessionMeta(db, sessionId, {
+					isSubagent: true,
+					piStableIdScheme: 1,
+				});
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					subagentCompaction,
+					historian: {
+						runner,
+						model: "test/historian",
+						historianChunkTokens: 20_000,
+						executeThresholdPercentage: 80,
+						protectedTags: 0,
+					},
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const messages = Array.from({ length: 12 }, (_, index) =>
+					index % 2 === 0
+						? userMessage(`user ${index}`, index + 1)
+						: assistantMessage(`assistant ${index}`, index + 1),
+				) as never[];
+
+				await handler({ messages }, {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						messages.map((_, index) => `entry-${index + 1}`),
+						messages,
+					),
+					getContextUsage: () => ({
+						tokens: 85_000,
+						percent: 85,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				await awaitInFlightHistorians();
+				return runner.run.mock.calls.length;
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		};
+
+		expect(await runPass("ses-omp-task-disabled", false)).toBe(0);
+		expect(await runPass("ses-omp-task-enabled", true)).toBe(1);
+	});
+
 	it("skips trigger-fired historian while /ctx-wrapup is active", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-wrapup-active-skip";
@@ -4193,5 +4258,18 @@ describe("maybeFireHistorian raw provider cleanup", () => {
 		expect(body).toContain("if (!trigger.shouldFire)");
 		expect(body).toContain("} finally {");
 		expect(body).toContain("if (!triggered) unregister();");
+	});
+	it("forwards the trigger boundary into the Pi historian runner", () => {
+		const source = readFileSync(
+			join(import.meta.dir, "context-handler.ts"),
+			"utf8",
+		);
+		const spawnStart = source.indexOf("function spawnPiHistorianRun");
+		const runnerStart = source.indexOf("await runPiHistorian({", spawnStart);
+		const runnerEnd = source.indexOf("\n\t\t\t});", runnerStart);
+		const invocation = source.slice(runnerStart, runnerEnd);
+
+		expect(invocation).toContain("boundarySnapshot,");
+		expect(invocation).toContain("refreshBoundarySnapshot,");
 	});
 });

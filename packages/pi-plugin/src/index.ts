@@ -144,6 +144,7 @@ import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { resolveOmpToolPolicy } from "./omp-tool-policy";
+import { registerOmpTaskSubagentLifecycle } from "./omp-subagent-compaction";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
 import { readPiSessionMessages } from "./read-session-pi";
@@ -808,6 +809,7 @@ async function startPiMagicContextRuntime(
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
+	const isOmpHost = isOmpHostProcess();
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
 	info(
@@ -861,6 +863,10 @@ async function startPiMagicContextRuntime(
 			executeThresholdTokens: cfg.execute_threshold_tokens,
 		},
 		historian: hist,
+		subagentCompaction: isOmpHost && cfg.omp.subagents.compaction === true,
+		isSubagentCtxReduceCallable: isOmpHost
+			? () => pi.getActiveTools().includes("ctx_reduce")
+			: undefined,
 		language: cfg.language,
 		autoSearch: auto,
 		resolveForProject: resolveContextOptionsForProject,
@@ -957,12 +963,20 @@ async function startPiMagicContextRuntime(
 	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
 	const todowriteOverlayEnabled =
 		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
-	const isOmpHost = isOmpHostProcess();
 	const ompToolPolicy = resolveOmpToolPolicy({
 		isOmpHost,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		ctxNoteEnabled: bootProjectDeps.config.omp.tools.ctx_note,
 	});
+	const ompTaskLifecycleRegistered = registerOmpTaskSubagentLifecycle(pi, {
+		db: database,
+		isOmpHost,
+	});
+	info(
+		ompTaskLifecycleRegistered
+			? `registered OMP task-subagent classifier (compaction=${bootProjectDeps.config.omp.subagents.compaction ? "enabled" : "disabled"})`
+			: "registered OMP task-subagent classifier: N/A (native Pi host)",
+	);
 
 	// Register the agent-facing tools. Reuses the same business logic
 	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
@@ -1354,53 +1368,9 @@ async function startPiMagicContextRuntime(
 				projectIdentity: effectiveProjectDeps.projectIdentity,
 			};
 			const effectiveConfig = effectiveProjectDeps.config;
-			seenDreamerProjectIdentities.add(currentProject.projectIdentity);
-
-			// Re-register the dreamer for the CURRENT project. The boot-time
-			// registration above used process.cwd(), but Pi can switch projects
-			// mid-process (`/cd`, multi-root). Without this, a switched-into
-			// project is never dreamed and `/ctx-dream` there throws
-			// "not registered". registerPiDreamerProject is idempotent for the
-			// same identity+dir, and rebuilds against the new checkout when the
-			// directory changed (worktree/clone of the same repo).
-			//
-			// All project-sensitive config comes from resolveCurrentProjectDeps(ctx),
-			// the same per-cwd accessor used by tools, commands, and the context
-			// pipeline. A switched-into project may carry its own config (different
-			// model/schedule, or its own `dreamer.disable`), so boot config must not
-			// leak into this registration.
-			const effectiveDreamerConfig = effectiveProjectDeps.dreamerConfig;
-			if (effectiveDreamerConfig) {
-				try {
-					registerPiDreamerProject({
-						db,
-						projectDir: currentProject.projectDir,
-						projectIdentity: currentProject.projectIdentity,
-						config: effectiveDreamerConfig,
-						embeddingConfig: effectiveConfig.embedding,
-						memoryEnabled: effectiveConfig.memory.enabled,
-						language: effectiveConfig.language,
-						gitCommitIndexing: effectiveConfig.memory.git_commit_indexing,
-						onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,
-					});
-				} catch (err) {
-					warn("before_agent_start: registerPiDreamerProject threw:", err);
-				}
-			} else {
-				// The current checkout disables the dreamer. Any existing registration
-				// for this identity may have been created while another checkout's
-				// config was active, so tear it down explicitly here.
-				try {
-					unregisterPiDreamerProject({
-						projectIdentity: currentProject.projectIdentity,
-					});
-				} catch (err) {
-					warn("before_agent_start: unregisterPiDreamerProject threw:", err);
-				}
-			}
-			// Pi exposes `sessionManager.getSessionId()` once a session is
-			// active. We resolve it here defensively because before_agent_start
-			// fires once per agent turn.
+			// Resolve session identity before project-wide lanes. OMP emits the
+			// authoritative task lifecycle event before this first agent turn, so
+			// lifecycle-attested children are already marked in session_meta.
 			const sm = ctx.sessionManager;
 			let sessionId: string | undefined;
 			if (sm !== undefined) {
@@ -1412,6 +1382,58 @@ async function startPiMagicContextRuntime(
 						if (typeof id === "string" && id.length > 0) sessionId = id;
 					} catch {
 						// Fail open — sessionId stays undefined.
+					}
+				}
+			}
+			const isTaskSubagent =
+				sessionId !== undefined &&
+				getOrCreateSessionMeta(db, sessionId).isSubagent;
+			const ctxReduceCallable =
+				!isTaskSubagent || pi.getActiveTools().includes("ctx_reduce");
+
+			if (!isTaskSubagent) {
+				seenDreamerProjectIdentities.add(currentProject.projectIdentity);
+
+				// Re-register the dreamer for the CURRENT project. The boot-time
+				// registration above used process.cwd(), but Pi can switch projects
+				// mid-process (`/cd`, multi-root). Without this, a switched-into
+				// project is never dreamed and `/ctx-dream` there throws
+				// "not registered". registerPiDreamerProject is idempotent for the
+				// same identity+dir, and rebuilds against the new checkout when the
+				// directory changed (worktree/clone of the same repo).
+				//
+				// All project-sensitive config comes from resolveCurrentProjectDeps(ctx),
+				// the same per-cwd accessor used by tools, commands, and the context
+				// pipeline. A switched-into project may carry its own config (different
+				// model/schedule, or its own `dreamer.disable`), so boot config must not
+				// leak into this registration.
+				const effectiveDreamerConfig = effectiveProjectDeps.dreamerConfig;
+				if (effectiveDreamerConfig) {
+					try {
+						registerPiDreamerProject({
+							db,
+							projectDir: currentProject.projectDir,
+							projectIdentity: currentProject.projectIdentity,
+							config: effectiveDreamerConfig,
+							embeddingConfig: effectiveConfig.embedding,
+							memoryEnabled: effectiveConfig.memory.enabled,
+							language: effectiveConfig.language,
+							gitCommitIndexing: effectiveConfig.memory.git_commit_indexing,
+							onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,
+						});
+					} catch (err) {
+						warn("before_agent_start: registerPiDreamerProject threw:", err);
+					}
+				} else {
+					// The current checkout disables the dreamer. Any existing registration
+					// for this identity may have been created while another checkout's
+					// config was active, so tear it down explicitly here.
+					try {
+						unregisterPiDreamerProject({
+							projectIdentity: currentProject.projectIdentity,
+						});
+					} catch (err) {
+						warn("before_agent_start: unregisterPiDreamerProject threw:", err);
 					}
 				}
 			}
@@ -1515,23 +1537,28 @@ async function startPiMagicContextRuntime(
 				cwd: currentProject.projectDir,
 				sessionId,
 				memoryEnabled:
-					effectiveConfig.memory.enabled && ompToolPolicy.memoryToolEnabled,
-				ctxNoteEnabled: ompToolPolicy.noteToolEnabled,
-				includeGuidance: true,
+					!isTaskSubagent &&
+					effectiveConfig.memory.enabled &&
+					ompToolPolicy.memoryToolEnabled,
+				ctxNoteEnabled: !isTaskSubagent && ompToolPolicy.noteToolEnabled,
+				includeGuidance: !isTaskSubagent || ctxReduceCallable,
 				protectedTags: effectiveConfig.protected_tags,
-				ctxReduceCallable: true,
-				dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
-				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
+				ctxReduceCallable,
+				subagentMode: isTaskSubagent,
+				dreamerEnabled: !isTaskSubagent && effectiveProjectDeps.dreamerEnabled,
+				temporalAwarenessEnabled:
+					!isTaskSubagent && (effectiveConfig.temporal_awareness ?? false),
 				cavemanTextCompressionEnabled:
+					!isTaskSubagent &&
 					effectiveConfig.caveman_text_compression?.enabled === true,
 				language: effectiveConfig.language,
 				// Stable user memories rendered as <user-profile> — dreamer
 				// promotes recurring observations into this set, then the
-				// system prompt surfaces them across all sessions in the
-				// project. Gated on dreamer.user_memories.enabled.
-				userMemoriesEnabled: userMemoryCollectionEnabled(
-					effectiveConfig.dreamer,
-				),
+				// system prompt surfaces them across all primary sessions in the
+				// project. Task subagents receive only their own compartment history.
+				userMemoriesEnabled:
+					!isTaskSubagent &&
+					userMemoryCollectionEnabled(effectiveConfig.dreamer),
 				isCacheBusting,
 				existingSystemPrompt: event.systemPrompt,
 			});

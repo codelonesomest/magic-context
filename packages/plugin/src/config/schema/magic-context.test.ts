@@ -40,6 +40,9 @@ describe("MagicContextConfigSchema", () => {
                     tools: {
                         ctx_note: true,
                     },
+                    subagents: {
+                        compaction: false,
+                    },
                 },
             });
             expect(result.historian).toBeUndefined();
@@ -85,6 +88,9 @@ describe("MagicContextConfigSchema", () => {
                 omp: {
                     tools: {
                         ctx_note: true,
+                    },
+                    subagents: {
+                        compaction: false,
                     },
                 },
                 smart_drops: false,
@@ -201,6 +207,14 @@ describe("MagicContextConfigSchema", () => {
             });
 
             expect(result.omp.tools.ctx_note).toBe(false);
+        });
+
+        it("can enable Magic Context compaction for OMP task subagents", () => {
+            const result = MagicContextConfigSchema.parse({
+                omp: { subagents: { compaction: true } },
+            });
+
+            expect(result.omp.subagents.compaction).toBe(true);
         });
 
 

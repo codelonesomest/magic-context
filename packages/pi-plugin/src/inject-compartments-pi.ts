@@ -517,6 +517,8 @@ export interface PiM0M1State {
 	memoryEnabled?: boolean;
 	/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
 	injectDocs?: boolean;
+	/** Defaults true. When false, m[0]/m[1] omit the global user profile. */
+	userProfileEnabled?: boolean;
 	/** Memory-block trim budget (~4K). Bounds the <project-memory> block. */
 	injectionBudgetTokens?: number;
 	/** v2 decay-render history budget (~60K). Drives compartment tier demotion.
@@ -1019,7 +1021,10 @@ function readCurrentMarkersFromCompartments(
 			: getMaxMemoryIdForProjects(db, [memPath])
 		: 0;
 	const projectState = memPath ? getProjectState(db, memPath) : undefined;
-	const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
+	const globalState =
+		state.userProfileEnabled === false
+			? undefined
+			: getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
 	return {
 		// reduce, not Math.max(...spread): a project with very many
 		// compartments/memories (100K+) blows the call-stack arg limit and
@@ -1302,10 +1307,13 @@ export function renderM0Pi(
 	// Rendering all active user memories untrimmed would put different (larger)
 	// bytes on the wire than OpenCode for the same state, and let m[0] grow
 	// without bound as the global user-profile accumulates.
-	const trimmedProfile = trimUserMemoriesToBudget(
-		userProfileOverride ?? safeGetActiveUserMemoriesPi(db),
-		state.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS,
-	);
+	const trimmedProfile =
+		state.userProfileEnabled === false
+			? []
+			: trimUserMemoriesToBudget(
+					userProfileOverride ?? safeGetActiveUserMemoriesPi(db),
+					state.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS,
+				);
 	const userProfile = renderUserProfileBlock(
 		db,
 		"user-profile",
@@ -1419,9 +1427,13 @@ function readFrozenM0InputsPi(
 						memoryCutoff,
 					)
 			: [];
-		const userProfile = safeGetActiveUserMemoriesPi(db);
+		const userProfile =
+			state.userProfileEnabled === false ? [] : safeGetActiveUserMemoriesPi(db);
 		const projectState = memPath ? getProjectState(db, memPath) : undefined;
-		const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
+		const globalState =
+			state.userProfileEnabled === false
+				? undefined
+				: getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
 		const markers: PiM0SnapshotMarkers = {
 			maxCompartmentSeq: compartments.reduce(
 				(max, compartment) =>
@@ -1931,8 +1943,10 @@ function renderM1PiWithMetadata(
 	// in m[1] before the next m[0] materialization folds them into the baseline.
 	// Trimmed to 25% of the user-profile budget (matches OpenCode renderM1).
 	const currentUserProfileVersion =
-		getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)
-			?.projectUserProfileVersion ?? 0;
+		state.userProfileEnabled === false
+			? 0
+			: (getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)
+					?.projectUserProfileVersion ?? 0);
 	if (currentUserProfileVersion !== markers.projectUserProfileVersion) {
 		const profileBudget =
 			state.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS;
