@@ -418,10 +418,14 @@ export interface MagicContextConfig {
         enabled: boolean;
         overlay: boolean;
     };
-    /** OMP-only tool registration controls. Changes require a new OMP session. */
+    /** OMP-only controls. Changes require a new OMP session. */
     omp: {
         tools: {
             ctx_note: boolean;
+        };
+        subagents: {
+            /** Let lifecycle-attested OMP task subagents run automatic historian compaction. */
+            compaction: boolean;
         };
     };
     /** Content-aware reclaim of tool output that a later call supersedes, added
@@ -725,10 +729,23 @@ export const MagicContextConfigSchema = z
                             ),
                     })
                     .default({ ctx_note: true }),
+                subagents: z
+                    .object({
+                        compaction: z
+                            .boolean()
+                            .default(false)
+                            .describe(
+                                "OMP only: let lifecycle-attested task subagents automatically compact their own context with the configured historian model, thresholds, and history budget. Native Pi and OpenCode are unaffected. Requires a new OMP session.",
+                            ),
+                    })
+                    .default({ compaction: false }),
             })
-            .default({ tools: { ctx_note: true } })
+            .default({
+                tools: { ctx_note: true },
+                subagents: { compaction: false },
+            })
             .describe(
-                "OMP-only tool registration controls. These settings do not change native Pi or OpenCode.",
+                "OMP-only runtime controls. These settings do not change native Pi or OpenCode.",
             ),
         todowrite: z
             .object({

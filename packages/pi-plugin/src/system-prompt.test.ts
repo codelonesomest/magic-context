@@ -58,6 +58,27 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 		}
 	});
 
+	it("uses minimal reduction guidance for verified OMP task subagents", () => {
+		const db = createTestDb();
+		try {
+			const block = buildMagicContextBlock({
+				db,
+				cwd: tempDir("pi-task-subagent-"),
+				sessionId: "ses-task-subagent",
+				memoryEnabled: false,
+				ctxNoteEnabled: false,
+				ctxReduceCallable: true,
+				subagentMode: true,
+			});
+
+			expect(block).toContain("ctx_reduce");
+			expect(block).not.toContain("ctx_search");
+			expect(block).not.toContain("long-term partner");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("does not render project-docs, user-profile, or key-files in the system prompt", () => {
 		const db = createTestDb();
 		const cwd = tempDir("pi-system-v2-");

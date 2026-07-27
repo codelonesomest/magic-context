@@ -1274,9 +1274,12 @@
       "default": {
         "tools": {
           "ctx_note": true
+        },
+        "subagents": {
+          "compaction": false
         }
       },
-      "description": "OMP-only tool registration controls. These settings do not change native Pi or OpenCode.",
+      "description": "OMP-only runtime controls. These settings do not change native Pi or OpenCode.",
       "type": "object",
       "properties": {
         "tools": {
@@ -1288,6 +1291,19 @@
             "ctx_note": {
               "default": true,
               "description": "OMP only: register the ctx_note tool. Set false to remove ctx_note from new OMP sessions. Native Pi and OpenCode are unaffected. Requires a new OMP session.",
+              "type": "boolean"
+            }
+          }
+        },
+        "subagents": {
+          "default": {
+            "compaction": false
+          },
+          "type": "object",
+          "properties": {
+            "compaction": {
+              "default": false,
+              "description": "OMP only: let lifecycle-attested task subagents automatically compact their own context with the configured historian model, thresholds, and history budget. Native Pi and OpenCode are unaffected. Requires a new OMP session.",
               "type": "boolean"
             }
           }

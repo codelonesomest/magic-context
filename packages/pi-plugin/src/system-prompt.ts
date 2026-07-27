@@ -42,6 +42,8 @@ export interface BuildMagicContextBlockOptions {
 	includeGuidance?: boolean;
 	protectedTags?: number;
 	ctxReduceCallable?: boolean;
+	/** Emit the minimal §N§ + ctx_reduce guidance used by verified task subagents. */
+	subagentMode?: boolean;
 	dreamerEnabled?: boolean;
 	temporalAwarenessEnabled?: boolean;
 	cavemanTextCompressionEnabled?: boolean;
@@ -69,11 +71,11 @@ export function buildMagicContextBlock(
 	return buildMagicContextSection(
 		null,
 		opts.protectedTags ?? 20,
-		opts.ctxReduceCallable ?? true,
+		opts.subagentMode ? false : (opts.ctxReduceCallable ?? true),
 		opts.dreamerEnabled ?? false,
 		opts.temporalAwarenessEnabled ?? false,
 		opts.cavemanTextCompressionEnabled ?? false,
-		false,
+		opts.subagentMode ?? false,
 		opts.language,
 		// Drop ctx_memory guidance when memory is off (the tool is gated via
 		// registerMagicContextTools memoryToolEnabled). ctx_search guidance stays.

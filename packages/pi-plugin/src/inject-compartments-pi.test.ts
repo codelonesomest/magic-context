@@ -401,6 +401,45 @@ describe("injectM0M1Pi memory feature gate", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("limits task-subagent m[0] to its own compartment history", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-task-subagent-m0-"));
+		try {
+			writeFileSync(join(cwd, "ARCHITECTURE.md"), "private project docs");
+			const state = {
+				...piState("ses-pi-task-subagent", cwd),
+				memoryEnabled: false,
+				injectDocs: false,
+				userProfileEnabled: false,
+			};
+			appendCompartments(db, state.sessionId, [
+				{
+					sequence: 1,
+					startMessage: 1,
+					endMessage: 1,
+					startMessageId: "task-entry-1",
+					endMessageId: "task-entry-1",
+					title: "Task history",
+					content: "U: inspect the child\nchild compartment remains visible",
+				},
+			]);
+			insertUserMemory(
+				db,
+				"global user profile must not enter task children",
+				[],
+			);
+
+			const messages = [userMessage("continue", 10)];
+			injectM0M1Pi(state, db, messages as never, undefined, true);
+			const m0 = textOf(messages[0] as never);
+			expect(m0).toContain("child compartment remains visible");
+			expect(m0).not.toContain("global user profile");
+			expect(m0).not.toContain("private project docs");
+		} finally {
+			closeQuietly(db);
+		}
+	});
 });
 
 describe("injectM0M1Pi", () => {
