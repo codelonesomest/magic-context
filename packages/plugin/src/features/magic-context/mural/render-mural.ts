@@ -169,7 +169,8 @@ function naturalLineLengths(entries: readonly MuralRenderEntry[], roomWidth: num
     const lengths: number[] = [];
     let currentCategory: string | null = null;
     for (let index = 0; index < entries.length; index++) {
-        const entry = entries[index]!;
+        const entry = entries[index];
+        if (!entry) continue;
         if (entry.category !== currentCategory) {
             currentCategory = entry.category;
             lengths.push(codepoints(` <${entry.category}> `));
@@ -210,7 +211,8 @@ function planLines(entries: readonly MuralRenderEntry[], roomWidth: number): Pla
     const lines: PlannedLine[] = [];
     let currentCategory: string | null = null;
     for (let index = 0; index < entries.length; index++) {
-        const entry = entries[index]!;
+        const entry = entries[index];
+        if (!entry) continue;
         if (entry.category !== currentCategory) {
             currentCategory = entry.category;
             lines.push({
@@ -309,7 +311,9 @@ function renderLayout(
 
     for (const [column, columnPlan] of splitPlan(plan, columnCount).entries()) {
         for (const [row, line] of columnPlan.entries()) {
-            grid[column]![row] = line.text;
+            const gridColumn = grid[column];
+            if (!gridColumn) continue;
+            gridColumn[row] = line.text;
             filledLineCount += 1;
             usage[line.category] = (usage[line.category] ?? 0) + 1;
             const placementLine = row + 1;
@@ -447,9 +451,9 @@ function drawGlyph(
             const py = y + row;
             if (px < 0 || py < 0 || px >= width || py >= height) continue;
             const offset = (py * width + px) * 3;
-            pixels[offset] = color[0]!;
-            pixels[offset + 1] = color[1]!;
-            pixels[offset + 2] = color[2]!;
+            pixels[offset] = color[0];
+            pixels[offset + 1] = color[1];
+            pixels[offset + 2] = color[2];
         }
     }
 }
@@ -487,9 +491,9 @@ function fillRect(
     for (let py = top; py < bottom; py++) {
         for (let px = left; px < right; px++) {
             const offset = (py * canvasWidth + px) * 3;
-            pixels[offset] = color[0]!;
-            pixels[offset + 1] = color[1]!;
-            pixels[offset + 2] = color[2]!;
+            pixels[offset] = color[0];
+            pixels[offset + 1] = color[1];
+            pixels[offset + 2] = color[2];
         }
     }
 }
@@ -542,7 +546,6 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
     );
     const candidatesToCompare = fittingCandidates.length > 0 ? fittingCandidates : candidates;
     const selected = candidatesToCompare.reduce((best, candidate) => {
-        if (!best) return candidate;
         if (
             fittingCandidates.length === 0 &&
             candidate.layout.renderedIds.length !== best.layout.renderedIds.length
@@ -555,7 +558,7 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
             return candidate.tileArea < best.tileArea ? candidate : best;
         }
         return candidate.requestedColumnCount < best.requestedColumnCount ? candidate : best;
-    }, candidatesToCompare[0]!);
+    });
 
     const { layout, width, height } = selected;
     const pixels = new Uint8Array(width * height * 3).fill(255);

@@ -50,7 +50,7 @@ import {
     normalizeMaterializeReason,
     recordPendingTransformDecision,
 } from "../../features/magic-context/transform-decision-log";
-import type { ContextUsage, SchedulerDecision } from "../../features/magic-context/types";
+import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
@@ -72,7 +72,6 @@ import {
     type ToolAvailabilityVerdict,
 } from "./ctx-reduce-availability";
 import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
-import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
 import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
@@ -117,7 +116,6 @@ import {
     applyFlushedStatuses,
     type MessageLike,
     stripStructuralNoise,
-    type TagNormalizationTarget,
     type TagTarget,
     tagMessages,
 } from "./transform-operations";
@@ -304,21 +302,25 @@ function authorityModuleForProject(
     module: RustModeModuleClient,
     projectRoot: string,
 ): AuthorityModuleClient {
-    if (!module.authorityStatus || !module.authorityDrain || !module.mirrorPull) {
+    const authorityStatus = module.authorityStatus;
+    const authorityPrepare = module.authorityPrepare;
+    const authorityDrain = module.authorityDrain;
+    const mirrorPull = module.mirrorPull;
+    if (!authorityStatus || !authorityDrain || !mirrorPull) {
         throw new Error(
             "the module does not expose authority.status, authority.drain, and mirror.pull",
         );
     }
     return {
-        authorityStatus: (request) => module.authorityStatus!({ ...request, projectRoot }),
+        authorityStatus: (request) => authorityStatus.call(module, { ...request, projectRoot }),
         authorityPrepare: (request) => {
-            if (!module.authorityPrepare) {
+            if (!authorityPrepare) {
                 throw new Error("the module does not expose authority.prepare");
             }
-            return module.authorityPrepare({ ...request, projectRoot });
+            return authorityPrepare.call(module, { ...request, projectRoot });
         },
-        authorityDrain: (request) => module.authorityDrain!({ ...request, projectRoot }),
-        mirrorPull: (request) => module.mirrorPull!({ ...request, projectRoot }),
+        authorityDrain: (request) => authorityDrain.call(module, { ...request, projectRoot }),
+        mirrorPull: (request) => mirrorPull.call(module, { ...request, projectRoot }),
     };
 }
 
@@ -406,7 +408,8 @@ function scheduleTsAuthorityRecovery(args: {
             `[magic-context] project ${args.projectPath} is module-authority-managed but transform_mode is TS; draining authority back to TypeScript`,
         );
     }
-    if (!args.module) {
+    const module = args.module;
+    if (!module) {
         tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
         if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
             tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
@@ -419,7 +422,7 @@ function scheduleTsAuthorityRecovery(args: {
 
     tsAuthorityRecoveryStateByProject.set(args.projectPath, "running");
     void Promise.resolve()
-        .then(() => recoverTsAuthorityProject({ ...args, module: args.module! }))
+        .then(() => recoverTsAuthorityProject({ ...args, module }))
         .then((outcome) => {
             if (outcome === "completed") {
                 tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
@@ -1549,7 +1552,6 @@ export function createTransform(deps: TransformDeps) {
             { type: string; thinking?: string; text?: string }[]
         >();
         let messageTagNumbers = new Map<MessageLike, number>();
-        let tagNormalizationTargets: TagNormalizationTarget[] = [];
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
         // Inject temporal markers before tagging so the §N§ tag prefix wraps
@@ -1602,7 +1604,6 @@ export function createTransform(deps: TransformDeps) {
             targets = result.targets;
             reasoningByMessage = result.reasoningByMessage;
             messageTagNumbers = result.messageTagNumbers;
-            tagNormalizationTargets = result.normalizationTargets;
             batch = result.batch;
             hasRecentReduceCall = result.hasRecentReduceCall;
             const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;

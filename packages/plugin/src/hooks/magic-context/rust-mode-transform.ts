@@ -695,7 +695,12 @@ async function prepareRustMemoryAuthority(args: {
     state.memoryAuthorityProject = projectPath;
     state.memoryAuthorityRoot = projectRoot;
     state.memoryAuthorityReady = false;
-    if (!module.authorityStatus || !module.authorityPrepare || !module.authoritySeed) {
+    const authorityStatus = module.authorityStatus;
+    const authorityPrepare = module.authorityPrepare;
+    const authoritySeed = module.authoritySeed;
+    const authorityDrain = module.authorityDrain;
+    const mirrorPull = module.mirrorPull;
+    if (!authorityStatus || !authorityPrepare || !authoritySeed) {
         if (args.allowProtocolBypassForTests === true) {
             state.memoryAuthorityReady = true;
             return;
@@ -710,14 +715,14 @@ async function prepareRustMemoryAuthority(args: {
     // locals would sever `this` and only fail at runtime (test fakes are object
     // literals and cannot catch the difference).
     const authorityModule: AuthorityModuleClient = {
-        authorityStatus: (request) => module.authorityStatus!({ ...request, projectRoot }),
-        authorityPrepare: (request) => module.authorityPrepare!({ ...request, projectRoot }),
-        authoritySeed: (request) => module.authoritySeed!({ ...request, projectRoot }),
-        authorityDrain: module.authorityDrain
-            ? (request) => module.authorityDrain!({ ...request, projectRoot })
+        authorityStatus: (request) => authorityStatus.call(module, { ...request, projectRoot }),
+        authorityPrepare: (request) => authorityPrepare.call(module, { ...request, projectRoot }),
+        authoritySeed: (request) => authoritySeed.call(module, { ...request, projectRoot }),
+        authorityDrain: authorityDrain
+            ? (request) => authorityDrain.call(module, { ...request, projectRoot })
             : undefined,
-        mirrorPull: module.mirrorPull
-            ? (request) => module.mirrorPull!({ ...request, projectRoot })
+        mirrorPull: mirrorPull
+            ? (request) => mirrorPull.call(module, { ...request, projectRoot })
             : undefined,
     };
     const contextStoreUuid = ensureContextStoreUuid(db);
@@ -1512,12 +1517,13 @@ export function createRustModeTransform(
                         };
                     }
                 }
+                const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
                 const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
-                        stateSyncCapabilities: options.moduleClient.stateSyncCapabilities
+                        stateSyncCapabilities: stateSyncCapabilities
                             ? (capabilityArgs) =>
-                                  options.moduleClient.stateSyncCapabilities!(capabilityArgs)
+                                  stateSyncCapabilities.call(options.moduleClient, capabilityArgs)
                             : undefined,
                     },
                     state,
@@ -1955,14 +1961,16 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust memory mirror-back failed (ignored):", error);
                 }
             }
-            if (options.moduleClient.getCompartmentsAfter) {
+            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
+            if (getCompartmentsAfter) {
                 try {
                     await mirrorModuleCompartments({
                         db: deps.db,
                         sessionId,
                         reader: {
                             getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                options.moduleClient.getCompartmentsAfter!(
+                                getCompartmentsAfter.call(
+                                    options.moduleClient,
                                     mirroredSessionId,
                                     afterSequence,
                                 ),

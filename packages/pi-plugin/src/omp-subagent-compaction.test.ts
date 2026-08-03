@@ -4,16 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { createTestDb } from "./test-utils.test";
 import {
 	OMP_TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	registerOmpTaskSubagentLifecycle,
 } from "./omp-subagent-compaction";
+import { createTestDb } from "./test-utils.test";
 
 describe("OMP task subagent lifecycle", () => {
 	it("classifies a lifecycle-attested child from OMP's session header", () => {
 		const db = createTestDb();
-		const sessionDirectory = mkdtempSync(join(tmpdir(), "mc-omp-task-session-"));
+		const sessionDirectory = mkdtempSync(
+			join(tmpdir(), "mc-omp-task-session-"),
+		);
 		try {
 			const sessionFile = join(sessionDirectory, "ChildAgent.jsonl");
 			writeFileSync(

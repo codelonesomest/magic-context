@@ -7,6 +7,7 @@ import {
 	__resetMessageIndexAsyncForTests,
 	isSessionReconciled,
 } from "@magic-context/core/features/magic-context/message-index-async";
+import { _resetProjectEmbeddingRegistryForTests } from "@magic-context/core/features/magic-context/project-embedding-registry";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
 	acquireWrapupInProgress,
@@ -1043,6 +1044,7 @@ describe("Pi fallback tag adoption", () => {
 
 describe("registerPiContextHandler", () => {
 	afterEach(() => {
+		_resetProjectEmbeddingRegistryForTests();
 		__resetMessageIndexAsyncForTests();
 		clearModelsDevCache();
 		clearContextHandlerSession("ses-context");
@@ -2507,7 +2509,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Task child">OMP task history.</compartment>',
+						'<compartment start="1" end="2" title="Task child"><p1>OMP task history.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;

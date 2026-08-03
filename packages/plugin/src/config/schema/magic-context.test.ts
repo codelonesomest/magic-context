@@ -217,7 +217,6 @@ describe("MagicContextConfigSchema", () => {
             expect(result.omp.subagents.compaction).toBe(true);
         });
 
-
         it("accepts an explicitly configured Pi subagent extension allowlist", () => {
             expect(
                 MagicContextConfigSchema.parse({
@@ -225,7 +224,6 @@ describe("MagicContextConfigSchema", () => {
                 }).pi,
             ).toEqual({ subagent_extensions: ["provider-package", "./local.ts"] });
         });
-
         it("accepts and normalizes 2-letter ISO 639-1 language codes", () => {
             expect(MagicContextConfigSchema.parse({ language: "tr" }).language).toBe("tr");
             expect(MagicContextConfigSchema.parse({ language: "  ES " }).language).toBe("es");

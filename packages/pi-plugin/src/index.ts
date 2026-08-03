@@ -142,9 +142,8 @@ import {
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
-import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
-import { resolveOmpToolPolicy } from "./omp-tool-policy";
 import { registerOmpTaskSubagentLifecycle } from "./omp-subagent-compaction";
+import { resolveOmpToolPolicy } from "./omp-tool-policy";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
 import { readPiSessionMessages } from "./read-session-pi";

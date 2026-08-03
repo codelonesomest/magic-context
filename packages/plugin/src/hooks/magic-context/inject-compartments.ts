@@ -9,16 +9,11 @@ import {
     getLastCompartmentEndMessageId,
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
-import {
-    MEMORY_CATEGORY_ORDER_SQL,
-    V2_MEMORY_CATEGORIES,
-} from "../../features/magic-context/memory/constants";
+import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
     getMemoriesByProjects,
-    getMemorySelectColumns,
-    isMemoryRow,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
