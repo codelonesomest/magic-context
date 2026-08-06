@@ -19,15 +19,24 @@ function normalizeSessionFile(value: unknown): string | undefined {
 	if (typeof value !== "string" || value.length === 0) return undefined;
 	return resolve(value);
 }
+function parseSessionHeaderLine(line: string): string | undefined {
+	try {
+		const parsed = JSON.parse(line) as { type?: unknown; id?: unknown };
+		if (parsed.type === "session" && typeof parsed.id === "string") {
+			return parsed.id;
+		}
+	} catch {
+		return undefined;
+	}
+	return undefined;
+}
 
 function readTaskSessionId(sessionFile: string): string | undefined {
 	try {
-		const header = readFileSync(sessionFile, "utf8").slice(0, 16 * 1024);
+		const header = readFileSync(sessionFile, "utf8").slice(0, 64 * 1024);
 		for (const line of header.split("\n")) {
-			const parsed = JSON.parse(line) as { type?: unknown; id?: unknown };
-			if (parsed.type === "session" && typeof parsed.id === "string") {
-				return parsed.id;
-			}
+			const sessionId = parseSessionHeaderLine(line);
+			if (sessionId) return sessionId;
 		}
 	} catch {
 		return undefined;
