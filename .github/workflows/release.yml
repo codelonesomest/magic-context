@@ -1,9 +1,9 @@
 name: Release
 
+# OMP fork policy: releases are local-verification + GitHub Release details only.
+# Do not run this public npm publish pipeline on tag pushes.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
