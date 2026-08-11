@@ -33,12 +33,11 @@ env:
 #     historian publish behavior, tag-owner collision, synthetic todowrite, cross-harness
 #     memory, etc. Spawns real `opencode serve` / Pi subprocesses against the embedded
 #     mock provider. Catches cache-stability + correctness regressions that the smoke
-#     layer cannot see. Adding it to the release gate means a tag push that breaks any of
-#     the ~74 host tests will block npm publishes.
+#     layer cannot see. A deliberately dispatched upstream-style publish run remains gated
+#     by the ~74 host tests.
 #
-# Prior to v0.21.x the Docker e2e ran in a separate workflow (e2e-docker.yml) on the
-# same tag push, so publishes could complete even if e2e failed. Folding both e2e
-# layers inline closes that gap.
+# Prior to v0.21.x the Docker e2e ran in a separate workflow (e2e-docker.yml). Keeping both
+# e2e layers inline preserves that gate for the rare manual upstream publish run.
 #
 # Discord announcement also lives inline: GitHub Actions suppresses
 # workflow cascades from `GITHUB_TOKEN`-authored events, so a separate

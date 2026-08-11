@@ -1,14 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches: [master, main]
-  pull_request:
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Pipeline shape on every push to master and on every PR:
+# Pipeline shape when manually dispatched:
 #
 #   check-plugin, check-pi-plugin                          (unit tests + lint + typecheck, parallel)
 #                  ↓
@@ -24,8 +22,8 @@ env:
 #     etc. Spawns real `opencode serve` / Pi subprocesses against an embedded mock provider.
 #     Catches cache-stability + correctness regressions that the smoke layer cannot see.
 #
-# Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here means
-# every PR and master push exercises the full unit → Docker → host gauntlet.
+# Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here keeps
+# the full unit → Docker → host gauntlet available as one deliberate manual run.
 
 jobs:
   check-plugin:

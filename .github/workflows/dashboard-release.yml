@@ -1,16 +1,19 @@
 name: Dashboard Release
 
 on:
-  push:
-    tags:
-      - "dashboard-v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing dashboard release tag (for example dashboard-v0.12.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   # Create the draft release ONCE, up front, and hand its id to every build leg.
@@ -31,7 +34,7 @@ jobs:
         with:
           result-encoding: string
           script: |
-            const ref = process.env.GITHUB_REF_NAME;
+            const ref = process.env.RELEASE_TAG;
             const { owner, repo } = context.repo;
             // Reuse an existing release for this tag (re-runs), else create a draft.
             try {
@@ -103,6 +106,8 @@ jobs:
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -201,6 +206,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
 
       # Publish the draft BEFORE deploying the updater manifest. A draft's asset
       # URLs 404 for anonymous clients, so deploying latest.json while the
@@ -211,13 +218,13 @@ jobs:
       - name: Publish release (undraft)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false
+        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
 
       - name: Download latest.json from release (with retry)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$RELEASE_TAG"
           mkdir -p _updater_publish
           OUT=_updater_publish/latest.json
           # Retry up to 20×15s (5 minutes) — first-time uploads of large
@@ -242,7 +249,7 @@ jobs:
       # Rewrite to /releases/download/<TAG>/, which is immune to the pointer.
       - name: Pin updater URLs to this release tag
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$RELEASE_TAG"
           FILE=_updater_publish/latest.json
           python3 - "$TAG" "$FILE" <<'PY'
           import json, sys
