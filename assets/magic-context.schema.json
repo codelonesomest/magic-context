@@ -1518,6 +1518,48 @@
         }
       }
     },
+    "omp": {
+      "default": {
+        "tools": {
+          "ctx_note": true
+        },
+        "subagents": {
+          "compaction": false
+        }
+      },
+      "description": "OMP-only user-tier controls. Project configuration cannot enable Task subagent historian compaction or alter process-level tool registration.",
+      "type": "object",
+      "properties": {
+        "tools": {
+          "default": {
+            "ctx_note": true
+          },
+          "description": "OMP primary-session tool controls.",
+          "type": "object",
+          "properties": {
+            "ctx_note": {
+              "default": true,
+              "description": "OMP only: register ctx_note in the primary OMP session. Default true. USER-LEVEL ONLY: project config is ignored.",
+              "type": "boolean"
+            }
+          }
+        },
+        "subagents": {
+          "default": {
+            "compaction": false
+          },
+          "description": "OMP Task subagent runtime controls.",
+          "type": "object",
+          "properties": {
+            "compaction": {
+              "default": false,
+              "description": "OMP only: allow Magic Context's lightweight Task subagent runtime to use historian-backed compaction. Default false preserves native OMP Task behavior without additional historian spend. USER-LEVEL ONLY: project config is ignored.",
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
     "smart_drops": {
       "default": false,
       "description": "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",

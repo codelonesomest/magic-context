@@ -207,7 +207,7 @@ function expandHomePath(value: string): string {
  * Positive OMP host identification. PI_CODING_AGENT_DIR alone is deliberately
  * insufficient because upstream Pi supports the same variable.
  */
-function isOmpHostProcess(): boolean {
+export function isOmpHostProcess(): boolean {
 	const execName = basename(process.execPath).toLowerCase();
 	if (/^omp(?:\.exe)?$/.test(execName)) return true;
 

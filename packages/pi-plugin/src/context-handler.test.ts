@@ -2499,6 +2499,88 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("runs historian for attested OMP Task children only when subagent compaction is enabled", async () => {
+		async function runScenario(sessionId: string, subagentCompaction: boolean) {
+			const db = createTestDb();
+			try {
+				updateSessionMeta(db, sessionId, {
+					isSubagent: true,
+					piStableIdScheme: 1,
+				});
+				const runner = {
+					harness: "pi",
+					run: mock(async () => ({
+						ok: true as const,
+						assistantText:
+							'<compartment start="1" end="2" title="Child"><p1>OMP Task child history.</p1></compartment>',
+						durationMs: 1,
+					})),
+				} as unknown as SubagentRunner;
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					subagentCompaction,
+					historian: {
+						runner,
+						model: "test/historian",
+						historianChunkTokens: 20_000,
+						executeThresholdPercentage: 80,
+						protectedTags: 0,
+					},
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const prime = [userMessage("prime", 1)] as never[];
+				await handler({ messages: prime }, {
+					...fakeContext(sessionId, process.cwd(), ["entry-prime"], prime),
+					getContextUsage: () => ({
+						tokens: 1_000,
+						percent: 1,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				updateSessionMeta(db, sessionId, {
+					lastResponseTime: Date.now(),
+					cacheTtl: "59m",
+					lastContextPercentage: 68,
+					lastInputTokens: 68_000,
+				});
+				const messages = Array.from({ length: 12 }, (_, index) =>
+					index % 2 === 0
+						? userMessage(`child user ${index}`, index + 2)
+						: assistantMessage(`child assistant ${index}`, index + 2),
+				) as never[];
+				await handler({ messages }, {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						messages.map((_, index) => `entry-${index + 1}`),
+						messages,
+					),
+					getContextUsage: () => ({
+						tokens: 85_000,
+						percent: 10,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				await awaitInFlightHistorians();
+				return runner.run;
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		}
+
+		const enabled = await runScenario("ses-omp-child-historian-on", true);
+		const disabled = await runScenario("ses-omp-child-historian-off", false);
+
+		expect(enabled).toHaveBeenCalledTimes(1);
+		expect(disabled).not.toHaveBeenCalled();
+	});
+
 	it("skips trigger-fired historian while /ctx-wrapup is active", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-wrapup-active-skip";

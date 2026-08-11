@@ -49,6 +49,35 @@ export const PiConfigSchema = z
     })
     .optional();
 export type PiConfig = NonNullable<z.infer<typeof PiConfigSchema>>;
+/** OMP-only user-tier controls. Project config must not set this block because
+ * these switches affect process-level child runtime behavior and historian spend. */
+export const OmpConfigSchema = z
+    .object({
+        tools: z
+            .object({
+                ctx_note: z
+                    .boolean()
+                    .default(true)
+                    .describe(
+                        "OMP only: register ctx_note in the primary OMP session. Default true. USER-LEVEL ONLY: project config is ignored.",
+                    ),
+            })
+            .default({ ctx_note: true })
+            .describe("OMP primary-session tool controls."),
+        subagents: z
+            .object({
+                compaction: z
+                    .boolean()
+                    .default(false)
+                    .describe(
+                        "OMP only: allow Magic Context's lightweight Task subagent runtime to use historian-backed compaction. Default false preserves native OMP Task behavior without additional historian spend. USER-LEVEL ONLY: project config is ignored.",
+                    ),
+            })
+            .default({ compaction: false })
+            .describe("OMP Task subagent runtime controls."),
+    })
+    .default({ tools: { ctx_note: true }, subagents: { compaction: false } });
+export type OmpConfig = z.infer<typeof OmpConfigSchema>;
 
 /**
  * Route the built-in prompt surface without changing guidance or tool registration.
@@ -560,6 +589,8 @@ export interface MagicContextConfig {
     };
     /** Pi-only child-process extension controls. */
     pi?: PiConfig;
+    /** OMP-only user-tier child runtime controls. */
+    omp: OmpConfig;
     /** Content-aware reclaim of tool output that a later call supersedes, added
      *  to the normal age-based auto-drop: superseded todowrite/ctx_reduce/meta
      *  outputs are dropped, and older edits to a file are compressed to a marker
@@ -931,6 +962,9 @@ export const MagicContextConfigSchema = z
             ),
         pi: PiConfigSchema.describe(
             "Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load.",
+        ),
+        omp: OmpConfigSchema.describe(
+            "OMP-only user-tier controls. Project configuration cannot enable Task subagent historian compaction or alter process-level tool registration.",
         ),
         smart_drops: z
             .boolean()

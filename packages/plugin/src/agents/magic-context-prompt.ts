@@ -71,15 +71,18 @@ Memories are grouped by category as \`#id: fact\` lines; pass the numeric id to 
 function memoryGuidanceBlock(memoryEnabled: boolean): string {
     return memoryEnabled ? `${MEMORY_GUIDANCE}\n` : "";
 }
+function noteGuidanceBlock(ctxNoteEnabled: boolean): string {
+    return ctxNoteEnabled ? `${CTX_NOTE_GUIDANCE}\n` : "";
+}
 
 const BASE_INTRO = (
     protectedTags: number,
     memoryEnabled: boolean,
+    ctxNoteEnabled: boolean,
 ): string => `Messages and tool outputs are tagged with §N§ identifiers (e.g., §1§, §42§).
 Use \`ctx_reduce\` to mark spent tagged content as discardable and reclaim space. Marking is NOT an immediate delete — it queues the content, which stays fully visible until space is actually needed (as soon as the next turn if you're already under pressure, much later if not), so mark a tool output as soon as you're done with it rather than hoarding the call for the end of the turn. The last ${protectedTags} tags are protected (marking one just queues it until it ages out). Syntax: "3-5", "1,2,9", or "1-5,8,12-15".
 Do not announce or narrate \`ctx_reduce\` drops — just call the tool silently. Saying "I'll drop these outputs" wastes tokens the user does not care about.
-${CTX_NOTE_GUIDANCE}
-${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
+${noteGuidanceBlock(ctxNoteEnabled)}${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use \`ctx_expand\` to recover the raw conversation behind a summary under a \`## start-end · date · title\` heading inside \`<session-history>\` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
 **Search before asking the user**: If you can't remember or don't know something that might have been discussed before or stored in project memory, use \`ctx_search\` before asking the user. Examples:
 - Can't remember where a related codebase or dependency lives → \`ctx_search(query="opencode source code path")\`
@@ -100,8 +103,10 @@ Before your turn finishes, consider using \`ctx_reduce\` to drop large tool outp
  *  agent never sees tags — describing a tagging system they can't observe just
  *  wastes tokens and (empirically) primes some models to emit malformed `§N">§`
  *  tokens at the start of their own text. */
-const BASE_INTRO_NO_REDUCE = (memoryEnabled: boolean): string => `${CTX_NOTE_GUIDANCE}
-${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
+const BASE_INTRO_NO_REDUCE = (
+    memoryEnabled: boolean,
+    ctxNoteEnabled: boolean,
+): string => `${noteGuidanceBlock(ctxNoteEnabled)}${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use \`ctx_expand\` to recover the raw conversation behind a summary under a \`## start-end · date · title\` heading inside \`<session-history>\` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
 **Search before asking the user**: If you can't remember or don't know something that might have been discussed before or stored in project memory, use \`ctx_search\` before asking the user. Examples:
 - Can't remember where a related codebase or dependency lives → \`ctx_search(query="opencode source code path")\`
@@ -117,16 +122,18 @@ const LIGHT_SEARCH_RECOVERY = `Use ctx_search before asking the user about prior
 const BASE_INTRO_LIGHT = (
     protectedTags: number,
     memoryEnabled: boolean,
+    ctxNoteEnabled: boolean,
 ): string => `In primary sessions with ctx_reduce, the system tags messages and tool outputs as §N§ (for example §1§ and §42§); never imitate these prefixes in replies because only injected tag numbers are valid ctx_reduce handles.
 In primary sessions, NEVER narrate ctx_reduce; call it silently after extracting a spent output because it marks content discardable and QUEUES release rather than deleting immediately. The last ${protectedTags} tags stay protected until they age out. Use drop grammar "3-5", "1,2,9", or "1-5,8,12-15".
-${CTX_NOTE_GUIDANCE}
-${memoryGuidanceBlock(memoryEnabled)}${LIGHT_SEARCH_RECOVERY}
+${noteGuidanceBlock(ctxNoteEnabled)}${memoryGuidanceBlock(memoryEnabled)}${LIGHT_SEARCH_RECOVERY}
 ${TOOL_HISTORY_GUIDANCE}
 For primary ctx_reduce choices, NEVER blanket-drop a large range because mixed-value evidence may be lost: inspect every tag first. Drop only analyzed reads, searches, diagnostics, or build/test outputs after use. NEVER drop user directives or assistant prose unless exceptionally large; keep requirements, constraints, unresolved errors or decisions, exact wording, raw evidence, and active files or work. Only extracted pasted user payloads may go.
 Consider small targeted drops after acted-on reads or searches, completed logical steps, before context switches, and before the turn ends; this keeps the working set tidy without changing task scope.`;
 
-const BASE_INTRO_NO_REDUCE_LIGHT = (memoryEnabled: boolean): string => `${CTX_NOTE_GUIDANCE}
-${memoryGuidanceBlock(memoryEnabled)}${LIGHT_SEARCH_RECOVERY}
+const BASE_INTRO_NO_REDUCE_LIGHT = (
+    memoryEnabled: boolean,
+    ctxNoteEnabled: boolean,
+): string => `${noteGuidanceBlock(ctxNoteEnabled)}${memoryGuidanceBlock(memoryEnabled)}${LIGHT_SEARCH_RECOVERY}
 ${TOOL_HISTORY_GUIDANCE}`;
 
 const GENERIC_SECTION = `
@@ -186,6 +193,7 @@ export function buildMagicContextSection(
     memoryEnabled = true,
     preset: PromptSurfacePreset = "full",
     primaryOverride?: string,
+    ctxNoteEnabled = true,
 ): string {
     // Subagent sessions: minimal §N§ + ctx_reduce mechanics only. Bypasses the
     // long-term-partner frame, memory/search/note guidance, and the reduction
@@ -200,11 +208,12 @@ export function buildMagicContextSection(
                 : SUBAGENT_REDUCE_INTRO(protectedTags);
         return `## Magic Context\n\n${intro}`;
     }
-    const smartNoteGuidance = dreamerEnabled
-        ? preset === "light"
-            ? SMART_NOTE_GUIDANCE_LIGHT
-            : `\nWhen \`surface_condition\` is provided with \`write\`, the note becomes a project-scoped smart note.\nThe dreamer evaluates smart note conditions during nightly runs and surfaces them when conditions are met.\nExample: \`ctx_note(action="write", content="Implement X because Y", surface_condition="When PR #42 is merged in this repo")\``
-        : "";
+    const smartNoteGuidance =
+        dreamerEnabled && ctxNoteEnabled
+            ? preset === "light"
+                ? SMART_NOTE_GUIDANCE_LIGHT
+                : `\nWhen \`surface_condition\` is provided with \`write\`, the note becomes a project-scoped smart note.\nThe dreamer evaluates smart note conditions during nightly runs and surfaces them when conditions are met.\nExample: \`ctx_note(action="write", content="Implement X because Y", surface_condition="When PR #42 is merged in this repo")\``
+            : "";
     const temporalGuidance = temporalAwarenessEnabled ? TEMPORAL_AWARENESS_GUIDANCE : "";
     // Caveman compression is independent of ctx_reduce availability. Emit the
     // warning in both primary guidance variants whenever the primary-session
@@ -222,12 +231,12 @@ export function buildMagicContextSection(
 
     if (!ctxReduceCallable) {
         if (preset === "light") {
-            return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_NO_REDUCE_LIGHT}\n\n${BASE_INTRO_NO_REDUCE_LIGHT(memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
+            return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_NO_REDUCE_LIGHT}\n\n${BASE_INTRO_NO_REDUCE_LIGHT(memoryEnabled, ctxNoteEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
         }
-        return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_NO_REDUCE}\n\n${BASE_INTRO_NO_REDUCE(memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
+        return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_NO_REDUCE}\n\n${BASE_INTRO_NO_REDUCE(memoryEnabled, ctxNoteEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
     }
     if (preset === "light") {
-        return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_REDUCE_LIGHT}\n\n${BASE_INTRO_LIGHT(protectedTags, memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
+        return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_REDUCE_LIGHT}\n\n${BASE_INTRO_LIGHT(protectedTags, memoryEnabled, ctxNoteEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
     }
-    return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_REDUCE}\n\n${BASE_INTRO(protectedTags, memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}\n${GENERIC_SECTION}\n\nPrefer many small targeted operations over one large blanket operation, and keep the working set tidy as routine maintenance.${languageGuidance}`;
+    return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_REDUCE}\n\n${BASE_INTRO(protectedTags, memoryEnabled, ctxNoteEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}\n${GENERIC_SECTION}\n\nPrefer many small targeted operations over one large blanket operation, and keep the working set tidy as routine maintenance.${languageGuidance}`;
 }

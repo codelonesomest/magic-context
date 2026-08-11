@@ -221,6 +221,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *  - `prompt_surface.guidance_override_path` / `tool_descriptions` — a repository
  *    may select a reviewed preset, but must not inject arbitrary guidance or tool
  *    description text into the user's provider-visible prompt.
+ *  - `omp` — OMP child runtime controls are user-tier only: a repository cannot
+ *    opt users into Task subagent historian spend or alter process-level tool
+ *    registration policy.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
  *    re-permission the historian/dreamer/sidekick.
  */
@@ -318,6 +321,13 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         delete pi.subagent_extensions;
         warnings.push(
             "Ignoring pi.subagent_extensions from project config (security: only user-level config may choose extensions loaded by Pi subagent children).",
+        );
+    }
+
+    if ("omp" in projectRaw) {
+        delete projectRaw.omp;
+        warnings.push(
+            "Ignoring omp from project config (security: only user-level config may control OMP Task subagent compaction or process-level tool registration).",
         );
     }
 

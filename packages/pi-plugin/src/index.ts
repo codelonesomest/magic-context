@@ -151,6 +151,13 @@ import {
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
+import { registerOmpSubagentCompaction } from "./omp-subagent-compaction";
+import {
+	clearOmpTaskChildRegistrar,
+	createOmpTaskChildRegistrar,
+	publishOmpTaskChildRegistrar,
+	tryRegisterOmpTaskChildRuntime,
+} from "./omp-task-child-runtime";
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
@@ -159,6 +166,7 @@ import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 import {
 	configurePiSubagentExtensions,
+	isOmpHostProcess,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
@@ -729,6 +737,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// timers, no background scans). The parent's registered instance keeps
 	// serving. See the latch block above for the dispose / `/reload` re-arm path.
 	if (isPiMagicContextActiveInProcess()) {
+		if (tryRegisterOmpTaskChildRuntime(pi)) {
+			log(`${PREFIX} OMP Task child detected; registered lightweight runtime`);
+			return;
+		}
 		log(
 			`${PREFIX} in-process re-init detected (Magic Context already active in this process); skipping full extension registration`,
 		);
@@ -1121,6 +1133,42 @@ async function startPiMagicContextRuntime(
 
 	const bootProjectDeps = buildProjectDeps(projectDir, projectIdentity, config);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
+	// OMP Task children are created in-process and reload this extension. Keep
+	// lifecycle attestation on the process-owned primary runtime, independent of
+	// the historian kill switch, so the child transform remains fail-closed until
+	// OMP has emitted its started event and the durable JSONL session id is known.
+	if (isOmpHostProcess()) {
+		const attestation = registerOmpSubagentCompaction(pi, {
+			db,
+			enabled: true,
+			isHostProcess: isOmpHostProcess,
+		});
+		if (attestation.registered) {
+			info("registered OMP Task child lifecycle attestation");
+		}
+	}
+
+	publishOmpTaskChildRegistrar(
+		createOmpTaskChildRegistrar({
+			db,
+			registrationPromptSurface,
+			promptSurfaceRuntime,
+			resolveProject: (directory) => {
+				const project = resolveProjectDepsForDir(directory);
+				return {
+					config: project.config,
+					contextOptions: project.contextOptions,
+					projectIdentity: project.projectIdentity,
+				};
+			},
+			resolveGuidance: (sessionId, promptSurface, modelKey) =>
+				promptSurfaceGuidanceEpochs.resolve(sessionId, promptSurface, modelKey),
+			clearGuidance: (sessionId) =>
+				promptSurfaceGuidanceEpochs.clear(sessionId),
+			persistMessageEndModelMeta: persistPiMessageEndModelMeta,
+			persistPressureFromMessageEnd: persistPiPressureFromMessageEnd,
+		}),
+	);
 	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
 	const todowriteOverlayEnabled =
 		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
@@ -1153,6 +1201,7 @@ async function startPiMagicContextRuntime(
 		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
 		// the retrieval-only sidekick, a separate security concern.)
 		memoryToolEnabled: true,
+		noteToolEnabled: !isOmpHostProcess() || config.omp.tools.ctx_note,
 		protectedTags: config.protected_tags ?? 20,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
@@ -1744,6 +1793,8 @@ async function startPiMagicContextRuntime(
 				language: effectiveConfig.language,
 				promptSurfacePreset: promptSurface.preset,
 				primaryGuidanceOverride: promptSurface.primaryOverride,
+				ctxNoteEnabled:
+					!isOmpHostProcess() || effectiveConfig.omp.tools.ctx_note,
 				// Stable user memories rendered as <user-profile> — dreamer
 				// promotes recurring observations into this set, then the
 				// system prompt surfaces them across all sessions in the
@@ -2317,6 +2368,7 @@ async function startPiMagicContextRuntime(
 		// here lets a `/reload` legitimately re-initialize the full runtime,
 		// while ephemeral in-process children never touch it.
 		clearPiMagicContextActive();
+		clearOmpTaskChildRegistrar();
 	});
 
 	// Pi has no `session_deleted` event, but `session_before_switch`

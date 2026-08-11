@@ -136,6 +136,22 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("pi.subagent_extensions"))).toBe(true);
     });
 
+    it("strips the entire OMP block from project config", () => {
+        const raw: Record<string, unknown> = {
+            omp: {
+                subagents: { compaction: true },
+                tools: { ctx_note: false },
+            },
+            dreamer: { model: "x" },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect("omp" in raw).toBe(false);
+        expect(raw.dreamer).toEqual({ model: "x" });
+        expect(warnings.some((w) => w.includes("omp"))).toBe(true);
+    });
+
     it("strips embedding destination fields from project config but keeps tuning fields", () => {
         const raw: Record<string, unknown> = {
             embedding: {

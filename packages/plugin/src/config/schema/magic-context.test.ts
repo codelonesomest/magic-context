@@ -40,6 +40,14 @@ describe("MagicContextConfigSchema", () => {
                     enabled: true,
                     overlay: true,
                 },
+                omp: {
+                    tools: {
+                        ctx_note: true,
+                    },
+                    subagents: {
+                        compaction: false,
+                    },
+                },
             });
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
@@ -142,6 +150,14 @@ describe("MagicContextConfigSchema", () => {
                 pi: {
                     subagent_extensions: ["@example/provider", "./extensions/local.ts"],
                 },
+                omp: {
+                    tools: {
+                        ctx_note: true,
+                    },
+                    subagents: {
+                        compaction: true,
+                    },
+                },
                 sidekick: {
                     disable: false,
                     model: "qwen-test",
@@ -240,6 +256,25 @@ describe("MagicContextConfigSchema", () => {
                     pi: { subagent_extensions: ["provider-package", "./local.ts"] },
                 }).pi,
             ).toEqual({ subagent_extensions: ["provider-package", "./local.ts"] });
+        });
+
+        it("accepts explicit OMP Task subagent compaction settings", () => {
+            expect(
+                MagicContextConfigSchema.parse({
+                    omp: { subagents: { compaction: true } },
+                }).omp,
+            ).toEqual({
+                tools: { ctx_note: true },
+                subagents: { compaction: true },
+            });
+            expect(
+                MagicContextConfigSchema.parse({
+                    omp: { subagents: { compaction: false } },
+                }).omp,
+            ).toEqual({
+                tools: { ctx_note: true },
+                subagents: { compaction: false },
+            });
         });
 
         it("accepts and normalizes 2-letter ISO 639-1 language codes", () => {

@@ -45,6 +45,8 @@ export interface BuildMagicContextBlockOptions {
 	dreamerEnabled?: boolean;
 	temporalAwarenessEnabled?: boolean;
 	cavemanTextCompressionEnabled?: boolean;
+	/** Render bounded Task-child guidance instead of the primary long-term frame. */
+	subagentMode?: boolean;
 	language?: string;
 	promptSurfacePreset?: PromptSurfacePreset;
 	primaryGuidanceOverride?: string;
@@ -52,6 +54,8 @@ export interface BuildMagicContextBlockOptions {
 	userMemoriesEnabled?: boolean;
 	existingSystemPrompt?: string;
 	isCacheBusting?: boolean;
+	/** Match guidance to the registered ctx_note surface. */
+	ctxNoteEnabled?: boolean;
 }
 
 /**
@@ -75,13 +79,14 @@ export function buildMagicContextBlock(
 		opts.dreamerEnabled ?? false,
 		opts.temporalAwarenessEnabled ?? false,
 		opts.cavemanTextCompressionEnabled ?? false,
-		false,
+		opts.subagentMode ?? false,
 		opts.language,
 		// Drop ctx_memory guidance when memory is off (the tool is gated via
 		// registerMagicContextTools memoryToolEnabled). ctx_search guidance stays.
 		opts.memoryEnabled !== false,
 		opts.promptSurfacePreset,
 		opts.primaryGuidanceOverride,
+		opts.ctxNoteEnabled ?? true,
 	);
 }
 

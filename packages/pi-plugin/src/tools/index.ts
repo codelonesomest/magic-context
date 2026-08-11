@@ -55,6 +55,8 @@ export interface RegisterToolsOptions {
 	/** When false, omit ctx_memory from the registered surface. Sidekick only
 	 *  needs read-only ctx_search; dreamer and the main agent keep ctx_memory. */
 	memoryToolEnabled?: boolean;
+	/** When false, omit ctx_note while retaining ctx_expand and ctx_reduce. */
+	noteToolEnabled?: boolean;
 	/** When true, omit session-scoped tools (ctx_note, ctx_expand) from the
 	 *  registered surface. Set by `--no-session` children (sidekick, dreamer):
 	 *  those tools resolve `ctx.sessionManager.getSessionId()` to the EPHEMERAL
@@ -131,10 +133,10 @@ export function registerMagicContextTools(
 
 	// ctx_note and ctx_expand are session-scoped: they resolve the CURRENT
 	// session id at call time. For `--no-session` children that id is the hidden
-	// ephemeral child session, so a note would be orphaned and an expand would
-	// target the child's empty transcript. Omit them for those children; ctx_search
-	// stays available and ctx_memory is controlled above.
-	if (!opts.sessionScopedToolsDisabled) {
+	// ephemeral child session, so both are omitted. OMP Task children own durable
+	// sessions and keep ctx_expand, but intentionally omit ctx_note from their
+	// bounded three-tool Magic Context surface.
+	if (!opts.sessionScopedToolsDisabled && opts.noteToolEnabled !== false) {
 		pi.registerTool(
 			surfaceTool(
 				createCtxNoteTool({
@@ -145,7 +147,9 @@ export function registerMagicContextTools(
 				}),
 			),
 		);
+	}
 
+	if (!opts.sessionScopedToolsDisabled) {
 		pi.registerTool(surfaceTool(createCtxExpandTool({ db: opts.db })));
 	}
 

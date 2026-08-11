@@ -46,6 +46,31 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
+	it("omits only ctx_note when the OMP note surface is disabled", () => {
+		const db = createTestDb();
+		try {
+			const registered: string[] = [];
+			const pi = {
+				registerTool: (tool: { name: string }) => registered.push(tool.name),
+				registerCommand: () => undefined,
+			} as never;
+
+			registerMagicContextTools(pi, { db, noteToolEnabled: false });
+
+			expect(registered).not.toContain("ctx_note");
+			expect(registered).toEqual(
+				expect.arrayContaining([
+					"ctx_search",
+					"ctx_memory",
+					"ctx_expand",
+					"ctx_reduce",
+				]),
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("removes only ctx_reduce in compaction-off mode", () => {
 		const db = createTestDb();
 		try {

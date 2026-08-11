@@ -955,6 +955,8 @@ export interface PiInjectionOptions {
 	memoryEnabled?: boolean;
 	/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
 	injectDocs?: boolean;
+	/** Defaults true. When false, m[0]/m[1] omit the global user profile. */
+	userProfileEnabled?: boolean;
 	injectionBudgetTokens: number;
 	temporalAwareness?: boolean;
 	/** mural.enabled — when enabled, generate a deterministic image of memories that did not fit the context budget whenever the system performs a full (HARD) context fold. */
@@ -1018,6 +1020,12 @@ export interface PiContextHandlerOptions {
 	 * async after each tagging pass.
 	 */
 	historian?: PiHistorianOptions;
+	/** Allow lifecycle-attested OMP task subagents to run the automatic historian. */
+	subagentCompaction?: boolean;
+	/** Resolve whether ctx_reduce is callable in this handler's active session. */
+	isSubagentCtxReduceCallable?: () => boolean;
+	/** Ignore context events until the parent lifecycle attests this as a task child. */
+	requiresSubagentAttestation?: boolean;
 	/**
 	 * Optional auto-search hint wiring (Step 4b.4). When omitted or
 	 * disabled, no hint computation runs. Notes that auto-search shares
@@ -1998,6 +2006,16 @@ export function registerPiContextHandler(
 				);
 				return;
 			}
+			const initialSessionMeta = getOrCreateSessionMeta(
+				baseOptions.db,
+				sessionId,
+			);
+			if (
+				baseOptions.requiresSubagentAttestation === true &&
+				!initialSessionMeta.isSubagent
+			) {
+				return;
+			}
 			sessionIdForError = sessionId;
 			const projectDirectory = ctx.cwd;
 			const fullWireMessageCount = event.messages.length;
@@ -2748,6 +2766,9 @@ export function registerPiContextHandler(
 				projectIdentity,
 				projectDirectory,
 				sessionMeta,
+				ctxReduceCallable:
+					!sessionMeta.isSubagent ||
+					options.isSubagentCtxReduceCallable?.() === true,
 				messages: event.messages,
 				smartDrops: options.smartDrops === true,
 				protectedTags: options.protectedTags ?? 20,
@@ -2756,7 +2777,13 @@ export function registerPiContextHandler(
 				injection: options.injection
 					? {
 							...options.injection,
-							memoryEnabled: options.injection.memoryEnabled,
+							memoryEnabled: sessionMeta.isSubagent
+								? false
+								: options.injection.memoryEnabled,
+							injectDocs: sessionMeta.isSubagent
+								? false
+								: options.injection.injectDocs,
+							userProfileEnabled: !sessionMeta.isSubagent,
 							// v2 decay rendering needs the HISTORY budget (~60K), not the
 							// memory injection budget (~4K). Compute it from live usage +
 							// historian config, mirroring OpenCode's decayPressure budget.
@@ -2795,7 +2822,9 @@ export function registerPiContextHandler(
 						DEFAULT_CLEAR_REASONING_AGE,
 				},
 				canUseEmptySentinels,
-				temporalAwareness: options.injection?.temporalAwareness === true,
+				temporalAwareness:
+					!sessionMeta.isSubagent &&
+					options.injection?.temporalAwareness === true,
 				appendCompaction: resolvePiAppendCompaction(ctx),
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				isSubagent: sessionMeta.isSubagent,
@@ -2845,7 +2874,11 @@ export function registerPiContextHandler(
 			// behavior is the Step 4b.2 contract, and historian is
 			// fire-and-forget so we never block the LLM call on it.
 			const tHistorianScheduling = performance.now();
-			if (options.historian && !options.compactionOff) {
+			if (
+				options.historian &&
+				!options.compactionOff &&
+				(!sessionMeta.isSubagent || options.subagentCompaction === true)
+			) {
 				maybeFireHistorian({
 					pi,
 					ctx,
@@ -2873,35 +2906,41 @@ export function registerPiContextHandler(
 			let outputMessages = result.messages as PiAgentMessage[];
 
 			const tNoteNudges = performance.now();
-			try {
-				if (!options.compactionOff) {
-					outputMessages = applyNoteNudges({
+			if (!sessionMeta.isSubagent) {
+				try {
+					if (!options.compactionOff) {
+						outputMessages = applyNoteNudges({
+							sessionId,
+							db: options.db,
+							messages: outputMessages,
+							projectIdentity,
+							entryIds: strictEntryIds,
+							// Use the map produced after commits and splices because those operations
+							// can change the final message-reference to entry-ID mapping.
+							entryIdByRef: result.postCommitEntryIdByRef,
+							// Same signal OpenCode uses to gate sticky-anchor GC
+							// (isCacheBustingPass = history-refresh OR work executed).
+							isCacheBusting: isCacheBusting || result.executedWorkThisPass,
+							// These leading synthetic messages have no persisted entry IDs, so
+							// exclude them from the sticky-anchor GC denominator.
+							syntheticLeadingCount: result.syntheticLeadingCount,
+						});
+					}
+				} catch (err) {
+					sessionLog(
 						sessionId,
-						db: options.db,
-						messages: outputMessages,
-						projectIdentity,
-						entryIds: strictEntryIds,
-						// Use the map produced after commits and splices because those operations
-						// can change the final message-reference to entry-ID mapping.
-						entryIdByRef: result.postCommitEntryIdByRef,
-						// Same signal OpenCode uses to gate sticky-anchor GC
-						// (isCacheBustingPass = history-refresh OR work executed).
-						isCacheBusting: isCacheBusting || result.executedWorkThisPass,
-						// These leading synthetic messages have no persisted entry IDs, so
-						// exclude them from the sticky-anchor GC denominator.
-						syntheticLeadingCount: result.syntheticLeadingCount,
-					});
+						`note nudges failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
 				}
-			} catch (err) {
-				sessionLog(
-					sessionId,
-					`note nudges failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
 			}
 			logTransformTiming(sessionId, "noteNudges", tNoteNudges);
 
 			const tAutoSearch = performance.now();
-			if (options.autoSearch?.enabled && !options.compactionOff) {
+			if (
+				!sessionMeta.isSubagent &&
+				options.autoSearch?.enabled &&
+				!options.compactionOff
+			) {
 				try {
 					outputMessages = await runAutoSearchHintForPi({
 						sessionId,
@@ -3179,11 +3218,13 @@ export function registerPiContextHandler(
 			// preserve message identity for unchanged messages and only
 			// rebuild the mutated ones, so this cast is safe at runtime.
 			clearLastTransformErrorIfSet(options.db, sessionId);
-			options.maybeAutoEmbedSession?.(
-				sessionId,
-				projectDirectory,
-				projectIdentity,
-			);
+			if (!sessionMeta.isSubagent) {
+				options.maybeAutoEmbedSession?.(
+					sessionId,
+					projectDirectory,
+					projectIdentity,
+				);
+			}
 			logTransformTiming(sessionId, "postPipelineTotal", postPipelineStart);
 			const transformElapsedMs = performance.now() - transformStartTime;
 			recordPiTransformTiming({
@@ -3508,6 +3549,7 @@ function spawnPiHistorianRun(args: {
 			return;
 		}
 		const renewal = startPiCompartmentLeaseRenewal(db, sessionId, holderId);
+		const isTaskSubagent = getOrCreateSessionMeta(db, sessionId).isSubagent;
 		try {
 			await runPiHistorian({
 				db,
@@ -3527,10 +3569,12 @@ function spawnPiHistorianRun(args: {
 				historianTimeoutMs: historian.timeoutMs,
 				twoPass: historian.twoPass,
 				thinkingLevel: historian.thinkingLevel,
-				memoryEnabled: historian.memoryEnabled,
+				memoryEnabled: isTaskSubagent ? false : historian.memoryEnabled,
 				allowHomeProject: historian.allowHomeProject,
-				autoPromote: historian.autoPromote,
-				userMemoriesEnabled: historian.userMemoriesEnabled,
+				autoPromote: isTaskSubagent ? false : historian.autoPromote,
+				userMemoriesEnabled: isTaskSubagent
+					? false
+					: historian.userMemoriesEnabled,
 				language: historian.language,
 				compartmentLeaseHolderId: holderId,
 				notifyIssue: (text) => {
@@ -4018,6 +4062,8 @@ interface RunPipelineArgs {
 		caveman?: { enabled: boolean; minChars: number };
 	};
 	isSubagent?: boolean;
+	/** Whether ctx_reduce is actually registered for this session. */
+	ctxReduceCallable?: boolean;
 	/** Additive-only transform mode: no tags, drops, history trim, markers, or nudges. */
 	compactionOff?: boolean;
 	/** ceiling = contextLimit × executeThreshold% for the tiered emergency drop. */
@@ -4029,6 +4075,8 @@ interface RunPipelineArgs {
 		memoryEnabled?: boolean;
 		/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
 		injectDocs?: boolean;
+		/** Defaults true. When false, m[0]/m[1] omit the global user profile. */
+		userProfileEnabled?: boolean;
 		injectionBudgetTokens: number;
 		/** v2 decay-render history budget (~60K), distinct from the memory
 		 *  injection budget. Drives compartment tier demotion in renderM0Pi. */
@@ -4369,11 +4417,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const alreadyRanHeuristicsThisTurn =
 		currentTurnId !== null &&
 		lastHeuristicsTurnIdBySession.get(args.sessionId) === currentTurnId;
-	// Pi's primary process always registers ctx_reduce. Hidden/no-session child
-	// processes do not use this context handler; if a future path marks a session
-	// as subagent here, suppress visible tags and nudges so the prompt never points
-	// at a missing session-scoped tool.
-	const ctxReduceCallable = !args.sessionMeta.isSubagent;
+	// Visible tag prefixes are only valid when the session can call ctx_reduce.
+	// Primary Pi always can; lifecycle-attested OMP task children inherit their
+	// own minimal tool registry and pass this capability explicitly.
+	const ctxReduceCallable =
+		args.ctxReduceCallable ?? !args.sessionMeta.isSubagent;
 	// Mid-turn-aware gate for consuming DEFERRED publication signals — mirrors
 	// OpenCode's canConsumeDeferredOnThisPass. `args.schedulerDecision` is ALREADY
 	// the mid-turn-adjusted decision (applyMidTurnDeferral downgrades execute→defer
@@ -4438,6 +4486,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						projectIdentity: args.projectIdentity,
 						projectDirectory: args.projectDirectory,
 						memoryEnabled: args.injection.memoryEnabled,
+						userProfileEnabled: args.injection.userProfileEnabled,
 						injectionBudgetTokens: args.injection.injectionBudgetTokens,
 						historyBudgetTokens: args.injection.historyBudgetTokens,
 						hardSignals: piHardSignals,
@@ -5238,6 +5287,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					projectDirectory: args.projectDirectory,
 					memoryEnabled: args.injection.memoryEnabled,
 					injectDocs: args.injection.injectDocs,
+					userProfileEnabled: args.injection.userProfileEnabled,
 					injectionBudgetTokens: args.injection.injectionBudgetTokens,
 					historyBudgetTokens: args.injection.historyBudgetTokens,
 					hardSignals: piHardSignals,
