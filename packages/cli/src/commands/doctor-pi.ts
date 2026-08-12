@@ -17,6 +17,10 @@ import {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import {
+    isPrototypePollutionKey,
+    sanitizeParsedJson,
+} from "@magic-context/core/shared/jsonc-parser";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 
@@ -30,6 +34,7 @@ import {
     openExistingContextDatabaseForMutation,
     UnsupportedSchemaVersionError,
 } from "../lib/database-access";
+import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
@@ -293,7 +298,14 @@ function readConfigForEmbedding(
             configPath: path,
             isProjectConfig,
         });
-        return parseJsonc(substituted.text) as Record<string, unknown>;
+        const rejectedKeyPaths: string[] = [];
+        const parsed = sanitizeParsedJson(parseJsonc(substituted.text) as Record<string, unknown>, {
+            onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
+        });
+        if (rejectedKeyPaths.length > 0) {
+            throw new Error("unsafe prototype-pollution key in config");
+        }
+        return parsed;
     } catch {
         return null;
     }
@@ -610,7 +622,7 @@ async function runHealthChecks(options: {
                     add(
                         results,
                         "fail",
-                        `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}`,
+                        `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}\n${formatDatabaseRepairGuidance(dbPath)}`,
                     );
 
                 const counts = ROW_COUNT_TABLES.map(
@@ -632,7 +644,7 @@ async function runHealthChecks(options: {
                 add(
                     results,
                     "fail",
-                    `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
+                    `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}\n${formatDatabaseRepairGuidance(dbPath)}`,
                 );
             }
         } finally {
@@ -656,7 +668,15 @@ async function runHealthChecks(options: {
     for (const config of [userRaw, projectRaw]) {
         const embedding = config?.embedding;
         if (embedding && typeof embedding === "object" && !Array.isArray(embedding)) {
-            Object.assign(mergedEmbedding, embedding);
+            for (const key of Object.keys(embedding)) {
+                if (isPrototypePollutionKey(key)) continue;
+                Object.defineProperty(mergedEmbedding, key, {
+                    value: (embedding as Record<string, unknown>)[key],
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                });
+            }
         }
     }
     // Drop the inherited user api_key if the project redirected the endpoint.

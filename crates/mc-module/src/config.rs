@@ -61,9 +61,8 @@ pub struct McModuleConfig {
     pub temporal_awareness: bool,
     pub smart_drops: bool,
     pub cache_ttl: String,
-    /// Per-model TTL overrides from the object config shape; keys are full
-    /// provider/model keys or bare model ids, mirroring the TS resolveCacheTtl
-    /// precedence (exact key, then bare id, then default).
+    /// Per-model TTL overrides from the object config shape. Resolution uses the
+    /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
 }
 
@@ -87,22 +86,69 @@ impl Default for McModuleConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtlProvenance {
+    Explicit,
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCacheTtl {
+    pub value: String,
+    pub provenance: CacheTtlProvenance,
+}
+
 impl McModuleConfig {
-    /// Resolve the effective cache TTL for a model, mirroring the TS adapter's
-    /// resolveCacheTtl precedence: exact provider/model key, then the bare model id
-    /// (config written without the provider prefix), then the default.
-    pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
-        if let Some(key) = model_key {
-            if let Some(ttl) = self.cache_ttl_by_model.get(key) {
-                return ttl.clone();
-            }
-            if let Some((_, bare)) = key.split_once('/') {
-                if let Some(ttl) = self.cache_ttl_by_model.get(bare) {
-                    return ttl.clone();
-                }
-            }
+    /// Resolve the effective cache TTL while preserving whether the model walk matched an entry.
+    ///
+    /// The configured default remains the effective value for host-side scheduling, but it is not
+    /// an instruction to place that value on a provider cache marker.
+    pub fn resolve_cache_ttl_with_provenance(&self, model_key: Option<&str>) -> ResolvedCacheTtl {
+        let explicit = |value: &String| ResolvedCacheTtl {
+            value: value.clone(),
+            provenance: CacheTtlProvenance::Explicit,
+        };
+        let default = || ResolvedCacheTtl {
+            value: self.cache_ttl.clone(),
+            provenance: CacheTtlProvenance::Default,
+        };
+
+        // Check an exact key before splitting into provider and model parts, so a bare key cannot
+        // silently fall back to the default TTL.
+        if let Some(ttl) = model_key.and_then(|key| self.cache_ttl_by_model.get(key)) {
+            return explicit(ttl);
         }
-        self.cache_ttl.clone()
+        let Some((provider, mut model_id)) = model_key.and_then(|key| key.split_once('/')) else {
+            return default();
+        };
+        if provider.is_empty() || model_id.is_empty() {
+            return default();
+        }
+
+        loop {
+            let exact = format!("{provider}/{model_id}");
+            if let Some(ttl) = self.cache_ttl_by_model.get(&exact) {
+                return explicit(ttl);
+            }
+            if let Some(ttl) = self.cache_ttl_by_model.get(model_id) {
+                return explicit(ttl);
+            }
+
+            let Some(last_dash) = model_id.rfind('-').filter(|index| *index > 0) else {
+                break;
+            };
+            model_id = &model_id[..last_dash];
+        }
+
+        if let Some(ttl) = self.cache_ttl_by_model.get(&format!("{provider}/*")) {
+            return explicit(ttl);
+        }
+        default()
+    }
+
+    /// Resolve only the effective value for existing host-side callers.
+    pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
+        self.resolve_cache_ttl_with_provenance(model_key).value
     }
 }
 
@@ -458,6 +504,50 @@ mod cache_ttl_tests {
         assert_eq!(cfg.resolve_cache_ttl(Some("openai/gpt-5.6-sol")), "30m");
         assert_eq!(cfg.resolve_cache_ttl(Some("unknown/model")), "10m");
         assert_eq!(cfg.resolve_cache_ttl(None), "10m");
+        // A bare unprefixed key with an exact config entry must not downgrade
+        // to the default (pre-parity behavior preserved).
+        assert_eq!(cfg.resolve_cache_ttl(Some("gpt-5.6-sol")), "30m");
+    }
+
+    #[test]
+    fn provenance_distinguishes_an_explicit_value_equal_to_the_default() {
+        let mut cfg = McModuleConfig::default();
+        cfg.cache_ttl_by_model.insert(
+            "anthropic/claude-haiku-4-5".to_string(),
+            cfg.cache_ttl.clone(),
+        );
+
+        let explicit = cfg.resolve_cache_ttl_with_provenance(Some("anthropic/claude-haiku-4-5"));
+        let fallback = cfg.resolve_cache_ttl_with_provenance(Some("anthropic/claude-nova-6-0"));
+        assert_eq!(explicit.value, fallback.value);
+        assert_eq!(explicit.provenance, CacheTtlProvenance::Explicit);
+        assert_eq!(fallback.provenance, CacheTtlProvenance::Default);
+    }
+
+    #[test]
+    fn cache_ttl_resolution_matches_shared_typescript_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/cache-ttl-routing-vectors.json"))
+                .unwrap();
+        let mut cfg = McModuleConfig {
+            cache_ttl: vectors["default"].as_str().unwrap().to_string(),
+            ..McModuleConfig::default()
+        };
+        cfg.cache_ttl_by_model = vectors["models"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_str().unwrap().to_string()))
+            .collect();
+
+        for case in vectors["cases"].as_array().unwrap() {
+            assert_eq!(
+                cfg.resolve_cache_ttl(case["modelKey"].as_str()),
+                case["expected"].as_str().unwrap(),
+                "shared vector {}",
+                case["name"].as_str().unwrap()
+            );
+        }
     }
 
     #[test]

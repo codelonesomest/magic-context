@@ -67,6 +67,7 @@ import {
 	findPiFallbackToolOwnerTags,
 	getActiveTagsBySession,
 	getActiveTagTokenAggregate,
+	getDroppedTagsByNumbers,
 	getHistorianFailureState,
 	getMaxDroppedTagNumber,
 	getOldestActiveUnprotectedToolTags,
@@ -222,7 +223,11 @@ import {
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import { clearPiSystemPromptSession } from "./system-prompt";
-import { injectPiTemporalMarkers } from "./temporal-awareness-pi";
+import {
+	injectPiTemporalMarkers,
+	stripPiLeadingTemporalMarker,
+	withoutPiLeadingTemporalMarker,
+} from "./temporal-awareness-pi";
 import { withTimeout } from "./timeout";
 import {
 	type PiMessageTokenCacheEntry,
@@ -469,9 +474,14 @@ function buildPiTextIdentityPlan(
 		if (messageId === undefined) continue;
 		currentSourcesByMessageId.set(
 			messageId,
+			// Temporal gap markers are derived from the current projection. They are
+			// not part of the stored message identity and can disappear when a newly
+			// applied compaction boundary promotes a user message to the wire head.
 			message.parts
 				.filter((part) => part.kind === "text")
-				.map((part) => stripTagPrefix(part.getText() ?? "")),
+				.map((part) =>
+					withoutPiLeadingTemporalMarker(stripTagPrefix(part.getText() ?? "")),
+				),
 		);
 	}
 
@@ -532,7 +542,8 @@ function buildPiTextIdentityPlan(
 			legacyRows.every(
 				(row, index) =>
 					row.ordinal === index &&
-					sourceCache.get(row.tagId) === currentSources[index],
+					withoutPiLeadingTemporalMarker(sourceCache.get(row.tagId) ?? "") ===
+						currentSources[index],
 			);
 		if (!vectorMatches) driftedMessageIds.add(messageId);
 	}
@@ -1487,6 +1498,52 @@ function buildPiAlignedEntryIds(
 	return ids;
 }
 
+// The first two prepended Pi messages already contain the compartment summaries.
+// Calling appendCompaction makes Pi add the same summary during the next projection,
+// changing bytes sent to the provider one pass after cache invalidation. Remove it
+// only when the branch entry proves this plugin created the matching compaction.
+function stripMcOwnedPiCompactionSummary(
+	messages: PiAgentMessage[],
+	entryIds: (string | undefined)[],
+	branchEntries: readonly unknown[],
+): boolean {
+	const summaryMessage = messages[0] as
+		| { role?: unknown; summary?: unknown; tokensBefore?: unknown }
+		| undefined;
+	if (summaryMessage?.role !== "compactionSummary") return false;
+
+	let compaction:
+		| {
+				type?: unknown;
+				summary?: unknown;
+				tokensBefore?: unknown;
+				fromHook?: unknown;
+				details?: unknown;
+		  }
+		| undefined;
+	for (let index = branchEntries.length - 1; index >= 0; index -= 1) {
+		const entry = branchEntries[index] as typeof compaction;
+		if (entry?.type === "compaction") {
+			compaction = entry;
+			break;
+		}
+	}
+	if (compaction?.fromHook !== true) return false;
+	const details = compaction.details as { source?: unknown } | undefined;
+	if (details?.source !== "magic-context") return false;
+	if (
+		summaryMessage.summary !== compaction.summary ||
+		summaryMessage.tokensBefore !== compaction.tokensBefore ||
+		entryIds[0] !== undefined
+	) {
+		return false;
+	}
+
+	messages.splice(0, 1);
+	entryIds.splice(0, 1);
+	return true;
+}
+
 function getPiBranchEntryLookup(
 	entries: readonly unknown[],
 ): PiBranchEntryLookup {
@@ -2083,6 +2140,23 @@ export function registerPiContextHandler(
 								branchEntries,
 							);
 			const strictEntryIds = resolvedEntryIds ? [...resolvedEntryIds] : null;
+			if (
+				strictEntryIds &&
+				branchEntries &&
+				options.injection &&
+				!options.compactionOff &&
+				stripMcOwnedPiCompactionSummary(
+					event.messages as PiAgentMessage[],
+					strictEntryIds,
+					branchEntries,
+				)
+			) {
+				logTransformTiming(
+					sessionId,
+					"mcCompactionSummarySuppression",
+					tEntryBranch,
+				);
+			}
 			if (strictEntryIds && options.injection && !options.compactionOff) {
 				const removed = trimPiMessagesToCachedBoundary(
 					options.db,
@@ -4763,30 +4837,28 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// execute passes. Mirrors OpenCode's `applyFlushedStatuses` call
 	// at transform.ts:728.
 	//
-	// P0 perf: applyFlushedStatuses only ever mutates tags whose
-	// tag_number is in `targets`, so feed it just that slice instead
-	// of the whole session (~50k rows on long sessions). Without this
-	// pre-load it lazy-loads via getTagsBySession internally — exactly
-	// the full-table scan we eliminated in OpenCode's transform.
+	// Status replay only acts on dropped targets. Filter by both status and
+	// visible tag number in SQLite so active rows are not materialized merely to
+	// be discarded by applyFlushedStatuses.
 	const targetTagNumbers = [...targets.keys()];
 	const tGetTags = performance.now();
-	const flushedSliceTags = getTagsByNumbers(
+	const flushedDroppedTags = getDroppedTagsByNumbers(
 		args.db,
 		args.sessionId,
 		targetTagNumbers,
 	);
 	logTransformTiming(
 		args.sessionId,
-		"getTagsByNumbers",
+		"getDroppedTagsByNumbers",
 		tGetTags,
-		`targets=${targetTagNumbers.length} fetched=${flushedSliceTags.length}`,
+		`targets=${targetTagNumbers.length} fetched=${flushedDroppedTags.length}`,
 	);
 	const tFlushed = performance.now();
 	didMutateFromFlushedStatuses = applyFlushedStatuses(
 		args.sessionId,
 		args.db,
 		targets,
-		flushedSliceTags,
+		flushedDroppedTags,
 	);
 	logTransformTiming(args.sessionId, "applyFlushedStatuses", tFlushed);
 	logTransformTiming(args.sessionId, "batchFinalize:flushed", tFlushed);
@@ -5305,6 +5377,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				// replay stale m[1]. Mirrors OpenCode's isCacheBustingPass gate.
 				args.isCacheBusting || deferredHistoryRefresh || executedWorkThisPass,
 			);
+			// Temporal markers are derived before history injection trims raw messages.
+			// If that trim promotes a user message to the raw-history head, its marker
+			// was based on a predecessor that is no longer visible. Remove it now so the
+			// marker-applying pass matches the next pass, where trimming happens first.
+			if (
+				args.temporalAwareness &&
+				injectionResult.skippedVisibleMessages > 0
+			) {
+				const firstRetainedMessage =
+					args.messages[injectionResult.syntheticLeadingCount];
+				stripPiLeadingTemporalMarker(firstRetainedMessage);
+			}
 			// PEEK-then-drain-on-success (Oracle audit Round 8 #6):
 			// only drain `historyRefreshSessions` if the rebuild
 			// succeeded AND this pass was busting the cache. If

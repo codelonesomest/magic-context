@@ -29,6 +29,8 @@ import {
 	setPendingPiCompactionMarkerState,
 	updateCavemanDepth,
 	updateSessionMeta,
+	updateTagDropMode,
+	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	getEmergencyInputSample,
@@ -43,6 +45,7 @@ import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudg
 import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { setBootQuietPeriodForTests } from "@magic-context/core/plugin/boot-quiet";
 import { clearModelsDevCache } from "@magic-context/core/shared/models-dev-cache";
+import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
@@ -1151,6 +1154,138 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("replays dropped text and every tool drop mode from the dropped-only target slice", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-dropped-only-replay";
+		const entryIds = [
+			"entry-drop-text",
+			"entry-full-call",
+			"entry-full-result",
+			"entry-truncated-call",
+			"entry-truncated-result",
+			"entry-edit-call",
+			"entry-edit-result",
+			"entry-active-text",
+		];
+		const buildMessages = () => [
+			userMessage("drop this text", 1),
+			assistantToolCall("call-full", "Read", { filePath: "/tmp/full.ts" }, 2),
+			toolResultMessage("call-full", "full tool output", 3),
+			assistantToolCall(
+				"call-truncated",
+				"Read",
+				{ filePath: "/tmp/truncated.ts" },
+				4,
+			),
+			toolResultMessage("call-truncated", "truncated tool output", 5),
+			assistantToolCall(
+				"call-edit",
+				"edit",
+				{
+					filePath: "/tmp/edit.ts",
+					oldString: "old region ".repeat(40),
+					newString: "new region ".repeat(40),
+				},
+				6,
+			),
+			toolResultMessage("call-edit", "edit tool output", 7),
+			userMessage("keep this active", 8),
+		];
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const firstMessages = buildMessages();
+			await handler(
+				{ messages: firstMessages as never[] },
+				fakeContext(sessionId, process.cwd(), entryIds, firstMessages) as never,
+			);
+
+			const tags = getTagsBySession(db, sessionId);
+			const droppedText = tags.find(
+				(tag) => tag.messageId === "entry-drop-text:p0",
+			);
+			const activeText = tags.find(
+				(tag) => tag.messageId === "entry-active-text:p0",
+			);
+			const fullTool = tags.find(
+				(tag) => tag.toolOwnerMessageId === "entry-full-call",
+			);
+			const truncatedTool = tags.find(
+				(tag) => tag.toolOwnerMessageId === "entry-truncated-call",
+			);
+			const editTool = tags.find(
+				(tag) => tag.toolOwnerMessageId === "entry-edit-call",
+			);
+			if (
+				!droppedText ||
+				!activeText ||
+				!fullTool ||
+				!truncatedTool ||
+				!editTool
+			) {
+				throw new Error("missing replay fixture tags");
+			}
+			for (const tag of [droppedText, fullTool, truncatedTool, editTool]) {
+				updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+			}
+			updateTagDropMode(db, sessionId, fullTool.tagNumber, "full");
+			updateTagDropMode(db, sessionId, truncatedTool.tagNumber, "truncated");
+			updateTagDropMode(db, sessionId, editTool.tagNumber, "edit_marker");
+
+			const replayMessages = buildMessages();
+			const result = await handler(
+				{ messages: replayMessages as never[] },
+				fakeContext(
+					sessionId,
+					process.cwd(),
+					entryIds,
+					replayMessages,
+				) as never,
+			);
+			const output = result.messages as unknown as ReturnType<
+				typeof buildMessages
+			>;
+			const fullSentinel = `[dropped §${fullTool.tagNumber}§]`;
+			const truncatedSentinel = `[dropped §${truncatedTool.tagNumber}§]`;
+			const editSentinel = `[dropped §${editTool.tagNumber}§]`;
+			const toolArguments = (index: number): Record<string, unknown> => {
+				const content = (output[index] as { content?: unknown }).content;
+				if (!Array.isArray(content))
+					throw new Error(`message ${index} has no content`);
+				const call = content.find(
+					(part) =>
+						typeof part === "object" &&
+						part !== null &&
+						(part as { type?: unknown }).type === "toolCall",
+				) as { arguments?: Record<string, unknown> } | undefined;
+				return call?.arguments ?? {};
+			};
+
+			expect(textOf(output[0])).toBe(`[dropped §${droppedText.tagNumber}§]`);
+			expect(toolArguments(1)).toEqual({
+				__magic_context_dropped__: fullSentinel,
+			});
+			expect(textOf(output[2])).toBe(fullSentinel);
+			expect(toolArguments(3)).toEqual({
+				__magic_context_replacement__: truncatedSentinel,
+			});
+			expect(textOf(output[4])).toBe(truncatedSentinel);
+			expect(toolArguments(5).filePath).toBe("/tmp/edit.ts");
+			expect(String(toolArguments(5).oldString)).toEndWith("...[truncated]");
+			expect(textOf(output[6])).toBe(editSentinel);
+			expect(textOf(output[7])).toBe(
+				`§${activeText.tagNumber}§ keep this active`,
+			);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("resets the persisted Channel 1 band when baseline refresh sees a smaller tail", async () => {
 		const db = createTestDb();
 		try {
@@ -1657,25 +1792,37 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
-	it("persists model-resolved cache_ttl from Pi message_end assistant metadata", async () => {
+	it("canonicalizes Pi-native refs before cache_ttl and prompt-surface routing", async () => {
 		const db = createTestDb();
 		try {
-			const { persistPiMessageEndModelMeta } = await import("./index");
+			const { canonicalPiModelKey, persistPiMessageEndModelMeta } =
+				await import("./index");
+			const canonicalModelKey = canonicalPiModelKey(
+				"openai-codex",
+				"gpt-5.6-sol",
+			);
 
 			persistPiMessageEndModelMeta({
 				db,
 				sessionId: "ses-context",
 				message: assistantMessage("done", 1, {
-					provider: "anthropic",
-					model: "claude-sonnet-4-5",
+					provider: "openai-codex",
+					model: "gpt-5.6-sol",
 				}),
 				cacheTtlConfig: {
 					default: "5m",
-					"anthropic/claude-sonnet-4-5": "1h",
+					"openai/gpt-5.6-sol": "never",
 				},
 			});
 
-			expect(getOrCreateSessionMeta(db, "ses-context").cacheTtl).toBe("1h");
+			expect(canonicalModelKey).toBe("openai/gpt-5.6-sol");
+			expect(getOrCreateSessionMeta(db, "ses-context").cacheTtl).toBe("never");
+			expect(
+				resolvePromptSurface(
+					{ default: "full", models: { "openai/gpt-5.6-sol": "light" } },
+					canonicalModelKey,
+				),
+			).toEqual({ preset: "light", source: "exact" });
 		} finally {
 			clearContextHandlerSession("ses-context");
 			closeQuietly(db);

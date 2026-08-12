@@ -16,6 +16,7 @@
 
 use crate::ck_wire;
 use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0ContentEpoch};
+use crate::config::CacheTtlProvenance;
 use crate::divergence::{self, FirstDivergence};
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{
@@ -34,16 +35,17 @@ use crate::scheduler::{
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
 };
 use crate::selection::{
-    filter_reasoning_ineligible_decisions, select_reductions, PassClass, SelItem, SelKind,
-    SelectionConfig, SelectionContext,
+    filter_reasoning_ineligible_decisions, select_reductions_with_outcome, PassClass, SelItem,
+    SelKind, SelectionConfig, SelectionContext, SelectionOutcome,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
     BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
     LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
-    MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
-    ServedBlockFingerprint, StoredCompartment, TagCacheSummary, TagMintInput, TemporalMarkInput,
-    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
+    PendingAgentDrop, PendingRewriteState, ServedBlockFingerprint, StoredCompartment,
+    TagCacheSummary, TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit,
+    TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -106,6 +108,9 @@ const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
 const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
 const DEFAULT_CLEAR_REASONING_AGE: u64 = 50;
 const DEFAULT_CAVEMAN_MIN_CHARS: usize = 500;
+const FIVE_MINUTE_CACHE_TTL_MS: u64 = 5 * 60 * 1_000;
+const ONE_HOUR_CACHE_TTL_MS: u64 = 60 * 60 * 1_000;
+const SUBAGENT_CACHE_TTL: &str = "5m";
 const M1_PENDING_LOG_THRESHOLDS_MS: [i64; 3] =
     [5 * 60 * 1_000, 30 * 60 * 1_000, 2 * 60 * 60 * 1_000];
 static M1_PENDING_LOG_BUCKETS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
@@ -468,8 +473,10 @@ pub struct ProducerContext<'a> {
     pub execute_threshold_percentage: f64,
     /// Smart-drop selector gate frozen at route bind.
     pub smart_drops: bool,
-    /// Cache TTL string from SessionMeta config; defaults to `5m`.
+    /// Effective cache TTL used by the host-side idle predicate.
     pub cache_ttl: String,
+    /// Whether the model-resolution walk selected a per-model entry or fell through to the default.
+    pub cache_ttl_provenance: CacheTtlProvenance,
     /// Provider/model key for threshold lookup. Per-model overrides are deferred, so
     /// production currently supplies None.
     pub model_key: Option<String>,
@@ -582,6 +589,10 @@ pub struct TransformRequest {
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
     pub tool_present: bool,
+    /// Frozen availability of OpenCode's native todowrite tool. None is a provisional or
+    /// legacy-sender verdict and fails open to preserve the existing injection behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_tool_present: Option<bool>,
     /// Session-resolved prompt preset. Full is the wire default so older callers retain the
     /// exact pre-prompt-surface identity.
     #[serde(default)]
@@ -591,6 +602,10 @@ pub struct TransformRequest {
     /// coupling routing scope to the provider's opaque model identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_surface_model_key: Option<String>,
+    /// Stable identity of the live prompt-surface config used to coordinate guidance,
+    /// manifest, and transform selection across config reloads.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_surface_config_identity: String,
     /// USER-tier top-level description replacements. IDs and schemas remain module-owned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prompt_surface_tool_descriptions: BTreeMap<String, String>,
@@ -726,9 +741,13 @@ struct TransformRequestWire {
     #[serde(default)]
     tool_present: bool,
     #[serde(default)]
+    todo_tool_present: Option<bool>,
+    #[serde(default)]
     prompt_surface_preset: PromptSurfacePreset,
     #[serde(default)]
     prompt_surface_model_key: Option<String>,
+    #[serde(default)]
+    prompt_surface_config_identity: String,
     #[serde(default)]
     prompt_surface_tool_descriptions: BTreeMap<String, String>,
     #[serde(default)]
@@ -811,8 +830,10 @@ impl<'de> Deserialize<'de> for TransformRequest {
             caveman_enabled: wire.caveman_enabled,
             caveman_min_chars: wire.caveman_min_chars,
             tool_present: wire.tool_present,
+            todo_tool_present: wire.todo_tool_present,
             prompt_surface_preset: wire.prompt_surface_preset,
             prompt_surface_model_key: wire.prompt_surface_model_key,
+            prompt_surface_config_identity: wire.prompt_surface_config_identity,
             prompt_surface_tool_descriptions: wire.prompt_surface_tool_descriptions,
             serve_native: wire.serve_native,
             native_messages: wire.native_messages,
@@ -1139,6 +1160,10 @@ pub struct TransformResponse {
     pub committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_ordinal: Option<u64>,
+    /// Memory IDs currently shown in the module's memory view. The host copies this list to
+    /// filter search results, using the module manifest rather than its TypeScript render cache.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rendered_memory_ids: Option<Vec<i64>>,
     /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1149,6 +1174,11 @@ pub struct TransformResponse {
     /// reading this module's store.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lineage_descent_disposition: Option<String>,
+    /// TTL the consumer must apply to every cache marker it places on this
+    /// response. Absent = inherit whatever the harness authored (today's
+    /// behaviour), so old/new module+gateway mixes are no-ops in both directions.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_ttl: Option<String>,
     /// Prior lineage tail used as the provisional ordinal base for native adapters.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ordinal_continuation_base: Option<u64>,
@@ -1200,8 +1230,10 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
+            rendered_memory_ids: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
+            cache_ttl: None,
             ordinal_continuation_base: None,
             historian: None,
             ck_messages: None,
@@ -1231,8 +1263,10 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
+            rendered_memory_ids: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
+            cache_ttl: None,
             ordinal_continuation_base: None,
             historian: None,
             ck_messages: Some(
@@ -1287,6 +1321,7 @@ pub struct TransformWithProjection {
     /// second numbers-only table scan after the response has been built.
     pub tag_numbers: BTreeMap<String, u64>,
     pub scheduler_pass: scheduler::PassDecision,
+    pub scheduler_drain_latch_active: bool,
     pub boundary_state: BoundaryState,
     pub trim_mismatch: Option<TrimMismatch>,
     pub revert_epoch: u64,
@@ -1609,12 +1644,30 @@ fn record_stable_pass_trace(
     ctx: &ProducerContext<'_>,
     result: &Result<TransformWithProjection, TransformError>,
 ) {
-    if result.as_ref().ok().is_some_and(|pass| {
+    if let Some(pass) = result.as_ref().ok().filter(|pass| {
         pass.response.status == TransformStatus::Ok
             && pass.response.ck_messages.is_some()
             && pass.response.first_divergence.is_none()
+            && !pass.response.committed
     }) {
-        let _ = store.trace_pass_stable(&req.session_id, ctx.now_ms);
+        let observation = pass_scheduler_observation(
+            pass.scheduler_pass,
+            pass.scheduler_drain_latch_active,
+            ctx.now_ms,
+        );
+        let _ = store.trace_pass_stable(&req.session_id, &observation);
+    }
+}
+
+fn pass_scheduler_observation(
+    pass: scheduler::PassDecision,
+    drain_latch_active: bool,
+    timestamp_ms: i64,
+) -> PassSchedulerObservation {
+    PassSchedulerObservation {
+        timestamp_ms,
+        scheduler_decision: pass.as_str().to_string(),
+        drain_latch_active,
     }
 }
 
@@ -1629,6 +1682,83 @@ fn apply_once_with_estimator(
     output_cache: Option<&Mutex<SerializedOutputCache>>,
 ) -> Result<TransformWithProjection, TransformError> {
     apply_once_with_estimator_and_projection(store, req, ctx, estimate_tokens, output_cache, None)
+}
+
+/// Convert MC's assumed cache lifetime into a provider-expressible Claude Code marker TTL.
+///
+/// The two values describe different things: the input controls when MC assumes a cache is dead,
+/// while the output is constrained to Anthropic's complete marker vocabulary, `5m|1h`. The wire
+/// mapping is therefore deliberately lossy: assumptions such as 60m, 90m, and 300m all mean "use
+/// the long provider cache" and become `1h`. Zero is the explicit provider-default/no-paid-TTL
+/// intent, while malformed values fall back as though the setting were absent. The `1h` value is
+/// beta-gated by Anthropic's `extended-cache-ttl-2025-04-11` request token. Only the
+/// `claude-code-anthropic` consumer is known to send that token on every request, so the response
+/// profile gate is a correctness constraint; widening it without verifying the beta header would
+/// make rewritten requests fail with HTTP 400.
+fn claude_code_marker_ttl(assumed_lifetime: &str) -> String {
+    let normalized = assumed_lifetime.trim();
+    if normalized.is_empty() {
+        return String::new();
+    }
+    match scheduler::parse_cache_ttl(normalized) {
+        Ok(0) => String::new(),
+        Ok(FIVE_MINUTE_CACHE_TTL_MS) => SUBAGENT_CACHE_TTL.to_string(),
+        Ok(_) => "1h".to_string(),
+        Err(_) => SUBAGENT_CACHE_TTL.to_string(),
+    }
+}
+
+/// Resolve MC's assumed cache lifetime for the idle-HARD predicate.
+///
+/// Anthropic is the one profile here with a known one-hour provider ceiling, and Claude Code has no
+/// cache-keep warmup on this path. An assumption above that ceiling therefore cannot be true and is
+/// clamped down to one hour. Other profiles retain the raw assumption because their provider ceiling
+/// is unknown or their plugin may keep a cache warm. `never` remains the user's explicit instruction
+/// to disable TTL-driven folds and is not a finite lifetime to clamp.
+fn internal_assumed_cache_lifetime_for_profile(
+    profile: Option<SerializerProfile>,
+    is_subagent: bool,
+    configured_assumed_lifetime: &str,
+    provenance: CacheTtlProvenance,
+) -> String {
+    if profile != Some(SerializerProfile::ClaudeCodeAnthropic) {
+        return configured_assumed_lifetime.to_string();
+    }
+    if provenance == CacheTtlProvenance::Default {
+        // Claude Code authors beta-gated one-hour markers and does not run cache-keep here.
+        // A five-minute assumption could trigger a fold while the provider marker is still valid.
+        return "1h".to_string();
+    }
+    if configured_assumed_lifetime
+        .trim()
+        .eq_ignore_ascii_case("never")
+    {
+        return configured_assumed_lifetime.to_string();
+    }
+    if is_subagent {
+        return SUBAGENT_CACHE_TTL.to_string();
+    }
+    match scheduler::parse_cache_ttl(configured_assumed_lifetime) {
+        Ok(milliseconds) if milliseconds > ONE_HOUR_CACHE_TTL_MS => "1h".to_string(),
+        _ => configured_assumed_lifetime.to_string(),
+    }
+}
+
+fn response_marker_ttl(
+    req: &TransformRequest,
+    configured_assumed_lifetime: &str,
+    provenance: CacheTtlProvenance,
+) -> Option<String> {
+    (SerializerProfile::parse(&req.serializer_profile)
+        == Some(SerializerProfile::ClaudeCodeAnthropic)
+        && provenance == CacheTtlProvenance::Explicit)
+        .then(|| {
+            if req.is_subagent {
+                SUBAGENT_CACHE_TTL.to_string()
+            } else {
+                claude_code_marker_ttl(configured_assumed_lifetime)
+            }
+        })
 }
 
 fn apply_once_with_estimator_and_projection(
@@ -1662,6 +1792,11 @@ fn apply_once_with_estimator_and_projection(
                 boundary_divergence_retry |= boundary_divergence_detected;
                 attempt += 1;
                 continue;
+            }
+            Ok(mut output) => {
+                output.response.cache_ttl =
+                    response_marker_ttl(req, &ctx.cache_ttl, ctx.cache_ttl_provenance);
+                return Ok(output);
             }
             other => return other,
         }
@@ -1885,13 +2020,18 @@ fn validate_lineage_anchor(
             block.ordinal
         ));
     }
+    // Locate the anchor at the first NON-synthetic message, matching the seam
+    // check's boundary rule. A synthetic-marked head (e.g. a normalized
+    // synthetic-todo message) would otherwise pass the seam gate and fail here
+    // on every pass, turning a benign head into a per-pass defer.
     let first = req
         .messages
-        .first()
-        .ok_or_else(|| "anchor message at messages[0] is absent".to_string())?;
+        .iter()
+        .find(|message| !message.ck.meta.synthetic)
+        .ok_or_else(|| "anchor message is absent from the live request".to_string())?;
     if first.mid != block.mid {
         return Err(format!(
-            "anchor block {anchor_id} is no longer in messages[0]"
+            "anchor block {anchor_id} is no longer the first live message"
         ));
     }
     let last_text_index = first
@@ -1974,6 +2114,7 @@ fn lineage_protocol_passthrough(
         tag_numbers: BTreeMap::new(),
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch: None,
         revert_epoch: 0,
@@ -2209,6 +2350,14 @@ fn apply_once(
             )));
         }
     }
+    let mut lineage_anchor_failure = false;
+    if let Err(detail) = validate_lineage_anchor(&loaded.meta, req, &projection) {
+        lineage_anchor_failure = true;
+        eprintln!(
+            "mc-module: lineage anchor validation failed closed for {}: {detail}",
+            req.session_id
+        );
+    }
     // Legacy sessions stored the CC latch before the generic surface latch existed.
     // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
     let persisted_tagging_surface_active =
@@ -2383,6 +2532,11 @@ fn apply_once(
                         compartment_max_seq: None,
                         project_root: Some(ctx.project_directory),
                         first_divergence: first_divergence_json.as_deref(),
+                        scheduler_observation: Some(&pass_scheduler_observation(
+                            scheduler::PassDecision::Defer,
+                            false,
+                            ctx.now_ms,
+                        )),
                         overlays: TransformOverlayBatch::default(),
                     },
                 )?
@@ -2403,6 +2557,7 @@ fn apply_once(
                 req,
                 mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
                 row_version,
+                rendered_memory_ids: next_meta.rendered_memory_ids.clone(),
                 revert_epoch: next_meta.revert_epoch,
                 reasoning_watermark: next_meta
                     .reasoning_cleared_through_tag
@@ -2473,6 +2628,11 @@ fn apply_once(
                 compartment_max_seq: None,
                 project_root: Some(ctx.project_directory),
                 first_divergence: first_divergence_json.as_deref(),
+                scheduler_observation: Some(&pass_scheduler_observation(
+                    scheduler::PassDecision::Defer,
+                    false,
+                    ctx.now_ms,
+                )),
                 overlays: TransformOverlayBatch::default(),
             },
         )?;
@@ -2494,6 +2654,7 @@ fn apply_once(
             req,
             mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
             row_version,
+            rendered_memory_ids: meta.rendered_memory_ids.clone(),
             revert_epoch: meta.revert_epoch,
             reasoning_watermark: meta
                 .reasoning_cleared_through_tag
@@ -2704,7 +2865,12 @@ fn apply_once(
                 .observed_last_response_at_ms
                 .map(|ts| ts.max(0) as u64)
                 .unwrap_or(0),
-            cache_ttl: ctx.cache_ttl.clone(),
+            cache_ttl: internal_assumed_cache_lifetime_for_profile(
+                serializer_profile,
+                req.is_subagent,
+                &ctx.cache_ttl,
+                ctx.cache_ttl_provenance,
+            ),
         },
         now_ms: ctx.now_ms.max(0) as u64,
         model_key: ctx.model_key.clone(),
@@ -2837,12 +3003,17 @@ fn apply_once(
         && !render_config_changed
         && !reconcile_hard_due
         && loaded.meta.initialized;
-    let pass_already_busting = !loaded.meta.initialized
+    let supersession_ride_available = !loaded.meta.initialized
         || render_config_changed
         || hard_fold_requested
         || reconcile_hard_due
-        || emergency_arm_engaged
+        || matches!(
+            scheduler_outcome.pass,
+            scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
+        )
         || loaded.meta.soft_refresh_pending;
+    let pass_already_busting =
+        supersession_ride_available || scheduler_outcome.drain_latch.is_active();
     // Tail reclaim gates purely on the serializer profile. Every shipping profile is a
     // full-array consumer (healing::tail_reclaim is true for all of them), so the request
     // array round-trips both prefix and tail mutations on every pass. The U1-era layering
@@ -2886,6 +3057,7 @@ fn apply_once(
             &loaded.meta,
             &tail_for_selection,
             loaded.meta.synthetic_todo.as_ref(),
+            req.todo_tool_present,
         );
     let mut protected_block_ids = if tagging_surface_requested {
         newest_active_tag_block_ids(
@@ -2920,7 +3092,7 @@ fn apply_once(
             timings.emergency_reasoning_exclusions = excluded_arcs;
         }
     }
-    let selected_reductions = if producer_gate {
+    let selection_outcome = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
         // tail_reclaim_enabled, which is the profile default. Gating again on the
@@ -2943,7 +3115,7 @@ fn apply_once(
             .filter(|drop| drop.command_first_applied_at_ms.is_some())
             .map(|drop| drop.target_id.clone())
             .collect::<HashSet<_>>();
-        select_reductions(
+        select_reductions_with_outcome(
             &tail_for_selection,
             &frozen,
             &SelectionContext {
@@ -2968,6 +3140,7 @@ fn apply_once(
                 agent_drop_command_ids,
                 first_applied_agent_drop_ids,
                 pass_already_busting,
+                supersession_ride_available,
                 protected_block_ids: protected_block_ids.clone(),
             },
             &SelectionConfig {
@@ -2975,9 +3148,11 @@ fn apply_once(
             },
         )
     } else {
-        Vec::new()
+        SelectionOutcome::default()
     };
     timings.selection = elapsed_ms(selection_started_at);
+    let selected_reductions = selection_outcome.decisions;
+    let two_pass_batch_can_apply = selection_outcome.two_pass_batch_can_apply;
     #[cfg(test)]
     let selected_reductions = if ctx.injected_reductions.is_empty() {
         selected_reductions
@@ -3130,27 +3305,10 @@ fn apply_once(
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
 
-    let soft_has_new_coverage = if matches!(plan, PassPlan::Soft)
-        && loaded.meta.anchor_block_id.is_some()
-        && compartment_seq_changed_since_meta
-    {
-        let compartments = store.load_compartments(&req.session_id)?;
-        coverage_ordinal_from_compartments(&compartments)? > loaded.meta.coverage_ordinal
-    } else {
-        false
-    };
-    let mut lineage_anchor_failure = false;
-    if matches!(plan, PassPlan::Hard | PassPlan::MigrateHard) || soft_has_new_coverage {
-        if let Err(detail) = validate_lineage_anchor(&loaded.meta, req, &projection) {
-            lineage_anchor_failure = true;
-            eprintln!(
-                "mc-module: lineage anchor validation failed closed for {}: {detail}",
-                req.session_id
-            );
-            core.reconcile_pending = true;
-            plan = PassPlan::Defer;
-            materialize_reason = Some("lineage_anchor_mismatch".to_string());
-        }
+    if lineage_anchor_failure {
+        core.reconcile_pending = true;
+        plan = PassPlan::Defer;
+        materialize_reason = Some("lineage_anchor_mismatch".to_string());
     }
 
     let is_bust_pass = !req.is_subagent
@@ -3207,7 +3365,7 @@ fn apply_once(
     let tail_for_capture = tail_for_selection.clone();
     if is_bust_pass && tail_reclaim_enabled {
         let todo_started_at = Instant::now();
-        capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
+        capture_todo_state_on_bust(&mut meta, &tail_for_capture, true, req.todo_tool_present);
         todo_ms += elapsed_ms(todo_started_at);
     }
 
@@ -3471,7 +3629,12 @@ fn apply_once(
                     let todo_started_at = Instant::now();
                     let post_truncate_tail =
                         tail_sel_items(&live, comp.coverage_ordinal, &tag_tokens_by_block);
-                    capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
+                    capture_todo_state_on_bust(
+                        &mut meta,
+                        &post_truncate_tail,
+                        true,
+                        req.todo_tool_present,
+                    );
                     todo_ms += elapsed_ms(todo_started_at);
                 }
                 meta.coverage_ordinal = comp.coverage_ordinal;
@@ -3837,12 +4000,19 @@ fn apply_once(
     }
     timings.transition_detection += elapsed_ms(transition_post_detection_started_at);
     let transition_newly_consumed = !newly_consumed_transition_classes.is_empty();
+    let mut committed_transition_classes = consumed_transition_classes.clone();
+    committed_transition_classes.extend(newly_consumed_transition_classes);
+    // A HARD rebuild reconstructs the frozen-unit vector from data-plane survivors, bypassing
+    // durability handling. Reinsert the full consumed union afterward so an unrelated fold cannot
+    // make an already-healed class eligible for another renderer transition.
+    if transition_newly_consumed
+        || (matches!(plan, PassPlan::Hard | PassPlan::MigrateHard)
+            && !committed_transition_classes.is_empty())
+    {
+        preserve_transition_consumed_marker(&mut core, &committed_transition_classes);
+    }
     let transition_committed = transition_renderer_active(&core) || transition_newly_consumed;
     if transition_newly_consumed {
-        let mut committed_transition_classes = consumed_transition_classes.clone();
-        committed_transition_classes.extend(newly_consumed_transition_classes);
-        preserve_transition_consumed_marker(&mut core, &committed_transition_classes);
-
         // Record consumption after any bust that renders an affected shape. If the shape first
         // appeared during a pass that was already invalidating the cache for another reason, its
         // changed bytes rode that invalidation and replay must not trigger a second one.
@@ -3850,12 +4020,11 @@ fn apply_once(
     }
     timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
-    // The two-pass watermark advances on every genuine pressure execute, even if the
-    // sweep selected nothing. TTL/model/epoch folds and low-usage refresh executes do not
-    // move it: they may drain queued work, but are not age-reclaim cadence. Held back under
-    // reconcile because the watermark may be stale-high against a store about to be re-cut.
-    let pressure_execute = tail_reclaim_enabled && scheduler_outcome.pressure_execute;
-    if pressure_execute && !loaded.core.reconcile_pending {
+    // Advance whenever a pressure pass allowed the age batch to apply, even if it selected
+    // no reductions. Ordinary execute-band passes that are not already changing provider-visible
+    // bytes leave the watermark frozen; an allowed empty batch records the current tail so later
+    // arcs can age into a future batch.
+    if two_pass_batch_can_apply && !loaded.core.reconcile_pending {
         meta.last_execute_ordinal = tail_for_selection
             .iter()
             .map(|item| item.ordinal)
@@ -4059,6 +4228,11 @@ fn apply_once(
                 compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),
                 project_root: Some(ctx.project_directory),
                 first_divergence: first_divergence_json.as_deref(),
+                scheduler_observation: Some(&pass_scheduler_observation(
+                    scheduler_outcome.pass,
+                    scheduler_outcome.drain_latch.is_active(),
+                    ctx.now_ms,
+                )),
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
                     tag_mints: &tag_rows[pending_overlays.tag_mint_start
@@ -4135,9 +4309,10 @@ fn apply_once(
     timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
-        tag_numbers: tag_number_by_message(&tag_rows),
+        tag_numbers,
         projection,
         scheduler_pass: scheduler_outcome.pass,
+        scheduler_drain_latch_active: scheduler_outcome.drain_latch.is_active(),
         boundary_state,
         trim_mismatch,
         revert_epoch: meta.revert_epoch,
@@ -4163,8 +4338,10 @@ fn apply_once(
             surface_state,
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
+            rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
+            cache_ttl: None,
             ordinal_continuation_base: meta.ordinal_continuation_base,
             historian: None,
             ck_messages: Some(ck_messages),
@@ -4395,6 +4572,7 @@ fn prompt_surface_selection(req: &TransformRequest) -> PromptSurfaceSelection {
             .prompt_surface_model_key
             .clone()
             .or_else(|| req.model_key.clone()),
+        config_identity: req.prompt_surface_config_identity.clone(),
         preset: req.prompt_surface_preset,
         tool_descriptions: req.prompt_surface_tool_descriptions.clone(),
     }
@@ -5552,6 +5730,7 @@ struct PendingPassthroughArgs<'a> {
     req: &'a TransformRequest,
     mutation_exempt_mid: Option<String>,
     row_version: u64,
+    rendered_memory_ids: Vec<i64>,
     revert_epoch: u64,
     reasoning_watermark: u64,
     transition_consumed: bool,
@@ -5602,6 +5781,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         req,
         mutation_exempt_mid,
         row_version,
+        rendered_memory_ids,
         revert_epoch,
         reasoning_watermark,
         transition_consumed,
@@ -5618,6 +5798,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         TransformResponse::passthrough(Vec::new(), req.full_array_fingerprint.clone());
     response.ck_messages = Some(messages);
     response.row_version = row_version;
+    response.rendered_memory_ids = Some(rendered_memory_ids);
     response.surface_state = surface_state;
     response.committed = committed;
     response.materialize_reason = materialize_reason;
@@ -5628,6 +5809,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         tag_numbers,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch,
         revert_epoch,
@@ -5662,7 +5844,8 @@ fn advance_synthetic_todo(
     req: &TransformRequest,
 ) -> Result<(), TransformError> {
     let existing = meta.synthetic_todo.clone();
-    let outcome = advance_injection_from_meta(meta, existing.as_ref(), is_bust_pass);
+    let outcome =
+        advance_injection_from_meta(meta, existing.as_ref(), is_bust_pass, req.todo_tool_present);
     match outcome {
         InjectionOutcome::Replace(next) => {
             let anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
@@ -9838,6 +10021,294 @@ pub(crate) mod tests {
         NoteCasOutcome, NoteEvaluationInput, NoteWriteInput, StoredCompartment,
     };
 
+    fn resolve_test_cache_ttl(
+        ctx: &mut ProducerContext<'_>,
+        config: &crate::config::McModuleConfig,
+        model_key: Option<&str>,
+    ) {
+        let resolved = config.resolve_cache_ttl_with_provenance(model_key);
+        ctx.cache_ttl = resolved.value;
+        ctx.cache_ttl_provenance = resolved.provenance;
+    }
+
+    #[test]
+    fn claude_code_cache_ttl_mapper_is_lossy_because_provider_vocabulary_is_limited() {
+        assert_eq!(claude_code_marker_ttl("5m"), "5m");
+        assert_eq!(claude_code_marker_ttl("60m"), "1h");
+        assert_eq!(claude_code_marker_ttl("90m"), "1h");
+        assert_eq!(claude_code_marker_ttl("300m"), "1h");
+        assert_eq!(claude_code_marker_ttl("0m"), "");
+        assert_eq!(claude_code_marker_ttl(""), "");
+    }
+
+    #[test]
+    fn claude_code_cache_ttl_mapper_treats_garbage_as_unset() {
+        assert_eq!(claude_code_marker_ttl("not-a-ttl"), "5m");
+    }
+
+    #[test]
+    fn wire_normalization_does_not_change_the_raw_effective_cache_lifetime() {
+        let config = crate::config::McModuleConfig {
+            cache_ttl: "300m".to_string(),
+            ..crate::config::McModuleConfig::default()
+        };
+        let internally_resolved = config.resolve_cache_ttl(None);
+
+        assert_eq!(internally_resolved, "300m");
+        assert_eq!(claude_code_marker_ttl(&internally_resolved), "1h");
+        assert_eq!(internally_resolved, "300m");
+    }
+
+    #[test]
+    fn claude_code_clamps_only_assumptions_above_its_known_provider_ceiling() {
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::ClaudeCodeAnthropic),
+                false,
+                "60m",
+                CacheTtlProvenance::Explicit,
+            ),
+            "60m"
+        );
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::ClaudeCodeAnthropic),
+                false,
+                "300m",
+                CacheTtlProvenance::Explicit,
+            ),
+            "1h"
+        );
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::OpencodeAiSdk),
+                false,
+                "300m",
+                CacheTtlProvenance::Explicit,
+            ),
+            "300m"
+        );
+    }
+
+    #[test]
+    fn explicit_never_is_emitted_without_clamping_and_disables_ttl_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = cc_req("cache-ttl-never", "cfg", vec![item("a", 1, "alpha")]);
+        request.model_key = Some("anthropic/claude-opus-4-1".to_string());
+        let mut config = crate::config::McModuleConfig::default();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "never".to_string());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(&mut ctx, &config, request.model_key.as_deref());
+
+        let internal = internal_assumed_cache_lifetime_for_profile(
+            Some(SerializerProfile::ClaudeCodeAnthropic),
+            false,
+            &ctx.cache_ttl,
+            ctx.cache_ttl_provenance,
+        );
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert_eq!(serialized["cache_ttl"], "1h");
+        assert_eq!(internal, "never");
+        assert_eq!(scheduler::parse_cache_ttl(&internal), Ok(u64::MAX));
+        assert!(!scheduler::ttl_execute_fired(u64::MAX, 0, u64::MAX));
+    }
+
+    #[test]
+    fn cache_ttl_serde_round_trip_preserves_absent_and_empty_states() {
+        let absent = TransformResponse::passthrough(Vec::new(), None);
+        let absent_json = serde_json::to_value(&absent).unwrap();
+        assert!(absent_json.get("cache_ttl").is_none());
+        let absent_round_trip: TransformResponse = serde_json::from_value(absent_json).unwrap();
+        assert_eq!(absent_round_trip.cache_ttl, None);
+
+        let mut provider_default = absent;
+        provider_default.cache_ttl = Some(String::new());
+        let provider_default_json = serde_json::to_value(&provider_default).unwrap();
+        assert_eq!(provider_default_json.get("cache_ttl"), Some(&json!("")));
+        let provider_default_round_trip: TransformResponse =
+            serde_json::from_value(provider_default_json).unwrap();
+        assert_eq!(provider_default_round_trip.cache_ttl, Some(String::new()));
+    }
+
+    #[test]
+    fn cache_ttl_serialization_discriminates_no_opinion_from_provider_default() {
+        let no_opinion = TransformResponse::passthrough(Vec::new(), None);
+        let mut provider_default = no_opinion.clone();
+        provider_default.cache_ttl = Some(String::new());
+
+        let no_opinion_json = serde_json::to_value(no_opinion).unwrap();
+        let provider_default_json = serde_json::to_value(provider_default).unwrap();
+        assert!(!no_opinion_json
+            .as_object()
+            .unwrap()
+            .contains_key("cache_ttl"));
+        assert_eq!(provider_default_json["cache_ttl"], "");
+    }
+
+    #[test]
+    fn claude_code_subagent_serializes_five_minutes_over_model_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = cc_req("cache-ttl-subagent", "cfg", vec![item("a", 1, "alpha")]);
+        request.is_subagent = true;
+        request.model_key = Some("anthropic/claude-opus-4-1".to_string());
+        let mut config = crate::config::McModuleConfig::default();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(&mut ctx, &config, request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert_eq!(serialized["cache_ttl"], "5m");
+    }
+
+    #[test]
+    fn claude_code_main_serializes_normalized_model_cache_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = cc_req("cache-ttl-model", "cfg", vec![item("a", 1, "alpha")]);
+        request.model_key = Some("anthropic/claude-opus-4-1".to_string());
+        let mut config = crate::config::McModuleConfig::default();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(&mut ctx, &config, request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert_eq!(serialized["cache_ttl"], "1h");
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::ClaudeCodeAnthropic),
+                false,
+                &ctx.cache_ttl,
+                ctx.cache_ttl_provenance,
+            ),
+            "1h"
+        );
+    }
+
+    #[test]
+    fn explicit_five_minute_model_ttl_is_not_mistaken_for_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = cc_req("cache-ttl-explicit-5m", "cfg", vec![item("a", 1, "alpha")]);
+        request.model_key = Some("anthropic/claude-haiku-4-5".to_string());
+        let mut config = crate::config::McModuleConfig::default();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-haiku-4-5".to_string(), "5m".to_string());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(&mut ctx, &config, request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert_eq!(serialized["cache_ttl"], "5m");
+    }
+
+    #[test]
+    fn claude_code_main_without_model_inherits_the_harness_cache_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = cc_req("cache-ttl-default", "cfg", vec![item("a", 1, "alpha")]);
+        let config = crate::config::McModuleConfig {
+            cache_ttl: "90m".to_string(),
+            ..crate::config::McModuleConfig::default()
+        };
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(&mut ctx, &config, request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert!(serialized.get("cache_ttl").is_none());
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::ClaudeCodeAnthropic),
+                false,
+                &ctx.cache_ttl,
+                ctx.cache_ttl_provenance,
+            ),
+            "1h"
+        );
+    }
+
+    #[test]
+    fn unconfigured_model_emits_absent_so_default_tuning_cannot_reach_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut config = crate::config::McModuleConfig {
+            cache_ttl: "5m".to_string(),
+            ..crate::config::McModuleConfig::default()
+        };
+        config.cache_ttl_by_model.extend([
+            ("anthropic/claude-opus-4-1".to_string(), "300m".to_string()),
+            ("anthropic/claude-sonnet-4-5".to_string(), "60m".to_string()),
+            ("anthropic/claude-haiku-4-5".to_string(), "5m".to_string()),
+        ]);
+
+        let mut configured = cc_req("cache-ttl-configured", "cfg", vec![item("a", 1, "alpha")]);
+        configured.model_key = Some("anthropic/claude-sonnet-4-5".to_string());
+        let mut configured_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(
+            &mut configured_ctx,
+            &config,
+            configured.model_key.as_deref(),
+        );
+        let configured_response =
+            serde_json::to_value(transform(&s, &configured, &configured_ctx).unwrap()).unwrap();
+        assert_eq!(configured_response["cache_ttl"], "1h");
+
+        let mut unconfigured = cc_req("cache-ttl-unconfigured", "cfg", vec![item("a", 1, "alpha")]);
+        unconfigured.model_key = Some("anthropic/claude-nova-6-0".to_string());
+        let mut unconfigured_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(
+            &mut unconfigured_ctx,
+            &config,
+            unconfigured.model_key.as_deref(),
+        );
+        let unconfigured_response =
+            serde_json::to_value(transform(&s, &unconfigured, &unconfigured_ctx).unwrap()).unwrap();
+        // When MC took marker ownership, making “no entry” assert the default changed the first-pass wire 1h -> 5m.
+        assert!(unconfigured_response.get("cache_ttl").is_none());
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::ClaudeCodeAnthropic),
+                false,
+                &unconfigured_ctx.cache_ttl,
+                unconfigured_ctx.cache_ttl_provenance,
+            ),
+            "1h"
+        );
+    }
+
+    #[test]
+    fn non_claude_code_profile_omits_cache_ttl_even_for_one_hour_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = opencode_req("cache-ttl-opencode", "cfg", vec![item("a", 1, "alpha")]);
+        request.model_key = Some("anthropic/claude-opus-4-1".to_string());
+        let mut config = crate::config::McModuleConfig::default();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        resolve_test_cache_ttl(&mut ctx, &config, request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert!(serialized.get("cache_ttl").is_none());
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::OpencodeAiSdk),
+                false,
+                &ctx.cache_ttl,
+                ctx.cache_ttl_provenance,
+            ),
+            "300m"
+        );
+    }
+
     #[test]
     fn effective_context_limit_falls_back_below_plausible_floor() {
         assert_eq!(
@@ -10089,11 +10560,10 @@ pub(crate) mod tests {
                 ),
             ],
         );
-        // The live drive paused ~434s between beats, so the second pass classified
-        // HARD via the idle-TTL trigger (default cache_ttl 5m). The TTL predicate
-        // needs an observed prior response time to arm; without it the pass stays
-        // SOFT-class and this fixture would not cover the drive's actual shape.
-        let mut ttl_ctx = pctx("git:proj", "/nonexistent-docs", 434_000);
+        // A Claude Code model with no explicit TTL inherits the harness's one-hour marker.
+        // Advance past that lifetime so the idle-TTL trigger still drives the second active pass;
+        // without an observed prior response time the pass stays SOFT-class.
+        let mut ttl_ctx = pctx("git:proj", "/nonexistent-docs", 3_700_000);
         ttl_ctx.observed_last_response_at_ms = Some(1);
         ttl_ctx.injected_reductions = spine().to_vec();
         let second = transform(&s, &beat2, &ttl_ctx).unwrap();
@@ -10513,8 +10983,10 @@ pub(crate) mod tests {
             caveman_enabled: false,
             caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
             tool_present: false,
+            todo_tool_present: None,
             prompt_surface_preset: PromptSurfacePreset::Full,
             prompt_surface_model_key: None,
+            prompt_surface_config_identity: String::new(),
             prompt_surface_tool_descriptions: BTreeMap::new(),
             serve_native: false,
             native_messages: None,
@@ -10690,6 +11162,7 @@ pub(crate) mod tests {
             execute_threshold_percentage: 65.0,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
+            cache_ttl_provenance: CacheTtlProvenance::Default,
             model_key: None,
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -10811,6 +11284,98 @@ pub(crate) mod tests {
         let mut unit = transition_consumed_unit(&v1_transition_classes());
         unit.frozen_payload.clear();
         unit
+    }
+
+    fn unstamped_opencode_tool_pair(mid: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
+        let native_message = json!({
+            "absolute_ordinal": ordinal,
+            "info": { "id": mid, "role": "assistant" },
+            "parts": [{
+                "type": "tool",
+                "tool": "read",
+                "callID": call_id,
+                "state": {
+                    "status": "completed",
+                    "input": { "path": "pair.txt" },
+                    "output": "historical output"
+                }
+            }]
+        });
+        let decoded = crate::codec::decode_opencode(&[native_message]);
+        let mut projected = decoded.messages.into_iter().next().unwrap();
+        projected.ck.content = projected
+            .ck
+            .content
+            .into_iter()
+            .map(|block| ck_wire::CkWireBlock::bare(block.kind))
+            .collect();
+        projected.ck.mark_modified();
+        projected
+    }
+
+    fn stored_transition_marker_classes(
+        store: &McStore,
+        session_id: &str,
+    ) -> BTreeSet<RendererTransitionClass> {
+        let loaded = store.load(session_id).unwrap();
+        let marker = loaded
+            .core
+            .frozen_units
+            .iter()
+            .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+            .expect("renderer transition marker must be durable");
+        serde_json::from_str(&marker.frozen_payload).unwrap()
+    }
+
+    #[test]
+    fn scheduler_trace_records_every_pass_and_preserves_variable_arm_state() {
+        const SESSION: &str = "scheduler-trace";
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![item("m1", 1, "stable tail")];
+        let low_request = with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100);
+        let mut context = pctx("git:proj", "/nonexistent-docs", 101);
+        context.cache_ttl = "never".to_string();
+
+        transform(&store, &low_request, &context).unwrap();
+        context.now_ms = 102;
+        transform(&store, &low_request, &context).unwrap();
+        context.now_ms = 103;
+        transform(
+            &store,
+            &with_usage(req(SESSION, "cfg0", messages), 90, 100),
+            &context,
+        )
+        .unwrap();
+
+        let history = store
+            .load_pass_trace(SESSION)
+            .unwrap()
+            .unwrap()
+            .scheduler_history;
+        assert_eq!(history.len(), 3, "every accepted pass must be queryable");
+        assert_eq!(
+            history
+                .iter()
+                .map(|observation| observation.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![101, 102, 103]
+        );
+        assert_eq!(history[0].scheduler_decision, "Defer");
+        assert!(!history[0].drain_latch_active);
+        assert_eq!(history[1].scheduler_decision, "Defer");
+        assert!(!history[1].drain_latch_active);
+        assert_eq!(history[2].scheduler_decision, "Force85");
+        assert!(history[2].drain_latch_active);
+        assert_ne!(
+            history[0].scheduler_decision, history[2].scheduler_decision,
+            "the trace must record the scheduler output rather than a constant"
+        );
+        let incident_window = store
+            .load_pass_scheduler_history(SESSION, 102, 103)
+            .unwrap();
+        assert_eq!(incident_window, history[1..]);
     }
 
     #[test]
@@ -11103,6 +11668,46 @@ pub(crate) mod tests {
                 },
             ),
         }
+    }
+
+    fn assistant_edit_call(
+        mid: &str,
+        ordinal: u64,
+        call_id: &str,
+        file_path: &str,
+    ) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: call_id.to_string(),
+                    name: "edit".to_string(),
+                    input: json!({
+                        "filePath": file_path,
+                        "oldString": format!("old-{call_id}"),
+                        "newString": format!("new-{call_id}"),
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn edit_result(mid: &str, ordinal: u64, call_id: &str, text: &str) -> CkIngressMessage {
+        let mut result = tool_result(mid, ordinal, call_id, text);
+        if let ck_wire::CkKind::ToolResult { tool_name, .. } = &mut result.ck.content[0].kind {
+            *tool_name = "edit".to_string();
+            result.ck.content[0].mark_modified();
+        }
+        result
     }
 
     fn reasoning_tool_shell_message(
@@ -12079,14 +12684,14 @@ pub(crate) mod tests {
             &ctx,
         )
         .unwrap();
-        assert_eq!(execute.action, "SOFT");
+        assert_eq!(execute.action, "SOFT+");
         assert!(s
             .load("ses")
             .unwrap()
             .core
             .frozen_units
             .iter()
-            .any(|unit| unit.key == "red:old#0"));
+            .all(|unit| unit.key != "red:old#0"));
 
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -12120,6 +12725,9 @@ pub(crate) mod tests {
         let mut hard_messages = vec![item("a", 1, "raw")];
         hard_messages.extend(todowrite_arc("hard_old", 2));
         hard_messages.extend(todowrite_arc("hard_new", 4));
+        for ordinal in 6..(6 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+            hard_messages.push(item(&format!("hard-tail-{ordinal}"), ordinal, "tail"));
+        }
         let hard = transform(
             &s,
             &with_usage(req("ses", "cfg1", hard_messages), 10, 100),
@@ -12207,6 +12815,16 @@ pub(crate) mod tests {
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
+        // Reset only the age watermark so this test remains about the emergency selector's
+        // same-sample latch. The first force pass advances the age watermark; without this
+        // reset, the second pass could legitimately select the emergency-reserved newer arc
+        // through the separate two-pass selector.
+        let loaded = s.load("subagent").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 0;
+        s.commit("subagent", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
         let second = transform(&s, &request, &context).unwrap();
         let second_red = s
             .load("subagent")
@@ -12236,6 +12854,13 @@ pub(crate) mod tests {
         assert_eq!(boot.action, "HARD");
         messages.extend(todowrite_arc("tail_old", 3));
         messages.extend(todowrite_arc("tail_new", 5));
+        for ordinal in 7..(7 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+            messages.push(item(&format!("tail-{ordinal}"), ordinal, "tail"));
+        }
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let response =
             transform(&s, &with_usage(req("ses", "cfg0", messages), 70, 100), &ctx).unwrap();
         assert_eq!(response.action, "SOFT");
@@ -12281,6 +12906,13 @@ pub(crate) mod tests {
                 },
             ),
         });
+        for ordinal in 7..(7 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+            messages.push(item(&format!("tail-{ordinal}"), ordinal, "tail"));
+        }
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let response =
             transform(&s, &with_usage(req("ses", "cfg0", messages), 70, 100), &ctx).unwrap();
         assert_eq!(response.action, "SOFT");
@@ -12439,7 +13071,9 @@ pub(crate) mod tests {
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let boot_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 90, 100);
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        let boot_req = with_usage(request.clone(), 10, 100);
+        let execute_req = with_usage(request, 70, 100);
         let boot = run(&s, &boot_req, &spine());
         assert_eq!(boot.action, "HARD");
         assert!(s.load("ses").unwrap().meta.last_todo_state.is_none());
@@ -12447,19 +13081,19 @@ pub(crate) mod tests {
         let before_native = opencode_native_bytes(&boot, "ses");
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.observed_last_response_at_ms = Some(0);
-        let execute = transform(&s, &boot_req, &ctx).unwrap();
-        // A zero-drop execute is byte-identical (no bust) but MAY commit metadata: the
-        // two-pass watermark stamps this tail as the next execute's candidate set.
+        let execute = transform(&s, &execute_req, &ctx).unwrap();
+        // A zero-drop execute is byte-identical and cannot move the age watermark. A
+        // pressure level is not an application edge, so residency alone remains silent.
         assert_eq!(execute.action, "SOFT+");
         assert_eq!(serde_json::to_vec(&execute.ck_messages).unwrap(), before);
         assert_eq!(opencode_native_bytes(&execute, "ses"), before_native);
         let meta = s.load("ses").unwrap().meta;
         assert_eq!(
-            meta.last_execute_ordinal, 1,
-            "zero-drop execute still advances the two-pass watermark"
+            meta.last_execute_ordinal, 0,
+            "zero-drop execute must keep the two-pass watermark frozen"
         );
         // And the pass after it, with an unchanged tail, is a true no-write defer.
-        let again = transform(&s, &boot_req, &ctx).unwrap();
+        let again = transform(&s, &execute_req, &ctx).unwrap();
         assert!(!again.committed);
         assert_eq!(serde_json::to_vec(&again.ck_messages).unwrap(), before);
     }
@@ -12555,6 +13189,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn disabled_todowrite_waits_for_independent_bust_then_clears_visible_tail_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let before_disable = json!([{
+            "content": "Captured before disable",
+            "status": "in_progress",
+            "priority": "high"
+        }]);
+        let initial = req(
+            "todo-disabled",
+            "cfg0",
+            vec![
+                item("a", 1, "raw"),
+                todowrite_call("todo-before", 2, before_disable.clone()),
+            ],
+        );
+        let boot = run(&s, &initial, &spine());
+        assert_eq!(boot.action, "HARD");
+        let frozen_pair = synthetic_todo_pair_bytes(&boot);
+
+        let mut disabled = initial;
+        disabled.todo_tool_present = Some(false);
+        disabled.messages.push(todowrite_call(
+            "todo-visible-after-disable",
+            3,
+            json!([{
+                "content": "Visible but disabled",
+                "status": "in_progress",
+                "priority": "high"
+            }]),
+        ));
+        let defer = run(&s, &with_usage(disabled.clone(), 10, 100), &spine());
+        assert_eq!(defer.materialize_reason, None);
+        assert_eq!(
+            synthetic_todo_pair_bytes(&defer),
+            frozen_pair,
+            "pending clearing must not create its own bust"
+        );
+        let deferred_meta = s.load("todo-disabled").unwrap().meta;
+        assert_eq!(
+            deferred_meta.last_todo_state_owner_message_id.as_deref(),
+            Some("todo-before")
+        );
+
+        let bust = run(&s, &with_usage(disabled, 70, 100), &spine());
+        assert!(bust.committed);
+        assert!(bust.messages().iter().all(|message| {
+            !message.meta.synthetic
+                || !matches!(
+                    message.content.first().map(|block| &block.kind),
+                    Some(ck_wire::CkKind::ToolCall { name, .. }) if name == "todowrite"
+                )
+        }));
+        let busted_meta = s.load("todo-disabled").unwrap().meta;
+        assert!(busted_meta.synthetic_todo.is_none());
+        assert_eq!(
+            busted_meta.last_todo_state_owner_message_id.as_deref(),
+            Some("todo-before"),
+            "disabled bust must not recapture the newer visible call"
+        );
+    }
+
+    #[test]
     fn low_usage_ttl_fold_neither_age_reclaims_nor_advances_the_watermark() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -12592,55 +13289,673 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn zero_drop_execute_watermark_ages_arcs_into_next_execute() {
+    fn band_resident_two_pass_waits_byte_identically_then_batches_on_fold_bust() {
+        const CONVEYOR_PASSES: usize = 3;
+        const FROZEN_WATERMARK: u64 = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let reference = store(reference_dir.path());
+        for target in [&s, &reference] {
+            target
+                .replace_compartments("two-pass-conveyor", &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+        }
+        let mut messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("old-call-1", 2, "old-1"),
+            tool_result("old-result-1", 3, "old-1", "eligible output one"),
+            assistant_tool_call("old-call-2", 4, "old-2"),
+            tool_result("old-result-2", 5, "old-2", "eligible output two"),
+            item("tail", 6, "stable tail"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot_request = with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 10, 100);
+        let boot = transform(&s, &boot_request, &context).unwrap();
+        let reference_boot = transform(&reference, &boot_request, &context).unwrap();
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(
+            canonical_output(boot.messages()),
+            canonical_output(reference_boot.messages())
+        );
+        for target in [&s, &reference] {
+            let loaded = target.load("two-pass-conveyor").unwrap();
+            let mut meta = loaded.meta.clone();
+            meta.last_execute_ordinal = FROZEN_WATERMARK;
+            target
+                .commit("two-pass-conveyor", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        }
+
+        let mut next_ordinal = 7u64;
+        let mut previous_bytes = canonical_output(boot.messages());
+        for pass in 1..=CONVEYOR_PASSES {
+            let call_id = format!("new-{pass}");
+            messages.push(assistant_tool_call(
+                &format!("new-call-{pass}"),
+                next_ordinal,
+                &call_id,
+            ));
+            next_ordinal += 1;
+            messages.push(tool_result(
+                &format!("new-result-{pass}"),
+                next_ordinal,
+                &call_id,
+                &format!("new output {pass}"),
+            ));
+            next_ordinal += 1;
+
+            let execute = transform(
+                &s,
+                &with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 70, 100),
+                &context,
+            )
+            .unwrap();
+            let expected = transform(
+                &reference,
+                &with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 10, 100),
+                &context,
+            )
+            .unwrap();
+            let execute_bytes = canonical_output(execute.messages());
+            assert_eq!(
+                execute_bytes,
+                canonical_output(expected.messages()),
+                "conveyor pass {pass} must render the unreduced byte identity"
+            );
+            assert_eq!(
+                &execute_bytes[..previous_bytes.len()],
+                previous_bytes.as_slice(),
+                "conveyor pass {pass} must preserve every previously cached byte"
+            );
+            let loaded = s.load("two-pass-conveyor").unwrap();
+            assert_eq!(
+                loaded.meta.last_execute_ordinal, FROZEN_WATERMARK,
+                "conveyor pass {pass} must not advance the frozen watermark"
+            );
+            assert!(
+                loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .all(|unit| !unit.key.starts_with("red:")),
+                "conveyor pass {pass} must not first-apply an age decision"
+            );
+            previous_bytes = execute_bytes;
+        }
+
+        let loaded = s.load("two-pass-conveyor").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit("two-pass-conveyor", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let riding = transform(
+            &s,
+            &with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(riding.action, "SOFT");
+        assert_ne!(canonical_output(riding.messages()), previous_bytes);
+        let loaded = s.load("two-pass-conveyor").unwrap();
+        for mid in ["old-call-1", "old-result-1", "old-call-2", "old-result-2"] {
+            assert!(
+                frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                "the whole watermark-eligible batch must apply on the riding pass"
+            );
+        }
+        for pass in 1..=CONVEYOR_PASSES {
+            for mid in [format!("new-call-{pass}"), format!("new-result-{pass}")] {
+                assert!(
+                    frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_none(),
+                    "arcs newer than the frozen watermark wait for a later batch"
+                );
+            }
+        }
+        assert_eq!(
+            loaded.meta.last_execute_ordinal,
+            next_ordinal - 1,
+            "the applied batch advances the watermark once to the riding pass tail"
+        );
+
+        let riding_bytes = canonical_output(riding.messages());
+        let replay = transform(
+            &s,
+            &with_usage(req("two-pass-conveyor", "cfg0", messages), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(canonical_output(replay.messages()), riding_bytes);
+        assert_eq!(
+            s.load("two-pass-conveyor")
+                .unwrap()
+                .meta
+                .last_execute_ordinal,
+            next_ordinal - 1,
+            "replay must not advance the applied watermark again"
+        );
+    }
+
+    #[test]
+    fn empty_two_pass_ride_advances_watermark_for_future_arc() {
+        const SESSION: &str = "two-pass-empty-ride";
+
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // Two-pass aging requires a FOLDED session: a new reduction can only freeze on
-        // a SOFT pass, and the classifier admits a SOFT only when a boundary is present.
-        // Seed one compartment covering ordinal 1 and fold it, then drive executes over
-        // the post-coverage tail.
-        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let large_output = "large tool output ".repeat(400);
-        let msgs = vec![
+        let mut messages = vec![
             item("a", 1, "covered head"),
-            assistant_tool_call("m1", 2, "call_age"),
-            tool_result("m2", 3, "call_age", &large_output),
-            item("m9", 9, "newest user text"),
+            assistant_tool_call("old-call", 2, "old"),
+            tool_result("old-result", 3, "old", "old eligible output"),
+            item("tail", 4, "stable tail"),
         ];
-        let boot = run(&s, &req("ses", "cfg0", msgs.clone()), &spine());
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
         assert_eq!(boot.action, "HARD");
-        // Execute pass 1 over the completed tool arc: nothing to drop yet (the arc is
-        // newer than the 0 watermark), but the watermark must stamp its ordinal.
-        // 70% usage: above the execute threshold (65) but below Force85, so the
-        // scheduler classes the pass Execute and the two-pass selector runs.
-        let exec_req = with_usage(req("ses", "cfg0", msgs.clone()), 70, 100);
-        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        ctx.observed_last_response_at_ms = Some(0);
-        let _ = transform(&s, &exec_req, &ctx).unwrap();
-        let after_first = s.load("ses").unwrap();
-        assert!(
-            after_first
+
+        let loaded = s.load(SESSION).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 3;
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let drained = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(drained.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        for mid in ["old-call", "old-result"] {
+            assert!(frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some());
+        }
+        assert_eq!(loaded.meta.last_execute_ordinal, 4);
+        let drained_reduction_count = loaded
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key.starts_with("red:"))
+            .count();
+
+        messages.push(assistant_tool_call("fresh-call", 5, "fresh"));
+        messages.push(tool_result(
+            "fresh-result",
+            6,
+            "fresh",
+            "future eligible output",
+        ));
+        let minted = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        let minted_bytes = canonical_output(minted.messages());
+        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 4);
+
+        let loaded = s.load(SESSION).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let empty_ride = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(empty_ride.action, "SOFT");
+        assert_eq!(
+            canonical_output(empty_ride.messages()),
+            minted_bytes,
+            "an empty age batch must add no provider-visible bytes"
+        );
+        let loaded = s.load(SESSION).unwrap();
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 6,
+            "the empty riding opportunity must advance over the fresh arc"
+        );
+        assert_eq!(
+            loaded
                 .core
                 .frozen_units
                 .iter()
-                .all(|unit| !unit.key.starts_with("red:m1#") && !unit.key.starts_with("red:m2#")),
-            "first execute has no candidates old enough to drop"
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count(),
+            drained_reduction_count,
+            "the empty ride must not freeze a reduction"
         );
-        assert!(
-            after_first.meta.last_execute_ordinal >= 9,
-            "watermark stamped from the execute tail"
+        for mid in ["fresh-call", "fresh-result"] {
+            assert!(frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_none());
+        }
+
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let next_ride = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(next_ride.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        for mid in ["fresh-call", "fresh-result"] {
+            assert!(
+                frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                "the arc crossed by the empty ride must freeze on the next ride"
+            );
+        }
+    }
+
+    #[test]
+    fn periodic_fold_cadence_batches_whole_age_sets_and_freezes_watermark_between_folds() {
+        // End-to-end periodic cadence for the age lane: a band-resident session (fill
+        // pinned above the execute threshold on EVERY pass) mints one new tool arc per
+        // pass and takes a fold bust every third pass. Between folds each pass must
+        // render byte-identically and leave the watermark frozen; at each fold the whole
+        // accumulated eligible batch must apply at once and the watermark must jump to
+        // that fold pass's tail ordinal. The pressure boot stamps the first watermark
+        // organically (an application opportunity with an empty batch), so no state is
+        // poked directly. A parallel no-pressure store renders the same message arrays
+        // as the byte-identity reference.
+        const SESSION: &str = "two-pass-periodic-cadence";
+        const TOTAL_PASSES: u64 = 9;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let reference = store(reference_dir.path());
+        for target in [&s, &reference] {
+            target
+                .replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+        }
+        let mut messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("arc-call-0", 2, "arc-0"),
+            tool_result("arc-result-0", 3, "arc-0", "arc zero output"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+        let reference_boot = transform(
+            &reference,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(reference_boot.action, "HARD");
+        assert_eq!(
+            canonical_output(boot.messages()),
+            canonical_output(reference_boot.messages()),
+            "a pressure boot must render the same bytes as a no-pressure boot"
         );
-        // Execute pass 2: the same arc is now at-or-below the watermark → age-drops.
-        let _ = transform(&s, &exec_req, &ctx).unwrap();
-        let after_second = s.load("ses").unwrap();
-        assert!(
-            after_second
+        assert_eq!(
+            s.load(SESSION).unwrap().meta.last_execute_ordinal,
+            3,
+            "the pressure boot is an application opportunity and stamps the boot tail"
+        );
+
+        let red_count = |target: &McStore| -> usize {
+            target
+                .load(SESSION)
+                .unwrap()
                 .core
                 .frozen_units
                 .iter()
-                .any(|unit| unit.key.starts_with("red:m1#") || unit.key.starts_with("red:m2#")),
-            "completed arc aged in by the prior execute's watermark must freeze a drop"
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count()
+        };
+        let mut frozen_reds = red_count(&s);
+        let mut expected_watermark = 3u64;
+        let mut next_ordinal = 4u64;
+        let mut previous_bytes = canonical_output(boot.messages());
+        for pass in 1..=TOTAL_PASSES {
+            let fold = pass % 3 == 0;
+            if fold {
+                s.arm_soft_refresh(SESSION).unwrap();
+            }
+            messages.push(assistant_tool_call(
+                &format!("arc-call-{pass}"),
+                next_ordinal,
+                &format!("arc-{pass}"),
+            ));
+            next_ordinal += 1;
+            messages.push(tool_result(
+                &format!("arc-result-{pass}"),
+                next_ordinal,
+                &format!("arc-{pass}"),
+                &format!("arc {pass} output"),
+            ));
+            next_ordinal += 1;
+
+            let response = transform(
+                &s,
+                &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+                &context,
+            )
+            .unwrap();
+            let reference_response = transform(
+                &reference,
+                &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+                &context,
+            )
+            .unwrap();
+            let bytes = canonical_output(response.messages());
+            let reference_bytes = canonical_output(reference_response.messages());
+            if fold {
+                // (b) + (c): the whole accumulated eligible batch applies at once and the
+                // watermark jumps to this fold pass's tail ordinal.
+                assert_eq!(response.action, "SOFT", "fold pass {pass} must bust");
+                let fold_index = pass / 3;
+                let first_new = if fold_index == 1 {
+                    0
+                } else {
+                    3 * fold_index - 5
+                };
+                let last_new = 3 * fold_index - 3;
+                let loaded = s.load(SESSION).unwrap();
+                for arc_index in first_new..=last_new {
+                    for mid in [
+                        format!("arc-call-{arc_index}"),
+                        format!("arc-result-{arc_index}"),
+                    ] {
+                        assert!(
+                            frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                            "fold {fold_index} must apply the whole accumulated batch (arc {arc_index})"
+                        );
+                    }
+                }
+                for arc_index in (last_new + 1)..=pass {
+                    for mid in [
+                        format!("arc-call-{arc_index}"),
+                        format!("arc-result-{arc_index}"),
+                    ] {
+                        assert!(
+                            frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_none(),
+                            "fold {fold_index} must not reach arcs minted after the previous stamp (arc {arc_index})"
+                        );
+                    }
+                }
+                frozen_reds += 2 * usize::try_from(last_new - first_new + 1).unwrap();
+                assert_eq!(
+                    red_count(&s),
+                    frozen_reds,
+                    "fold pass {pass} must freeze exactly the accumulated batch"
+                );
+                assert_ne!(
+                    bytes, previous_bytes,
+                    "fold pass {pass} applies a non-empty batch and must change the render"
+                );
+                expected_watermark = next_ordinal - 1;
+            } else {
+                // (a) + (d): byte-identity and a frozen watermark on every non-riding pass.
+                assert_eq!(
+                    response.action, "SOFT+",
+                    "non-riding pass {pass} must stay defer-shaped"
+                );
+                assert_eq!(
+                    &bytes[..previous_bytes.len()],
+                    previous_bytes.as_slice(),
+                    "non-riding pass {pass} must preserve every previously rendered byte"
+                );
+                if pass < 3 {
+                    assert_eq!(
+                        bytes, reference_bytes,
+                        "non-riding pass {pass} must match the no-pressure render exactly"
+                    );
+                }
+                assert_eq!(
+                    &bytes[bytes.len() - 2..],
+                    &reference_bytes[reference_bytes.len() - 2..],
+                    "non-riding pass {pass} must render the freshly minted arc unreduced"
+                );
+                assert_eq!(
+                    red_count(&s),
+                    frozen_reds,
+                    "non-riding pass {pass} must not first-apply a reduction"
+                );
+            }
+            assert_eq!(
+                s.load(SESSION).unwrap().meta.last_execute_ordinal,
+                expected_watermark,
+                "pass {pass}: the watermark must be {expected_watermark}"
+            );
+            previous_bytes = bytes;
+        }
+        assert_eq!(
+            red_count(&reference),
+            0,
+            "the no-pressure reference must never reduce"
+        );
+    }
+
+    #[test]
+    fn force_band_admits_age_batch_and_advances_watermark_under_historian_veto() {
+        // An active historian vetoes the ordinary execute-band arm (queued work waits for
+        // the next materializing pass), but the veto must not reach the force band: a
+        // Force85/Emergency95 pass engages the emergency arm, which exempts the veto, so
+        // the waiting age batch is admitted and the watermark advances on that same pass.
+        // The aged arc is a T1 `read` and the fresh arc a T2 `edit`, each the only arc in
+        // its tier: the emergency tier selector reserves both (newest-20% per tier), so
+        // any freeze of the aged arc is uniquely the force-band age arm's work.
+        const SESSION: &str = "force-band-veto";
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let mut messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("aged-call", 2, "aged-read"),
+            tool_result("aged-result", 3, "aged-read", "aged eligible output"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+
+        // Stamp the watermark over the aged arc with an empty riding opportunity.
+        s.arm_soft_refresh(SESSION).unwrap();
+        let stamp = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(stamp.action, "SOFT");
+        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
+
+        // Mint a fresh arc above the watermark; a low-usage defer cannot move it.
+        messages.push(assistant_edit_call("fresh-call", 4, "fresh-edit", "a.txt"));
+        messages.push(edit_result("fresh-result", 5, "fresh-edit", "fresh output"));
+        let minted = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(minted.action, "SOFT+");
+        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
+
+        // Queue a pending memory change: it reaches the rendered m1 memory block only
+        // when a bust materializes it, and an engaged veto defers that. The queued change
+        // therefore makes the veto itself observable on the ordinary pass below.
+        s.insert_memory(memory_input(
+            "git:proj",
+            "ARCHITECTURE",
+            "veto probe rule",
+            0,
+        ))
+        .unwrap();
+
+        let mut veto_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        veto_ctx.cache_ttl = "never".to_string();
+        veto_ctx.historian_active = true;
+
+        // Ordinary execute under the historian veto: the veto engages (the m1 delta stays
+        // queued), the age batch is not admitted and the watermark stays frozen.
+        let ordinary = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &veto_ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary.action, "SOFT+",
+            "the vetoed ordinary execute must stay defer-shaped"
+        );
+        assert!(
+            !m1_bytes(&ordinary).contains("veto probe rule"),
+            "the engaged historian veto must defer the queued m1 delta"
+        );
+        let loaded = s.load(SESSION).unwrap();
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 3,
+            "the vetoed ordinary pass must keep the watermark frozen"
+        );
+        assert!(frozen_red_payload(&loaded.core, "aged-call#0").is_none());
+        assert!(frozen_red_payload(&loaded.core, "aged-result#0").is_none());
+
+        // Force85 under the same active historian: the emergency arm bypasses the veto.
+        let force = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 90, 100),
+            &veto_ctx,
+        )
+        .unwrap();
+        assert_eq!(force.action, "SOFT");
+        assert!(
+            m1_bytes(&force).contains("veto probe rule"),
+            "the force pass busts and consumes the queued m1 delta"
+        );
+        let loaded = s.load(SESSION).unwrap();
+        assert!(
+            frozen_red_payload(&loaded.core, "aged-call#0").is_some(),
+            "the force-band edge must admit the waiting age batch despite the historian veto"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, "aged-result#0").is_some(),
+            "the admitted age batch drops the paired result"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, "fresh-call#0").is_none(),
+            "the fresh arc stays above the pre-pass watermark"
+        );
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 5,
+            "the force pass must advance the watermark on that same pass"
+        );
+    }
+
+    #[test]
+    fn injected_reductions_cannot_starve_or_convey_the_watermark() {
+        // The test-only injection seam replaces the native decision set AFTER selection,
+        // so the applied batch is never the native two-pass batch. The watermark must
+        // ignore the injected decisions entirely and follow the opportunity predicate:
+        // a riding pass advances it, a pressure-free pass keeps it frozen no matter how
+        // many injected reductions bust it.
+        const SESSION: &str = "injected-watermark";
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("old-call", 2, "old"),
+            tool_result("old-result", 3, "old", "old eligible output"),
+            item("tail", 4, "stable tail"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(
+            s.load(SESSION).unwrap().meta.last_execute_ordinal,
+            0,
+            "a no-pressure boot must not stamp the watermark"
+        );
+
+        // Riding pass under injection: the native batch (empty at a zero watermark) is
+        // replaced by the injected decision, yet the opportunity predicate still advances
+        // the watermark over the whole tail — injection cannot starve it.
+        s.arm_soft_refresh(SESSION).unwrap();
+        let mut riding_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        riding_ctx.cache_ttl = "never".to_string();
+        riding_ctx.injected_reductions =
+            with_reductions(vec![reduce("old-result", "drop", "[dropped]")]);
+        let riding = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &riding_ctx,
+        )
+        .unwrap();
+        assert_eq!(riding.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        assert_eq!(
+            frozen_red_payload(&loaded.core, "old-result#0"),
+            Some("[dropped]"),
+            "the injected decision must be the applied one"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, "old-call#0").is_none(),
+            "the native decision set was replaced, not extended"
+        );
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 4,
+            "the riding opportunity must advance the watermark despite the injection"
+        );
+
+        // Defer under injection: the injected reduction forces a bust, but without
+        // pressure there is no opportunity — injection cannot convey the watermark.
+        let mut defer_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        defer_ctx.cache_ttl = "never".to_string();
+        defer_ctx.injected_reductions =
+            with_reductions(vec![reduce("old-call", "drop", "[dropped]")]);
+        let deferred = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages), 10, 100),
+            &defer_ctx,
+        )
+        .unwrap();
+        assert_eq!(deferred.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        assert!(
+            frozen_red_payload(&loaded.core, "old-call#0").is_some(),
+            "the injected decision applies on the defer-forced bust"
+        );
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 4,
+            "a pressure-free injection bust must not convey the watermark"
         );
     }
 
@@ -17372,6 +18687,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn transform_projection_tag_numbers_include_same_pass_mints() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let request = active_opencode_req(
+                "same-pass-tag-numbers",
+                "cfg0",
+                vec![item("m1", 1, "hello")],
+            );
+
+            let result =
+                transform_with_projection(&s, &request, &pctx("git:proj", "/nonexistent-docs", 0))
+                    .unwrap();
+
+            assert_eq!(result.tag_numbers.get("m1"), Some(&1));
+            assert_eq!(
+                s.load_tags_for_session("same-pass-tag-numbers")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
     fn subagent_first_active_render_commits_tagged_bytes_before_replay() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -18919,6 +20259,425 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn latched_execute_without_concrete_work_preserves_supersession_bytes() {
+        const LATCHED_PASSES: usize = 3;
+        const SESSION: &str = "latched-supersession-idle";
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference_store = store(reference_dir.path());
+        let store = store(dir.path());
+        for target in [&store, &reference_store] {
+            target
+                .replace_compartments(SESSION, &[comp(1, 1, 1, "covered", "summary")])
+                .unwrap();
+        }
+        let mut messages = vec![
+            item("covered", 1, "covered source"),
+            assistant_edit_call("edit-call-1", 2, "edit-1", "shared.ts"),
+            edit_result("edit-result-1", 3, "edit-1", "result one"),
+        ];
+        let mut context = smart_pctx();
+        context.cache_ttl = "never".to_string();
+        let mut reference_context = pctx("git:proj", "/nonexistent-docs", 0);
+        reference_context.cache_ttl = "never".to_string();
+        let boot_request = with_usage(cc_req(SESSION, "cfg0", messages.clone()), 10, 100);
+        let boot = transform(&store, &boot_request, &context).unwrap();
+        let reference_boot =
+            transform(&reference_store, &boot_request, &reference_context).unwrap();
+        let mut previous_bytes = canonical_output(boot.messages());
+        assert_eq!(previous_bytes, canonical_output(reference_boot.messages()));
+
+        let mut next_ordinal = 4u64;
+        for pass in 1..=LATCHED_PASSES {
+            let edit_number = pass + 1;
+            let call_id = format!("edit-{edit_number}");
+            messages.push(assistant_edit_call(
+                &format!("edit-call-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                "shared.ts",
+            ));
+            next_ordinal += 1;
+            messages.push(edit_result(
+                &format!("edit-result-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                &format!("result {edit_number}"),
+            ));
+            next_ordinal += 1;
+            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+                messages.push(item(
+                    &format!("latched-{pass}-tail-{message}"),
+                    next_ordinal,
+                    "stable tail",
+                ));
+                next_ordinal += 1;
+            }
+
+            for target in [&store, &reference_store] {
+                let loaded = target.load(SESSION).unwrap();
+                let mut meta = loaded.meta;
+                meta.soft_refresh_pending = false;
+                meta.deferred_execute_state = Some(mc_store::DeferredExecuteState {
+                    reason: "execute-none".to_string(),
+                });
+                meta.emergency_drain_active = true;
+                meta.emergency_drain_entered_at_ms = 1;
+                target
+                    .commit(SESSION, loaded.row_version, &loaded.core, &meta)
+                    .unwrap();
+            }
+
+            let request = with_usage(cc_req(SESSION, "cfg0", messages.clone()), 60, 100);
+            let latched = transform(&store, &request, &context).unwrap();
+            let reference = transform(&reference_store, &request, &reference_context).unwrap();
+            let rendered = canonical_output(latched.messages());
+            assert_eq!(
+                rendered,
+                canonical_output(reference.messages()),
+                "latched Execute pass {pass} must serve the unreduced bytes"
+            );
+            assert_eq!(
+                &rendered[..previous_bytes.len()],
+                previous_bytes.as_slice(),
+                "latched Execute pass {pass} must preserve all previously served bytes"
+            );
+            let loaded = store.load(SESSION).unwrap();
+            assert!(loaded.meta.emergency_drain_active);
+            assert!(
+                loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .all(|unit| !unit.key.starts_with("red:")),
+                "latched Execute pass {pass} must leave supersession pending"
+            );
+            previous_bytes = rendered;
+        }
+    }
+
+    #[test]
+    fn latched_execute_batches_supersession_on_the_next_concrete_bust() {
+        const LATCHED_PASSES: usize = 3;
+        const SESSION: &str = "latched-supersession-batch";
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments(SESSION, &[comp(1, 1, 1, "covered", "summary")])
+            .unwrap();
+        let mut messages = vec![
+            item("covered", 1, "covered source"),
+            assistant_edit_call("edit-call-1", 2, "edit-1", "shared.ts"),
+            edit_result("edit-result-1", 3, "edit-1", "result one"),
+        ];
+        let mut context = smart_pctx();
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &store,
+            &with_usage(cc_req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        let mut previous_bytes = canonical_output(boot.messages());
+
+        let mut next_ordinal = 4u64;
+        for pass in 1..=LATCHED_PASSES {
+            let edit_number = pass + 1;
+            let call_id = format!("edit-{edit_number}");
+            messages.push(assistant_edit_call(
+                &format!("edit-call-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                "shared.ts",
+            ));
+            next_ordinal += 1;
+            messages.push(edit_result(
+                &format!("edit-result-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                &format!("result {edit_number}"),
+            ));
+            next_ordinal += 1;
+            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+                messages.push(item(
+                    &format!("batch-{pass}-tail-{message}"),
+                    next_ordinal,
+                    "stable tail",
+                ));
+                next_ordinal += 1;
+            }
+
+            let loaded = store.load(SESSION).unwrap();
+            let mut meta = loaded.meta;
+            meta.soft_refresh_pending = false;
+            meta.deferred_execute_state = Some(mc_store::DeferredExecuteState {
+                reason: "execute-none".to_string(),
+            });
+            meta.emergency_drain_active = true;
+            meta.emergency_drain_entered_at_ms = 1;
+            store
+                .commit(SESSION, loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+
+            let latched = transform(
+                &store,
+                &with_usage(cc_req(SESSION, "cfg0", messages.clone()), 60, 100),
+                &context,
+            )
+            .unwrap();
+            let rendered = canonical_output(latched.messages());
+            assert_eq!(
+                &rendered[..previous_bytes.len()],
+                previous_bytes.as_slice(),
+                "latched Execute pass {pass} must not rewrite an existing byte"
+            );
+            assert!(
+                store
+                    .load(SESSION)
+                    .unwrap()
+                    .core
+                    .frozen_units
+                    .iter()
+                    .all(|unit| !unit.key.starts_with("red:")),
+                "latched Execute pass {pass} must accumulate the supersession batch"
+            );
+            previous_bytes = rendered;
+        }
+
+        let loaded = store.load(SESSION).unwrap();
+        let mut meta = loaded.meta;
+        meta.soft_refresh_pending = true;
+        meta.emergency_drain_active = true;
+        meta.emergency_drain_entered_at_ms = 1;
+        store
+            .commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let riding = transform(
+            &store,
+            &with_usage(cc_req(SESSION, "cfg0", messages), 60, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(riding.action, "SOFT");
+        assert_ne!(canonical_output(riding.messages()), previous_bytes);
+
+        let loaded = store.load(SESSION).unwrap();
+        for edit_number in 1..=LATCHED_PASSES {
+            for mid in [
+                format!("edit-call-{edit_number}"),
+                format!("edit-result-{edit_number}"),
+            ] {
+                assert!(
+                    frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                    "superseded edit member {mid} must join the one riding batch"
+                );
+            }
+        }
+        assert_eq!(
+            loaded
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count(),
+            LATCHED_PASSES * 2,
+            "every accumulated member must first-apply in the concrete bust"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, &format!("edit-call-{}#0", LATCHED_PASSES + 1),)
+                .is_none(),
+            "the newest edit must stay full"
+        );
+    }
+
+    #[test]
+    fn aged_supersession_stays_byte_stable_then_rides_one_bust() {
+        const EXECUTE_BAND_PASSES: usize = 3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference_store = store(reference_dir.path());
+        let store = store(dir.path());
+        for target in [&store, &reference_store] {
+            target
+                .replace_compartments(
+                    "supersession-trickle",
+                    &[comp(1, 1, 1, "covered", "summary")],
+                )
+                .unwrap();
+        }
+        let mut messages = vec![
+            item("covered", 1, "covered source"),
+            assistant_edit_call("edit-call-1", 2, "edit-1", "shared.ts"),
+            edit_result("edit-result-1", 3, "edit-1", "result one"),
+        ];
+        let mut context = smart_pctx();
+        context.cache_ttl = "never".to_string();
+        let mut reference_context = pctx("git:proj", "/nonexistent-docs", 0);
+        reference_context.cache_ttl = "never".to_string();
+        let boot_request = with_usage(
+            cc_req("supersession-trickle", "cfg0", messages.clone()),
+            10,
+            100,
+        );
+        let boot = transform(&store, &boot_request, &context).unwrap();
+        let reference_boot =
+            transform(&reference_store, &boot_request, &reference_context).unwrap();
+        assert_eq!(boot.action, "HARD");
+        let mut previous_bytes = canonical_output(boot.messages());
+        assert_eq!(
+            previous_bytes,
+            canonical_output(reference_boot.messages()),
+            "both fixtures must begin from identical rendered bytes"
+        );
+
+        let mut next_ordinal = 4u64;
+        for pass in 0..EXECUTE_BAND_PASSES {
+            let edit_number = pass + 2;
+            let call_id = format!("edit-{edit_number}");
+            messages.push(assistant_edit_call(
+                &format!("edit-call-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                "shared.ts",
+            ));
+            next_ordinal += 1;
+            messages.push(edit_result(
+                &format!("edit-result-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                &format!("result {edit_number}"),
+            ));
+            next_ordinal += 1;
+            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+                messages.push(item(
+                    &format!("pass-{pass}-tail-{message}"),
+                    next_ordinal,
+                    "stable tail",
+                ));
+                next_ordinal += 1;
+            }
+
+            for target in [&store, &reference_store] {
+                let mut loaded = target.load("supersession-trickle").unwrap();
+                loaded.meta.soft_refresh_pending = false;
+                loaded.meta.deferred_execute_state = Some(mc_store::DeferredExecuteState {
+                    reason: "execute-none".to_string(),
+                });
+                target
+                    .commit(
+                        "supersession-trickle",
+                        loaded.row_version,
+                        &loaded.core,
+                        &loaded.meta,
+                    )
+                    .unwrap();
+            }
+            let request = with_usage(
+                cc_req("supersession-trickle", "cfg0", messages.clone()),
+                10,
+                100,
+            );
+            let execute_band = transform(&store, &request, &context).unwrap();
+            let reference = transform(&reference_store, &request, &reference_context).unwrap();
+            let rendered = canonical_output(execute_band.messages());
+            assert_eq!(
+                &rendered[..previous_bytes.len()],
+                previous_bytes.as_slice(),
+                "non-busting pass {pass} must preserve every existing byte"
+            );
+            assert_eq!(
+                rendered,
+                canonical_output(reference.messages()),
+                "non-busting pass {pass} must not first-apply supersession"
+            );
+            assert!(
+                store
+                    .load("supersession-trickle")
+                    .unwrap()
+                    .core
+                    .frozen_units
+                    .iter()
+                    .all(|unit| !unit.key.starts_with("red:")),
+                "non-busting pass {pass} must leave the growing batch pending"
+            );
+            previous_bytes = rendered;
+        }
+
+        let mut loaded = store.load("supersession-trickle").unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        store
+            .commit(
+                "supersession-trickle",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+        let bust_request = with_usage(
+            cc_req("supersession-trickle", "cfg0", messages.clone()),
+            10,
+            100,
+        );
+        let batch = transform(&store, &bust_request, &context).unwrap();
+        assert_eq!(batch.action, "SOFT");
+        let batch_bytes = canonical_output(batch.messages());
+        assert_ne!(
+            batch_bytes, previous_bytes,
+            "the independent refresh is the one bust"
+        );
+
+        let loaded = store.load("supersession-trickle").unwrap();
+        for edit_number in 1..=EXECUTE_BAND_PASSES {
+            assert!(
+                frozen_red_payload(&loaded.core, &format!("edit-call-{edit_number}#0")).is_some(),
+                "superseded edit {edit_number} must join the riding batch"
+            );
+            assert!(
+                frozen_red_payload(&loaded.core, &format!("edit-result-{edit_number}#0")).is_some(),
+                "superseded result {edit_number} must join the riding batch"
+            );
+        }
+        assert!(
+            frozen_red_payload(
+                &loaded.core,
+                &format!("edit-call-{}#0", EXECUTE_BAND_PASSES + 1),
+            )
+            .is_none(),
+            "the newest edit stays full"
+        );
+        let reduction_count = loaded
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key.starts_with("red:"))
+            .count();
+        assert_eq!(reduction_count, EXECUTE_BAND_PASSES * 2);
+
+        let replay = transform(
+            &store,
+            &with_usage(cc_req("supersession-trickle", "cfg0", messages), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(canonical_output(replay.messages()), batch_bytes);
+        assert_eq!(
+            store
+                .load("supersession-trickle")
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count(),
+            reduction_count,
+            "the frozen batch must replay without minting another reclaim change"
+        );
+    }
+
+    #[test]
     fn held_agent_remainder_keeps_full_rendered_output_byte_stable() {
         let dir = tempfile::tempdir().unwrap();
         let initial_store = store(dir.path());
@@ -18962,6 +20721,7 @@ pub(crate) mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -19041,6 +20801,7 @@ pub(crate) mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -19479,6 +21240,21 @@ pub(crate) mod tests {
         let durable = store.load("mixed-freezes").unwrap().core;
         assert_eq!(frozen_red_payload(&durable, "m1#0"), Some("[dropped §7§]"));
         assert_eq!(frozen_red_payload(&durable, "m2#0"), Some("[dropped]"));
+    }
+
+    #[test]
+    fn missing_todo_tool_verdict_deserializes_as_provisional() {
+        let wire = serde_json::to_value(profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "todo-verdict-default",
+            "cfg0",
+            vec![item("a", 1, "first")],
+        ))
+        .unwrap();
+        assert!(wire.get("todo_tool_present").is_none());
+        let request: TransformRequest = serde_json::from_value(wire).unwrap();
+
+        assert_eq!(request.todo_tool_present, None);
     }
 
     #[test]
@@ -21956,6 +23732,7 @@ pub(crate) mod tests {
                 compartment_max_seq: None,
                 project_root: None,
                 first_divergence: None,
+                scheduler_observation: None,
                 overlays: TransformOverlayBatch::default(),
             },
         )
@@ -22301,6 +24078,145 @@ pub(crate) mod tests {
             per_pass_micros < 50.0,
             "the no-reduction short circuit regressed: {per_pass_micros:.3}us/pass"
         );
+    }
+
+    #[test]
+    fn consumed_transition_marker_survives_unrelated_hard_and_store_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "transition-hard-survivor";
+        let messages = vec![
+            unstamped_opencode_tool_pair("survivor-pair", 1, "survivor-call"),
+            item("survivor-tail", 2, "stable tail"),
+        ];
+        let initial_store = store(dir.path());
+        let request = active_opencode_req(session, "cfg0", messages.clone());
+        assert_eq!(run(&initial_store, &request, &spine()).action, "HARD");
+        append_historical_frozen_reductions(
+            &initial_store,
+            session,
+            &[
+                red_unit("survivor-pair#0", "skeleton", "historical call shell"),
+                red_unit("survivor-pair#1", "drop", "historical result shell"),
+            ],
+        );
+
+        let transition = run(&initial_store, &request, &spine());
+        assert_eq!(transition.action, "HARD");
+        assert_eq!(
+            transition.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let expected = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        assert_eq!(
+            stored_transition_marker_classes(&initial_store, session),
+            expected
+        );
+
+        let unrelated_request = active_opencode_req(session, "cfg1", messages);
+        let unrelated = run(&initial_store, &unrelated_request, &spine());
+        assert_eq!(unrelated.action, "HARD");
+        assert_eq!(
+            unrelated.materialize_reason.as_deref(),
+            Some("epoch_change")
+        );
+        assert_eq!(
+            stored_transition_marker_classes(&initial_store, session),
+            expected
+        );
+
+        drop(initial_store);
+        let reopened = store(dir.path());
+        assert_eq!(
+            stored_transition_marker_classes(&reopened, session),
+            expected
+        );
+        let replay = run(&reopened, &unrelated_request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_ne!(
+            replay.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        assert_eq!(
+            stored_transition_marker_classes(&reopened, session),
+            expected
+        );
+    }
+
+    #[test]
+    fn consumed_class_does_not_mask_a_new_renderer_transition_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "transition-new-class";
+        let messages = vec![
+            unstamped_opencode_tool_pair("new-class-pair", 1, "new-class-unmatched"),
+            reasoning_tool_shell_message("new-class-reasoning", 2, "new-class-poisoned", false),
+            tool_result(
+                "new-class-result",
+                3,
+                "new-class-poisoned",
+                "historical tool output",
+            ),
+            item("new-class-tail", 4, "stable tail"),
+        ];
+        let request = active_opencode_req(session, "cfg0", messages);
+        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+        append_historical_frozen_reductions(
+            &store,
+            session,
+            &[
+                red_unit("new-class-pair#0", "skeleton", "historical call shell"),
+                red_unit("new-class-pair#1", "drop", "historical result shell"),
+            ],
+        );
+
+        let unmatched_transition = run(&store, &request, &spine());
+        assert_eq!(unmatched_transition.action, "HARD");
+        assert_eq!(
+            unmatched_transition.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let unmatched_only = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        assert_eq!(
+            stored_transition_marker_classes(&store, session),
+            unmatched_only,
+            "classes without consumed shapes must not be pre-recorded"
+        );
+
+        append_historical_frozen_reductions(
+            &store,
+            session,
+            &[
+                red_unit(
+                    "new-class-reasoning#1",
+                    "skeleton",
+                    "historical reasoning call shell",
+                ),
+                red_unit(
+                    "new-class-result#0",
+                    "drop",
+                    "historical reasoning result shell",
+                ),
+            ],
+        );
+        let new_class_transition = run(&store, &request, &spine());
+        assert_eq!(new_class_transition.action, "HARD");
+        assert_eq!(
+            new_class_transition.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let expected = BTreeSet::from([
+            RendererTransitionClass::PoisonedReasoning,
+            RendererTransitionClass::UnmatchedPair,
+        ]);
+        assert_eq!(stored_transition_marker_classes(&store, session), expected);
+
+        let replay = run(&store, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_ne!(
+            replay.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        assert_eq!(stored_transition_marker_classes(&store, session), expected);
     }
 
     #[test]
@@ -23567,7 +25483,10 @@ pub(crate) mod tests {
             fake_compaction_messages("2026-08-06", &summary),
         );
         let first = run(&store, &descent, &spine());
-        assert_eq!(first.lineage_descent_disposition.as_deref(), Some("descended"));
+        assert_eq!(
+            first.lineage_descent_disposition.as_deref(),
+            Some("descended")
+        );
         assert_eq!(first.ordinal_continuation_base, Some(10));
 
         // The successor runs on: the historian folds messages past the seam,
@@ -23596,11 +25515,136 @@ pub(crate) mod tests {
         follow_up_messages.push(item("succ-13", 13, "successor turn thirteen"));
         follow_up_messages.push(item("succ-14", 14, "successor turn fourteen"));
         let follow_up = req("B", "descent-cfg", follow_up_messages);
-        let outcome = transform(&store, &follow_up, &pctx("git:proj", "/nonexistent-docs", 0));
+        let outcome = transform(
+            &store,
+            &follow_up,
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        );
         assert!(
             outcome.is_ok(),
             "post-descent fold past the seam must not fence: {:?}",
             outcome.err()
+        );
+    }
+
+    #[test]
+    fn continued_lineage_stable_defer_rejects_mutated_anchor_after_post_seam_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("stable-seam");
+        let descent = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            502,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        run(&store, &descent, &spine());
+        store
+            .append_compartments("B", &[comp(4, 12, 14, "successor-14", "successor work")])
+            .unwrap();
+
+        let follow_up_messages = vec![
+            wire_item(
+                "user",
+                "summary",
+                11,
+                &[
+                    "<system-reminder>Today's date: 2026-08-06</system-reminder>",
+                    &summary,
+                ],
+            ),
+            wire_item("assistant", "tail", 12, &["continued answer"]),
+            item("succ-13", 13, "successor turn thirteen"),
+            item("succ-14", 14, "successor turn fourteen"),
+        ];
+        let follow_up = req("B", "descent-cfg", follow_up_messages);
+        let intact = run(&store, &follow_up, &spine());
+        assert_eq!(intact.action, "SOFT+");
+        assert!(!intact.reconcile_pending);
+
+        let mut mutated = follow_up.clone();
+        mutated.messages[0].ck.content[1].kind = ck_wire::CkKind::Text {
+            text: continuation_summary("MUTATED"),
+        };
+        mutated.messages[0].ck.content[1].mark_modified();
+        let refused = run(&store, &mutated, &spine());
+        assert_eq!(refused.action, "SOFT+");
+        assert!(refused.reconcile_pending);
+        assert_eq!(
+            refused.materialize_reason.as_deref(),
+            Some("lineage_anchor_mismatch")
+        );
+        assert_eq!(
+            refused
+                .messages()
+                .iter()
+                .filter(|message| !message.meta.synthetic)
+                .count(),
+            mutated.messages.len(),
+            "a mutated continuation anchor must fail closed without trimming live input"
+        );
+    }
+
+    #[test]
+    fn continued_lineage_tolerates_a_synthetic_head_like_the_seam_check() {
+        // The seam check finds the boundary at the first non-synthetic message;
+        // the anchor check must use the same rule or a synthetic-marked head
+        // (normalized synthetic todo) passes one gate and defers forever on the
+        // other.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("synthetic-head");
+        let descent = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            601,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        let first = run(&store, &descent, &spine());
+        assert_eq!(
+            first.lineage_descent_disposition.as_deref(),
+            Some("descended")
+        );
+
+        // Follow-up pass whose head message is synthetic-marked; the anchor
+        // stays the first NON-synthetic message.
+        let mut synthetic_head = item("synth-head", 10, "synthetic filler");
+        synthetic_head.ck.meta.synthetic = true;
+        let mut follow_up_messages = vec![
+            synthetic_head,
+            wire_item(
+                "user",
+                "summary",
+                11,
+                &[
+                    "<system-reminder>Today's date: 2026-08-06</system-reminder>",
+                    &summary,
+                ],
+            ),
+            wire_item("assistant", "tail", 12, &["continued answer"]),
+        ];
+        follow_up_messages.push(item("succ-13", 13, "successor turn thirteen"));
+        let follow_up = req("B", "descent-cfg", follow_up_messages);
+        let outcome = transform(
+            &store,
+            &follow_up,
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        );
+        assert!(
+            outcome.is_ok(),
+            "synthetic head must not fail the anchor gate: {:?}",
+            outcome.err()
+        );
+        let response = outcome.unwrap();
+        assert!(
+            !response.reconcile_pending,
+            "synthetic head must not latch a lineage_anchor_mismatch defer"
         );
     }
 

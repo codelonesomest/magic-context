@@ -75,6 +75,7 @@ import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
+import { preloadTokenizer } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
 import {
@@ -90,6 +91,7 @@ import {
 } from "@magic-context/core/shared/announcement";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { setHarness } from "@magic-context/core/shared/harness";
+import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
 import {
@@ -284,6 +286,10 @@ export async function handlePiSessionBeforeCompact(args: {
 	return { cancel: true };
 }
 
+export function canonicalPiModelKey(provider: string, model: string): string {
+	return piModelRefToCanonical(`${provider}/${model}`);
+}
+
 export function persistPiMessageEndModelMeta(args: {
 	db: ContextDatabase;
 	sessionId: string;
@@ -305,7 +311,7 @@ export function persistPiMessageEndModelMeta(args: {
 	) {
 		return;
 	}
-	const modelKey = `${msg.provider}/${msg.model}`;
+	const modelKey = canonicalPiModelKey(msg.provider, msg.model);
 	recordPiLiveModel(args.sessionId, modelKey);
 	const cacheTtl = resolveCacheTtl(args.cacheTtlConfig, modelKey);
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
@@ -1543,6 +1549,9 @@ async function startPiMagicContextRuntime(
 	// `experimental.chat.system.transform` handler in
 	// `system-prompt-hash.ts`.
 	pi.on("before_agent_start", async (event, ctx) => {
+		// Match OpenCode's first-prompt lazy-load boundary so synchronous token
+		// estimates below never depend on a virtual bundled-module resolution base.
+		await preloadTokenizer();
 		// Startup release announcement (Pi parity with OpenCode TUI dialog +
 		// Desktop ignored message). Fires once per ANNOUNCEMENT_VERSION across
 		// the whole machine — persistence file is shared with the OpenCode
@@ -1765,7 +1774,10 @@ async function startPiMagicContextRuntime(
 				promptSurfaceModel.provider.length > 0 &&
 				typeof promptSurfaceModel.id === "string" &&
 				promptSurfaceModel.id.length > 0
-					? `${promptSurfaceModel.provider}/${promptSurfaceModel.id}`
+					? canonicalPiModelKey(
+							promptSurfaceModel.provider,
+							promptSurfaceModel.id,
+						)
 					: undefined;
 			const promptSurface = sessionId
 				? promptSurfaceGuidanceEpochs.resolve(

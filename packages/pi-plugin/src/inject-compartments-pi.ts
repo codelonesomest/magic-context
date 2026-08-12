@@ -507,6 +507,8 @@ export interface PiM0SnapshotMarkers {
 	// Pi sessions can switch projects in-process (`/cd`). NULL on legacy cached
 	// rows means unknown/lazy-adopted and must not force a HARD fold by itself.
 	projectIdentity: string | null;
+	muralEnabled: boolean;
+	renderBudgetIdentity: string;
 }
 
 /**
@@ -528,6 +530,10 @@ const EMPTY_PI_HARD_SIGNALS: PiM0HardSignals = {
 	cacheExpired: false,
 	lastResponseTime: 0,
 };
+
+function renderBudgetIdentityPi(state: PiM0M1State): string {
+	return `m${state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
+}
 
 export interface PiMaterializeDecision {
 	value: boolean;
@@ -834,6 +840,8 @@ function getCachedMarkers(
 		systemHash: meta.cachedM0SystemHash ?? "",
 		modelKey: meta.cachedM0ModelKey ?? "",
 		projectIdentity: meta.cachedM0ProjectIdentity ?? null,
+		muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
+		renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
 	};
 }
 
@@ -924,6 +932,8 @@ function readCurrentMarkersFromCompartments(
 		systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
 		modelKey: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
 		projectIdentity: state.projectIdentity,
+		muralEnabled: state.muralEnabled === true,
+		renderBudgetIdentity: renderBudgetIdentityPi(state),
 	};
 }
 
@@ -966,6 +976,12 @@ export function mustMaterializePi(
 	// persists this component with the rendered bytes, consuming the trigger.
 	if (cached.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
 		return { value: true, reason: "compartment_render_epoch" };
+	}
+	if (
+		cached.muralEnabled !== current.muralEnabled ||
+		cached.renderBudgetIdentity !== current.renderBudgetIdentity
+	) {
+		return { value: true, reason: "render_config" };
 	}
 	// ── HARD: provider-side cache eviction (the cache was already dead) ──
 	// Parity with OpenCode mustMaterialize. An empty current signal means
@@ -1331,6 +1347,8 @@ function readFrozenM0InputsPi(
 			systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
 			modelKey: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
 			projectIdentity: state.projectIdentity,
+			muralEnabled: state.muralEnabled === true,
+			renderBudgetIdentity: renderBudgetIdentityPi(state),
 		};
 		return { docs, markers, compartments, memories, userProfile, workspace };
 	});
@@ -1561,6 +1579,8 @@ export function materializeM0Pi(
 			upgradeState: encodeCachedM0UpgradeIdentity(
 				snapshotMarkers.upgradeState,
 				snapshotMarkers.compartmentRenderEpoch,
+				snapshotMarkers.muralEnabled,
+				snapshotMarkers.renderBudgetIdentity,
 			),
 			systemHash: snapshotMarkers.systemHash,
 			modelKey: snapshotMarkers.modelKey,
@@ -1962,6 +1982,8 @@ function markersFromCachedPiRow(
 		systemHash: row.cached_m0_system_hash ?? "",
 		modelKey: row.cached_m0_model_key ?? "",
 		projectIdentity: row.cached_m0_project_identity ?? null,
+		muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
+		renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
 	};
 }
 

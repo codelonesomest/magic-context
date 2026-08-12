@@ -13,6 +13,7 @@ import {
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
+    applyMirroredNoteCompileFields,
     applyMirrorPage,
     ensureContextStoreUuid,
     getMirrorCursor,
@@ -220,6 +221,38 @@ function notifyMagicContextDisabled(client: PluginContext["client"], reason: str
         .catch((error) => {
             log("[magic-context] failed to show disabled toast:", error);
         });
+}
+
+function moduleNoteRowId(response: unknown, depth = 0): number | null {
+    if (depth > 4 || response === null || response === undefined) return null;
+    if (typeof response === "string") {
+        const match = response.match(/\b(?:smart\s+)?note\s+#(\d+)/i);
+        return match ? Number(match[1]) : null;
+    }
+    if (Array.isArray(response)) {
+        for (const item of response) {
+            const id = moduleNoteRowId(item, depth + 1);
+            if (id !== null) return id;
+        }
+        return null;
+    }
+    if (typeof response !== "object") return null;
+    const record = response as Record<string, unknown>;
+    return (
+        moduleNoteRowId(record.result, depth + 1) ??
+        moduleNoteRowId(record.content, depth + 1) ??
+        moduleNoteRowId(record.text, depth + 1)
+    );
+}
+
+function moduleNoteResponseIsError(response: unknown, depth = 0): boolean {
+    if (depth > 4 || response === null || typeof response !== "object") return false;
+    if (Array.isArray(response)) {
+        return response.some((item) => moduleNoteResponseIsError(item, depth + 1));
+    }
+    const record = response as Record<string, unknown>;
+    if (record.isError === true || record.ok === false || record.error !== undefined) return true;
+    return moduleNoteResponseIsError(record.result, depth + 1);
 }
 
 export function createMagicContextHook(deps: MagicContextDeps) {
@@ -666,6 +699,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         autoEmbedAttemptedBySession.add(sessionId);
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         void (async () => {
+            let completedDrainWithWork = false;
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -698,6 +732,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     });
                 }
                 const summary = await executeEmbedHistory(sessionId);
+                const completedCoverage = getEmbeddingCoverageStatus(
+                    db,
+                    sessionProjectIdentity,
+                    sessionId,
+                );
+                completedDrainWithWork =
+                    completedCoverage.session.total - completedCoverage.session.embedded <= 0;
                 if (!isTuiConnected(sessionId)) {
                     await sendIgnoredMessage(deps.client, sessionId, summary, {
                         ...notifyParams,
@@ -705,6 +746,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
+            } finally {
+                if (!completedDrainWithWork) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };
@@ -810,6 +853,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       action,
                       content,
                       surfaceCondition,
+                      compiledProvider,
+                      compiledConfig,
+                      compiledAt,
+                      compileStatus,
                       filter,
                       limit,
                       offset,
@@ -837,6 +884,28 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       // The module is authoritative, but context.db remains the local
                       // read model for note nudges and dashboard/RPC consumers.
                       await syncModuleNotes();
+                      if (compileStatus && !moduleNoteResponseIsError(response)) {
+                          const moduleRowId =
+                              action === "write" ? moduleNoteRowId(response) : (noteId ?? null);
+                          if (
+                              moduleRowId === null ||
+                              !applyMirroredNoteCompileFields({
+                                  db,
+                                  moduleProject: memoryProject,
+                                  moduleRowId,
+                                  fields: {
+                                      compiledProvider: compiledProvider ?? null,
+                                      compiledConfig: compiledConfig ?? null,
+                                      compiledAt: compiledAt ?? null,
+                                      compileStatus,
+                                  },
+                              })
+                          ) {
+                              throw new Error(
+                                  "Rust note was written but its host compilation metadata could not be mirrored",
+                              );
+                          }
+                      }
                       return response;
                   },
                   memory: async ({

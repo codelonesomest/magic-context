@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/magic-context",
-  "version": "0.36.0-omp.1",
+  "version": "0.36.1-omp.1",
   "description": "Unified CLI for Magic Context — setup, doctor, and migration across OpenCode, Pi, and OMP",
   "keywords": [
     "opencode",
@@ -33,7 +33,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm --external node:sqlite",
+    "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm --external node:sqlite --external jsonc-parser",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "lint": "biome check src",
@@ -44,7 +44,8 @@
   "dependencies": {
     "@clack/prompts": "^1.6.0",
     "@cortexkit/subc-client": "0.4.1",
-    "comment-json": "^5.0.0"
+    "comment-json": "^5.0.0",
+    "jsonc-parser": "^3.3.1"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.1",

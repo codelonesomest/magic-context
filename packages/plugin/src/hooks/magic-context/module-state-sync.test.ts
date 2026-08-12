@@ -517,6 +517,80 @@ describe("module state sync section deltas", () => {
         expect(statusCalls).toBe(1);
     });
 
+    it("re-probes and rebuilds a full payload after a delta crosses a connection generation", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-delta-reconnect";
+        createWorkspace(db);
+        insertUserMemory(db, "profile survives reconnect", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: loadModuleWatermarks({
+                db,
+                sessionId,
+                projectPath: "/tmp/project",
+            }),
+            seedPassPending: false,
+        };
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"changed"}]' });
+
+        let generation = 1;
+        let cachedGeneration = 1;
+        let moduleSupportsDeltas = true;
+        let statusCalls = 0;
+        const stateSyncBodies: Record<string, unknown>[] = [];
+        let moduleProfile = ["profile survives reconnect"];
+        let moduleWorkspace: unknown = { preserved: true };
+        const transport = {
+            getCachedStateSyncCapabilities: () =>
+                cachedGeneration === generation
+                    ? { state_sync_deltas: moduleSupportsDeltas }
+                    : undefined,
+            async stateSyncCapabilities() {
+                statusCalls += 1;
+                cachedGeneration = generation;
+                return { state_sync_deltas: moduleSupportsDeltas };
+            },
+            async call(args: { body: unknown; generationSensitive?: boolean }) {
+                const body = args.body as Record<string, unknown>;
+                stateSyncBodies.push(body);
+                if (stateSyncBodies.length === 1) {
+                    expect(args.generationSensitive).toBe(true);
+                    expect(body).not.toHaveProperty("user_profile");
+                    expect(body).not.toHaveProperty("workspace");
+                    generation = 2;
+                    moduleSupportsDeltas = false;
+                    return {
+                        transport_status: "connection_generation_changed",
+                        previous_generation: 1,
+                        current_generation: 2,
+                    };
+                }
+                expect(args.generationSensitive).toBe(false);
+                moduleProfile = body.user_profile as string[];
+                moduleWorkspace = body.workspace;
+                return { result: { shadow_seq: 1 } };
+            },
+        };
+
+        await expect(
+            syncModuleState({
+                client: transport,
+                state,
+                pass: { db, sessionId, projectPath: "/tmp/project", nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: false,
+            }),
+        ).resolves.toMatchObject({ status: "acked" });
+
+        expect(statusCalls).toBe(1);
+        expect(stateSyncBodies).toHaveLength(2);
+        expect(stateSyncBodies[1]).toHaveProperty("user_profile", ["profile survives reconnect"]);
+        expect(stateSyncBodies[1]).toHaveProperty("workspace");
+        expect(moduleProfile).toEqual(["profile survives reconnect"]);
+        expect(moduleWorkspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
+    });
+
     it("uses a re-probed capability shape without leaking module-owned memories", async () => {
         const db = createContextDb();
         const sessionId = "ses-state-sync-capability-reprobe";
@@ -920,7 +994,7 @@ describe("module incremental and paged assembly", () => {
 });
 
 describe("module compartment mirror-back", () => {
-    it("copies rows after the local watermark idempotently", async () => {
+    it("copies the authoritative row set idempotently", async () => {
         const db = new Database(":memory:");
         databases.push(db);
         initializeDatabase(db);
@@ -962,7 +1036,61 @@ describe("module compartment mirror-back", () => {
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
 
-        expect(calls).toEqual([-1, 2]);
+        expect(calls).toEqual([-1, -1]);
         expect(getCompartments(db, "ses-mirror").map((row) => row.sequence)).toEqual([1, 2]);
+    });
+
+    it("replaces a recut suffix and truncates rows absent from the module set", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-recut";
+        let rows = Array.from({ length: 5 }, (_, index) => {
+            const sequence = index + 1;
+            return {
+                sequence,
+                start_message: sequence * 2 - 1,
+                end_message: sequence * 2,
+                start_message_id: `m${sequence * 2 - 1}#0`,
+                end_message_id: `m${sequence * 2}#0`,
+                title: `Compartment ${sequence}`,
+                content: `original content ${sequence}`,
+                created_at: sequence,
+            };
+        });
+        const reader = {
+            async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
+                return {
+                    max_sequence: rows.at(-1)?.sequence ?? -1,
+                    compartments: rows.filter((row) => row.sequence > afterSequence).slice(0, 2),
+                };
+            },
+        };
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        expect(getCompartments(db, sessionId)).toHaveLength(5);
+
+        rows = [
+            rows[0]!,
+            rows[1]!,
+            {
+                ...rows[2]!,
+                end_message: 30,
+                end_message_id: "recut-m30#0",
+                title: "Recut third compartment",
+                content: "authoritative recut content",
+            },
+        ];
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        const mirrored = getCompartments(db, sessionId);
+        expect(mirrored).toHaveLength(3);
+        expect(mirrored.map((row) => row.sequence)).toEqual([1, 2, 3]);
+        expect(mirrored[2]).toEqual(
+            expect.objectContaining({
+                endMessage: 30,
+                endMessageId: "recut-m30#0",
+                title: "Recut third compartment",
+                content: "authoritative recut content",
+            }),
+        );
     });
 });

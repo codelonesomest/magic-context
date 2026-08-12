@@ -81,7 +81,7 @@ use subc_client_rs::{
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use classify::{
-    child_session_id, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
+    child_session_id, has_manifest_envelope, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
     CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK, CLASSIFY_TEMPERATURE,
     MAX_CLASSIFY_PROMPT_BYTES,
 };
@@ -6058,7 +6058,10 @@ impl McHandler {
             .lock()
             .expect("prompt surface epoch mutex");
         if let Some(frozen) = epochs.get(session_id) {
-            if frozen.model_key == requested.model_key {
+            if frozen.model_key == requested.model_key
+                && prompt_surface::selection_freeze_identity(frozen)
+                    == prompt_surface::selection_freeze_identity(&requested)
+            {
                 return frozen.clone();
             }
         }
@@ -6090,6 +6093,18 @@ impl McHandler {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let config_identity = match request
+            .get("prompt_surface_config_identity")
+            .or_else(|| request.get("config_identity"))
+        {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(value)) => value.trim().to_string(),
+            _ => {
+                return Err(invalid_params_error(
+                    "prompt_surface config identity must be a string",
+                ))
+            }
+        };
         let descriptions = request
             .get("tool_descriptions")
             .or_else(|| request.get("prompt_surface_tool_descriptions"));
@@ -6121,6 +6136,7 @@ impl McHandler {
         }
         Ok(PromptSurfaceSelection {
             model_key,
+            config_identity,
             preset,
             tool_descriptions,
         })
@@ -6556,6 +6572,7 @@ impl McHandler {
                 .prompt_surface_model_key
                 .clone()
                 .or_else(|| parsed.model_key.clone()),
+            config_identity: parsed.prompt_surface_config_identity.clone(),
             preset: parsed.prompt_surface_preset,
             tool_descriptions: parsed.prompt_surface_tool_descriptions.clone(),
         };
@@ -6563,6 +6580,7 @@ impl McHandler {
             self.freeze_prompt_surface_selection(&parsed.session_id, requested_prompt_surface);
         parsed.prompt_surface_preset = frozen_prompt_surface.preset;
         parsed.prompt_surface_model_key = frozen_prompt_surface.model_key;
+        parsed.prompt_surface_config_identity = frozen_prompt_surface.config_identity;
         parsed.prompt_surface_tool_descriptions = frozen_prompt_surface.tool_descriptions;
 
         let lineage_root = canonical_root(&binding.project_root);
@@ -6638,6 +6656,19 @@ impl McHandler {
         // change the transform result.
         let _ = store.trace_pass_received(&parsed.session_id, pass_now);
         let run_transform = || {
+            let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
+                || {
+                    binding
+                        .config
+                        .resolve_cache_ttl_with_provenance(parsed.model_key.as_deref())
+                },
+                |value| config::ResolvedCacheTtl {
+                    value,
+                    // Host-resolved TTLs remain host-side; only a per-model config match may
+                    // instruct the Claude Code marker owner.
+                    provenance: config::CacheTtlProvenance::Default,
+                },
+            );
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
                 note_project_path: &note_project_path,
@@ -6657,11 +6688,10 @@ impl McHandler {
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
-                cache_ttl: parsed.cache_ttl.clone().unwrap_or_else(|| {
-                    binding
-                        .config
-                        .resolve_cache_ttl(binding.model_key.as_deref())
-                }),
+                // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
+                // request's model while retaining whether the walk actually matched an entry.
+                cache_ttl: resolved_cache_ttl.value,
+                cache_ttl_provenance: resolved_cache_ttl.provenance,
                 model_key: binding.model_key.clone(),
                 observed_last_response_at_ms: self
                     .observed_last_response_at_ms(&store, &parsed.session_id),
@@ -8110,13 +8140,17 @@ impl McHandler {
                 Err(error) => Err(error),
             };
             match attempt_output {
-                Ok(result) => {
-                    // The module never parses manifests. A capped result is still returned
-                    // with truncated=true so the host's fail-closed parser remains the
-                    // authority for output validity.
+                Ok(result) if has_manifest_envelope(&result.text) => {
+                    // The module checks only for the task-specific envelope. Even if the
+                    // output limit truncated a result, this layer accepts it when the
+                    // envelope remains; the host parser rejects malformed contents.
                     output = Some((model.clone(), result));
                     producer.purge_session(&child_session).await;
                     break;
+                }
+                Ok(_) => {
+                    last_error =
+                        "classify producer returned no classify manifest envelope".to_string();
                 }
                 Err(error) => last_error = error.to_string(),
             }
@@ -14145,6 +14179,45 @@ mod tests {
         call_transform_request(handler, request(messages)).await
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_response_resolves_per_pass_model_cache_ttl_from_module_config() {
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let route_config = config.clone();
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config);
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = route_config;
+        handler.bind_route(7, route);
+        let mut transform_request = request(vec![ck("a", 1, "alpha")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+        transform_request["model_key"] = json!("anthropic/claude-opus-4-1");
+
+        let response = call_transform_request(&handler, transform_request).await;
+        assert_eq!(response["cache_ttl"], "1h");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_response_without_model_cache_ttl_inherits_harness_markers() {
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        config.cache_ttl = "90m".to_string();
+        let route_config = config.clone();
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config);
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = route_config;
+        handler.bind_route(7, route);
+        let mut transform_request = request(vec![ck("a", 1, "alpha")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+
+        let response = call_transform_request(&handler, transform_request).await;
+        assert!(response.get("cache_ttl").is_none());
+    }
+
     #[test]
     fn cached_transform_response_writer_is_byte_identical_to_value_round_trip() {
         let response = transform::TransformResponse::passthrough(
@@ -16625,7 +16698,7 @@ mod tests {
         assert_eq!(second.receive_count, 2);
         assert_eq!(second.reject_count, 2);
         assert_eq!(second.last_reject_error.as_deref(), Some(message.as_str()));
-        assert!(second.last_reject_at_ms.unwrap() >= first.last_reject_at_ms.unwrap());
+        assert!(second.last_reject_at_ms.unwrap() > first.last_reject_at_ms.unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16830,7 +16903,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_manifest_freezes_per_model_epoch_and_keeps_ids_and_schemas_stable() {
+    async fn session_manifest_freezes_per_model_and_config_epoch_and_keeps_ids_and_schemas_stable()
+    {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         handler.bind_route(30, binding("/tmp/project", "manifest-ses"));
@@ -16841,6 +16915,7 @@ mod tests {
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
                 "model_key": "provider/model-a",
+                "config_identity": "config-a",
                 "preset": "light",
                 "tool_descriptions": { "ctx_search": "Search override A." },
             }),
@@ -16856,6 +16931,7 @@ mod tests {
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
                 "model_key": "provider/model-a",
+                "config_identity": "config-a",
                 "preset": "full",
                 "tool_descriptions": { "ctx_search": "Ignored mid-epoch override." },
             }),
@@ -16872,7 +16948,8 @@ mod tests {
             json!({
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
-                "model_key": "provider/model-b",
+                "model_key": "provider/model-a",
+                "config_identity": "config-b",
                 "preset": "full",
                 "tool_descriptions": { "ctx_search": "Search override B." },
             }),
@@ -16899,6 +16976,130 @@ mod tests {
                 assert_eq!(actual.execution_mode, expected.execution_mode);
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_reload_reselects_guidance_and_manifest_together_then_stays_frozen() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let session = "prompt-config-reload";
+        handler.bind_route(31, binding("/tmp/project", session));
+        handler.guidance_dates.lock().unwrap().insert(
+            session.to_string(),
+            "Today's date: Fri Jan 01 2016".to_string(),
+        );
+
+        let guidance_light = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "light",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_light = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "light",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_light["preset"], json!("light"));
+        assert_eq!(manifest_light["preset"], json!("light"));
+        assert_eq!(
+            guidance_light["manifest_content_epoch"],
+            manifest_light["content_epoch"]
+        );
+
+        let guidance_stable = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "full",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_stable = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "full",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_stable, guidance_light);
+        assert_eq!(manifest_stable, manifest_light);
+
+        let guidance_full = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "full",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_full = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "full",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_full["preset"], json!("full"));
+        assert_eq!(manifest_full["preset"], json!("full"));
+        assert_ne!(guidance_full["bytes"], guidance_light["bytes"]);
+        assert_ne!(
+            manifest_full["content_epoch"],
+            manifest_light["content_epoch"]
+        );
+        assert_eq!(
+            guidance_full["manifest_content_epoch"],
+            manifest_full["content_epoch"]
+        );
+
+        let guidance_full_repeat = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "light",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        assert_eq!(guidance_full_repeat, guidance_full);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -19126,6 +19327,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_advances_model_chain_after_outage_text() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Ok(ProducerOutput {
+                    text: "All Antigravity endpoints failed".to_string(),
+                    length_capped: false,
+                }),
+                Ok(ProducerOutput {
+                    text: "<classify></classify>".to_string(),
+                    length_capped: false,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        let mut route_binding = binding(route_root, "ses");
+        route_binding.config.model_chain =
+            vec!["test/bad-model".to_string(), "test/good-model".to_string()];
+        handler.bind_route(7, route_binding);
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "model-chain-command",
+                    "authority_generation": generation,
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("dreamer run failed: {other:?}"),
+        };
+
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(response["manifest_text"], json!("<classify></classify>"));
+        assert_eq!(response["diagnostics"]["model"], json!("test/good-model"));
+        assert_eq!(response["diagnostics"]["attempts"], json!(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cancelled_dreamer_run_unregisters_its_child_session() {
         let producer = Arc::new(ProducerState::default());
         producer.block_output.store(true, Ordering::SeqCst);
@@ -19227,6 +19483,7 @@ mod tests {
         let request = request(vec![ck("m0", 0, "live input")]);
         let initial = call_transform_request(&handler, request.clone()).await;
         assert_eq!(initial["action"], "HARD");
+        assert_eq!(initial["rendered_memory_ids"], json!([source]));
         assert_eq!(
             store.load("ses").unwrap().meta.rendered_memory_ids,
             vec![source]
@@ -19817,6 +20074,44 @@ mod tests {
         assert!(historical["pass_id"].is_number());
         assert!(historical["timestamp_ms"].is_number());
         assert_eq!(historical["divergence"], diverging["first_divergence"]);
+
+        let appended = request(vec![ck("m1", 1, "after"), ck("m2", 2, "before")]);
+        let append_only = call_transform_request(&handler, appended.clone()).await;
+        assert!(append_only.get("first_divergence").is_none());
+        let second_diverging = call_transform_request(
+            &handler,
+            request(vec![ck("m1", 1, "after"), ck("m2", 2, "after")]),
+        )
+        .await;
+        assert!(second_diverging["first_divergence"].is_object());
+        let second_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expected status response, got {other:?}"),
+        };
+        let second_historical: Value = serde_json::from_str(
+            second_status["pass_trace"]["last_divergence"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            second_historical["divergence"],
+            second_diverging["first_divergence"]
+        );
+        assert_ne!(
+            historical["divergence"]["block_id_old"],
+            second_historical["divergence"]["block_id_old"],
+            "different divergent blocks must remain distinguishable in the durable trace"
+        );
+        let stable_again = call_transform_request(
+            &handler,
+            request(vec![ck("m1", 1, "after"), ck("m2", 2, "after")]),
+        )
+        .await;
+        assert!(stable_again.get("first_divergence").is_none());
 
         let session_status = tool_body(handler.handle_session_status_value(
             7,
@@ -23024,6 +23319,7 @@ mod tests {
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -23797,6 +24093,7 @@ mod tests {
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -24396,6 +24693,52 @@ mod tests {
             store.load_active_memories(&project_path, 0).unwrap()[0].content,
             "authority memory"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_todowrite_clears_cold_start_seed_on_first_bust() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let state_json =
+            r#"[{"content":"Seeded before disable","status":"in_progress","priority":"high"}]"#;
+        let pair = injection::build_synthetic_todo_pair(state_json).unwrap();
+        let call_id = pair.call_id.clone();
+        let seeded = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "last_todo_state": state_json,
+                    "todo_synthetic_anchor": {
+                        "call_id": call_id,
+                        "message_id": "tail",
+                        "state_json": state_json
+                    },
+                    "acked_watermarks": {}
+                }),
+            )
+            .await;
+        assert!(matches!(seeded, HandlerOutcome::Response(_)), "{seeded:?}");
+        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_some());
+
+        let mut first_request = request(vec![ck("tail", 0, "live tail")]);
+        first_request["todo_tool_present"] = json!(false);
+        let first = call_transform_request(&handler, first_request).await;
+
+        assert!(
+            matches!(first["decision"].as_str(), Some("HARD" | "SOFT+")),
+            "{first}"
+        );
+        assert!(first["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .all(|block| block["kind"]["name"] != json!("todowrite")));
+        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_none());
     }
 
     #[tokio::test]
