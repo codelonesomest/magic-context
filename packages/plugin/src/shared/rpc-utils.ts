@@ -374,6 +374,10 @@ export function __resetRpcIdentityTestHooks(): void {
 
 function commandLooksLikePi(command: string): boolean {
     const normalized = command.trim().toLowerCase().replaceAll("\\", "/");
+    // OMP spawns isolated worker entrypoints for tiny inference, stats, JS,
+    // browser, and similar services. They do not load extensions or open the
+    // shared Magic Context database, so they must not block a schema migration.
+    if (/(?:^|\s)__omp_worker_[^\s]+(?:\s|$)/.test(normalized)) return false;
     const tokens = normalized.split(/\s+/).filter(Boolean);
     const executableName = (token: string | undefined): string =>
         (token ?? "").split("/").at(-1) ?? "";

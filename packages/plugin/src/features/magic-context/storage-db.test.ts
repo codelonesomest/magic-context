@@ -543,6 +543,19 @@ describe("storage-db", () => {
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
+        it("#when only an OMP internal worker is live #then migrates the shared database", () => {
+            const dataHome = useTempDataHome("storage-db-omp-worker-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41008 bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js __omp_worker_tiny_inference\n") as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
         it("#when an unrelated Pi harness is live #then opens a fresh explicit-path database", () => {
             const isolatedRoot = makeTempDir("storage-db-isolated-live-pi-");
             const dbPath = join(isolatedRoot, "profile", "context.db");

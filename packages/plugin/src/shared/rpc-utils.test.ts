@@ -92,12 +92,21 @@ describe("discoverLivePiProcessIds", () => {
                     " 41005 node /workspace/pi-plugin/src/index.ts",
                     " 41006 npm install @earendil-works/pi-coding-agent",
                     " 41007 /usr/local/bin/omp --model test",
+                    " 41008 bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js __omp_worker_tiny_inference",
                 ].join("\n")) as typeof execFileSync,
         });
 
         expect(discoverLivePiProcessIds()).toEqual([41001, 41002, 41003, 41007]);
     });
 
+    test("excludes OMP internal workers that cannot load extensions", () => {
+        __setRpcIdentityTestHooks({
+            processListExecFileSync: (() =>
+                " 41008 bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js __omp_worker_tiny_inference\n") as typeof execFileSync,
+        });
+
+        expect(discoverLivePiProcessIds()).toEqual([]);
+    });
     test("reports uncertainty instead of treating an unavailable process list as empty", () => {
         __setRpcIdentityTestHooks({
             processListExecFileSync: (() => {
