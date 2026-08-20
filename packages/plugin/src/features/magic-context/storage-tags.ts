@@ -1,5 +1,7 @@
+import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { newestCtxReduceTagNumbers } from "./reclaim-protection";
 import type { TagEntry } from "./types";
 
 const insertTagStatements = new WeakMap<Database, PreparedStatement>();
@@ -208,29 +210,35 @@ export interface AgeReclaimToolTag extends ToolReclaimHintTag {
  * only to render lightweight nudge hints; it never mutates tag state.
  */
 /**
- * Tools whose output is task / plan STATE, never appropriate to surface as a
- * "you could drop this" hint regardless of size. `todowrite` is the agent's
- * working plan: the canonical todo state is the synthetic todowrite we inject
- * (and protect from dropping), so suggesting the agent drop a todowrite output
- * is both pointless and confusing. Name-excluded (not just floor-excluded)
- * because a todowrite output can be several hundred tokens, above the floor.
+ * Tool results that are useful to coordinate with but are poor suggestions for
+ * a context-reduction hint. This only filters guidance; the agent can still
+ * explicitly drop any of these tags.
  */
-const RECLAIM_HINT_EXCLUDED_TOOLS = ["todowrite"] as const;
+const RECLAIM_HINT_EXCLUDED_TOOLS = new Set([
+    "ask",
+    "bash_kill",
+    "bash_status",
+    "board",
+    "task",
+    "todoread",
+    "todowrite",
+    "work",
+]);
 
 /**
  * A reclaim hint should point at MEANINGFULLY reclaimable output, not a
- * 30-token status line or a tiny control-plane call (ctx_reduce, bash_status,
- * check_comments…). Tags whose cached token total is known AND below this are
- * skipped. A tag with NO cached token count is NOT excluded by the floor (we
- * cannot size it, so we never hide a potentially-large output).
+ * 30-token status line or a tiny control-plane call. Tags whose cached token
+ * total is known AND below this are skipped. A tag with NO cached token count
+ * is NOT excluded by the floor (we cannot size it, so we never hide a
+ * potentially-large output).
  */
 export const AGE_RECLAIM_MIN_TOKENS = 250;
 
-// Constant-folded literal list (the names are compile-time constants, never
-// user input), so the prepared SQL text stays static across calls.
-const RECLAIM_HINT_EXCLUDED_LIST = RECLAIM_HINT_EXCLUDED_TOOLS.map(
-    (name) => `'${name.replace(/'/g, "''")}'`,
-).join(", ");
+function isReclaimHintExcludedTool(toolName: string | null): boolean {
+    if (!toolName) return false;
+    const normalized = toolName.toLowerCase().replace(/^mcp_/, "");
+    return normalized.startsWith("ctx_") || RECLAIM_HINT_EXCLUDED_TOOLS.has(normalized);
+}
 
 export function getOldestActiveUnprotectedToolTags(
     db: Database,
@@ -248,45 +256,50 @@ export function getOldestActiveUnprotectedToolTags(
                     ORDER BY tag_number DESC LIMIT 1 OFFSET ?
                 )`
             : "";
-    // Drop task/plan-state tools (todowrite) and trivially-small outputs (below
-    // the token floor) from the hint, since they are not worth a drop suggestion.
     // Unsized tags (both token columns NULL) pass the floor clause so a
-    // not-yet-backfilled large output is never wrongly hidden.
-    const excludeStateTools = RECLAIM_HINT_EXCLUDED_LIST
-        ? `AND (tool_name IS NULL OR tool_name NOT IN (${RECLAIM_HINT_EXCLUDED_LIST}))`
-        : "";
+    // not-yet-backfilled large output is never wrongly hidden. Tier selection
+    // is applied after the SQL query so it reuses the emergency-drop classifier.
     const valueFloor = `AND (
             (token_count IS NULL AND input_token_count IS NULL)
             OR (COALESCE(token_count, 0) + COALESCE(input_token_count, 0)) >= ?
         )`;
     const params =
         protectedTags > 0
-            ? [sessionId, AGE_RECLAIM_MIN_TOKENS, sessionId, protectedTags - 1, boundedLimit]
-            : [sessionId, AGE_RECLAIM_MIN_TOKENS, boundedLimit];
+            ? [sessionId, AGE_RECLAIM_MIN_TOKENS, sessionId, protectedTags - 1]
+            : [sessionId, AGE_RECLAIM_MIN_TOKENS];
     const rows = db
         .prepare(
             `SELECT tag_number, tool_name
              FROM tags
              WHERE session_id = ? AND status = 'active' AND type = 'tool'
-             ${excludeStateTools}
              ${valueFloor}
              ${whereProtected}
-             ORDER BY tag_number ASC, id ASC
-             LIMIT ?`,
+             ORDER BY tag_number ASC, id ASC`,
         )
         .all(...params) as Array<{ tag_number?: unknown; tool_name?: unknown }>;
     return rows
-        .filter((row) => typeof row.tag_number === "number")
+        .filter(
+            (row): row is { tag_number: number; tool_name?: unknown } =>
+                typeof row.tag_number === "number",
+        )
         .map((row) => ({
-            tagNumber: row.tag_number as number,
+            tagNumber: row.tag_number,
             toolName: typeof row.tool_name === "string" ? row.tool_name : null,
-        }));
+        }))
+        .filter((tag) => !isReclaimHintExcludedTool(tag.toolName))
+        .sort(
+            (left, right) =>
+                resolveToolTier(right.toolName) - resolveToolTier(left.toolName) ||
+                left.tagNumber - right.tagNumber,
+        )
+        .slice(0, boundedLimit);
 }
 
 const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedStatement>();
 
 /**
- * Return active tool tags with the same persisted token estimate used by reclaim hints.
+ * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
+ * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -309,7 +322,7 @@ export function getActiveToolTagsForAgeReclaim(
         token_count?: unknown;
         input_token_count?: unknown;
     }>;
-    return rows
+    const tags = rows
         .filter((row) => typeof row.tag_number === "number")
         .map((row) => {
             const outputTokens = typeof row.token_count === "number" ? row.token_count : null;
@@ -324,6 +337,8 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
+    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
+    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
 }
 
 /**
@@ -1607,6 +1622,7 @@ export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
 // apply-operations, heuristic-cleanup, nudger) should switch to these.
 
 const getActiveTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
+const getNullOwnerToolTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getDroppedTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxDroppedTagNumberStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -1659,6 +1675,32 @@ function getMaxDroppedTagNumberStatement(db: Database): PreparedStatement {
 export function getActiveTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = getActiveTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
     return rows.map(toTagEntry);
+}
+
+/**
+ * Attribution rows for final rendered-tail accounting. Active, non-protected
+ * rows identify reclaimable token mass (U). Legacy tool rows with no owner are
+ * included regardless of status so duplicate call IDs remain visible and the
+ * orphan resolver can reject ambiguous matches.
+ */
+export function getTailHygieneTags(db: Database, sessionId: string): TagEntry[] {
+    const active = getActiveTagsBySession(db, sessionId);
+    let orphanStatement = getNullOwnerToolTagsBySessionStatements.get(db);
+    if (!orphanStatement) {
+        orphanStatement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags
+             WHERE session_id = ? AND type = 'tool' AND tool_owner_message_id IS NULL
+             ORDER BY tag_number ASC, id ASC`,
+        );
+        getNullOwnerToolTagsBySessionStatements.set(db, orphanStatement);
+    }
+    const seen = new Set(active.map((tag) => `${tag.tagNumber}\0${tag.messageId}\0${tag.type}`));
+    for (const row of orphanStatement.all(sessionId).filter(isTagRow)) {
+        const orphan = toTagEntry(row);
+        const key = `${orphan.tagNumber}\0${orphan.messageId}\0${orphan.type}`;
+        if (!seen.has(key)) active.push(orphan);
+    }
+    return active;
 }
 
 /**

@@ -407,6 +407,19 @@ const MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES: usize = 512 * 1024;
 const CHUNK_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[truncated: transcript exceeded the inflated-byte limit]";
 const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
+const PASS_SCHEDULER_HISTORY_CAP: usize = 256;
+const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
+const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
+/// The recency entry is at most 99 bytes. An interesting entry is at most 1,906 bytes with
+/// sender identity and arc counters; JSON's worst case expands fingerprint bytes to `\u00xx`.
+const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
+const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_906;
+/// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
+pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
+    + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
+    + 1
+    + PASS_SCHEDULER_INTERESTING_HISTORY_CAP
+        * (MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1);
 
 fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
@@ -2355,6 +2368,39 @@ const MIGRATIONS: &[Migration] = &[
             ADD COLUMN scheduler_history TEXT NOT NULL DEFAULT '[]';
         ",
     },
+    Migration {
+        version: 48,
+        // Ordinary Defer traffic must not displace rare scheduler evidence. Keep a second bounded
+        // oldest-to-newest ring on the same row; the existing per-pass UPSERT appends to it only
+        // for reductions, output divergence, or non-Defer arms and evicts its oldest entry at cap.
+        statements: "
+        ALTER TABLE mc_pass_trace
+            ADD COLUMN scheduler_interesting_history TEXT NOT NULL DEFAULT '[]';
+        ",
+    },
+    Migration {
+        version: 49,
+        // The host renders murals, while every consumer profile composes the frozen m0 prefix.
+        // Keep the rendered bytes under the resolved project identity rather than a session key
+        // so a Claude Code route can inherit the last OpenCode-host-supplied artifact.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_project_mural_artifacts (
+            project_path TEXT PRIMARY KEY NOT NULL,
+            data_url BLOB NOT NULL,
+            content_hash TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        ",
+    },
+    Migration {
+        version: 50,
+        // Historian transcripts are the durable recovery source once an in-process transform
+        // snapshot is gone. Keep the original CK message array beside its condensed transcript
+        // so full-message and verbose ctx_expand views do not degrade to summarized text.
+        statements: "
+        ALTER TABLE mc_chunk_transcripts ADD COLUMN raw_messages_deflate BLOB NULL;
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -2672,6 +2718,104 @@ pub struct PassSchedulerObservation {
     pub drain_latch_active: bool,
 }
 
+/// Incident-worthy scheduler evidence retained independently of the recency ring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterestingPassSchedulerObservation {
+    pub timestamp_ms: i64,
+    pub scheduler_decision: String,
+    pub drain_latch_active: bool,
+    /// Sender-stamped request instant. Missing remains missing; it is never backfilled from the
+    /// module clock because the two clocks are not interchangeable correlation keys.
+    pub request_observed_at_ms: Option<u64>,
+    /// Caller-owned full-array fingerprint echoed by the transform response. This is omitted
+    /// only when the caller supplied no identity or exceeded the diagnostic byte bound.
+    pub full_array_fingerprint: Option<String>,
+    /// Live superseded tool arcs observed when the ride gate opened, before downstream filters.
+    /// Missing means the gate stayed shut and selection did not run; zero is an observed empty set.
+    #[serde(default)]
+    pub eligible_supersession_count: Option<u64>,
+    /// Eligible supersession arcs whose final decisions were entirely removed by the newest-tag
+    /// block window. Unit: tool arcs.
+    #[serde(default)]
+    pub withheld_by_tag_window: Option<u64>,
+    /// Eligible supersession arcs whose final decisions were entirely removed by mutation-exempt
+    /// or lineage-anchor messages. Unit: tool arcs.
+    #[serde(default)]
+    pub withheld_by_exempt_message: Option<u64>,
+    /// Eligible supersession tool arcs represented in the final reduction decision list.
+    #[serde(default)]
+    pub applied_supersession_count: Option<u64>,
+}
+
+impl InterestingPassSchedulerObservation {
+    fn from_observation(
+        observation: &PassSchedulerObservation,
+        request_observed_at_ms: Option<u64>,
+        full_array_fingerprint: Option<&str>,
+        eligible_supersession_count: Option<u64>,
+        withheld_by_tag_window: Option<u64>,
+        withheld_by_exempt_message: Option<u64>,
+        applied_supersession_count: Option<u64>,
+    ) -> Self {
+        Self {
+            timestamp_ms: observation.timestamp_ms,
+            scheduler_decision: observation.scheduler_decision.clone(),
+            drain_latch_active: observation.drain_latch_active,
+            request_observed_at_ms,
+            full_array_fingerprint: full_array_fingerprint
+                .filter(|fingerprint| fingerprint.len() <= MAX_FULL_ARRAY_FINGERPRINT_BYTES)
+                .map(str::to_string),
+            eligible_supersession_count,
+            withheld_by_tag_window,
+            withheld_by_exempt_message,
+            applied_supersession_count,
+        }
+    }
+}
+
+fn serialize_scheduler_observation(
+    observation: &PassSchedulerObservation,
+) -> Result<String, McStoreError> {
+    if !matches!(
+        observation.scheduler_decision.as_str(),
+        "Defer" | "Execute" | "Force85" | "Emergency95"
+    ) {
+        return Err(McStoreError::Serde(format!(
+            "unknown scheduler decision {:?}",
+            observation.scheduler_decision
+        )));
+    }
+    serde_json::to_string(observation).map_err(|error| McStoreError::Serde(error.to_string()))
+}
+
+fn scheduler_pass_is_interesting(
+    applied_reduction: bool,
+    produced_output_divergence: bool,
+) -> bool {
+    applied_reduction || produced_output_divergence
+}
+
+fn serialize_interesting_scheduler_observation(
+    observation: &PassSchedulerObservation,
+    request_observed_at_ms: Option<u64>,
+    full_array_fingerprint: Option<&str>,
+    eligible_supersession_count: Option<u64>,
+    withheld_by_tag_window: Option<u64>,
+    withheld_by_exempt_message: Option<u64>,
+    applied_supersession_count: Option<u64>,
+) -> Result<String, McStoreError> {
+    serde_json::to_string(&InterestingPassSchedulerObservation::from_observation(
+        observation,
+        request_observed_at_ms,
+        full_array_fingerprint,
+        eligible_supersession_count,
+        withheld_by_tag_window,
+        withheld_by_exempt_message,
+        applied_supersession_count,
+    ))
+    .map_err(|error| McStoreError::Serde(error.to_string()))
+}
+
 /// Durable receive/complete/reject breadcrumbs for one session's transform passes.
 /// Stored separately from `mc_cache_state` so a rejected pass can still leave a readable
 /// trail without advancing the cache row_version.
@@ -2822,6 +2966,9 @@ pub struct HistorianPublishRequest<'a> {
     pub user_memory_candidates: &'a [HistorianUserMemoryCandidate],
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: Option<&'a str>,
+    /// JSON-encoded original CK messages for the compacted range. Unlike the condensed
+    /// transcript, this preserves full tool output for durable ctx_expand recovery.
+    pub raw_chunk_messages: Option<&'a str>,
 }
 
 /// Typed publish failures. CAS and state mismatches are deliberately separate so a
@@ -3214,6 +3361,58 @@ fn u8_is_zero(value: &u8) -> bool {
     *value == 0
 }
 
+/// A response-side Channel-2 directive awaiting a gateway delivery acknowledgement.
+/// The text is stored verbatim because Claude Code does not retain the injected prompt block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChannel2Directive {
+    pub text: String,
+    pub directive_id: String,
+    pub armed_at_ms: i64,
+    pub arming_watermark: u64,
+}
+
+/// Content class recorded by the rendered-tail hygiene walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TailHygienePartKind {
+    Text,
+    ToolInput,
+    ToolOutput,
+    File,
+    Excluded,
+}
+
+/// One typed part from the rendered-tail hygiene walk. Persisting its measurements lets later
+/// passes record newly appended content and update which content is considered recent without
+/// tokenizing the historical prefix again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailHygienePartMeasurement {
+    pub key: String,
+    pub content_hash: String,
+    pub kind: TailHygienePartKind,
+    pub tokens: i64,
+    pub u_tokens: i64,
+    pub tag_number: Option<i64>,
+    pub tag_status: Option<String>,
+    pub protected: bool,
+}
+
+/// Durable hygiene metrics used by both reminder channels, measured relative to the currently
+/// live tail rather than the full history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailHygieneBaseline {
+    pub baseline_u: i64,
+    pub baseline_t: i64,
+    pub turn_delta_u: i64,
+    pub turn_delta_t: i64,
+    pub baseline_generation: u64,
+    pub computed_at_ms: i64,
+    pub evaluable: bool,
+    pub generation_invalidated: bool,
+    pub baseline_parts: Vec<TailHygienePartMeasurement>,
+    pub content_signature: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -3447,6 +3646,14 @@ pub struct ModuleMeta {
     /// Last Channel-1 severity band that appended a reminder. Empty means no active band.
     #[serde(default)]
     pub channel1_last_nudge_level: String,
+    /// Baseline calculated by one shared tail walk so both nudge channels use the same measurements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_hygiene_baseline: Option<TailHygieneBaseline>,
+    /// Auto-search decisions targeting a previously served block remain hidden until an
+    /// independent cache-busting pass. A genuinely new physical tail renders immediately and
+    /// never enters this set.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pending_user_hint_block_ids: BTreeSet<String>,
     /// Set by ctx_reduce after the agent has acted on a reminder. The next transform
     /// suppresses new Channel-1 appends while still replaying every stored append row.
     #[serde(default)]
@@ -3505,6 +3712,15 @@ pub struct ModuleMeta {
     /// Channel-2 host lease state copied from the TypeScript session metadata.
     #[serde(default)]
     pub channel2_nudge_state: String,
+    /// Claude Code directive bytes awaiting an idempotent delivery echo from the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_channel2_directive: Option<PendingChannel2Directive>,
+    /// True from a pressure crossing until a later below-threshold observation rearms the cycle.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub channel2_pressure_latched: bool,
+    /// Monotonic cycle identity used to make directive IDs deterministic across retries.
+    #[serde(default)]
+    pub channel2_arming_watermark: u64,
     /// Emergency drain latch active bit.
     #[serde(default)]
     pub emergency_drain_active: bool,
@@ -3671,6 +3887,17 @@ pub struct TransformCommit<'a> {
     /// Scheduler arm and updated drain-latch state for a real accepted transform pass.
     /// Maintenance callers that reuse this transaction leave it absent.
     pub scheduler_observation: Option<&'a PassSchedulerObservation>,
+    /// Sender clock and exact full-array identity already carried on the transform request.
+    pub scheduler_request_observed_at_ms: Option<u64>,
+    pub scheduler_full_array_fingerprint: Option<&'a str>,
+    /// Eligible supersession tool arcs counted when an open ride gate runs selection. Missing
+    /// means selection did not run; zero means it ran and found none.
+    pub scheduler_eligible_supersession_count: Option<u64>,
+    pub scheduler_withheld_by_tag_window: Option<u64>,
+    pub scheduler_withheld_by_exempt_message: Option<u64>,
+    pub scheduler_applied_supersession_count: Option<u64>,
+    /// Whether this pass added a previously-unfrozen reduction to the served output.
+    pub scheduler_applied_reductions: bool,
     pub overlays: TransformOverlayBatch<'a>,
 }
 
@@ -3751,6 +3978,15 @@ pub struct MemoryRevision {
 pub struct MemoryRenderSnapshot {
     pub memories: Vec<StoredMemory>,
     pub revision: MemoryRevision,
+}
+
+/// A rendered mural artifact shared by every session under one project identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMuralArtifact {
+    pub project_path: String,
+    pub data_url: Vec<u8>,
+    pub content_hash: String,
+    pub updated_at: i64,
 }
 
 /// The read-consistent inputs used by the module's per-pass m1 revision signal.
@@ -3909,6 +4145,9 @@ pub struct StoredChunkTranscript {
     pub start_ordinal: i64,
     pub end_ordinal: i64,
     pub transcript: Option<String>,
+    /// JSON-encoded original CK messages for this compacted range. Old transcript rows do not
+    /// have this migration-era payload, so callers retain the condensed transcript fallback.
+    pub raw_messages_json: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -6528,6 +6767,61 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Return the last OC-host-rendered mural for a resolved project identity.
+    pub fn load_project_mural_artifact(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<ProjectMuralArtifact>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_path, data_url, content_hash, updated_at
+                       FROM mc_project_mural_artifacts
+                      WHERE project_path = ?1",
+                    params![project_path],
+                    |row| {
+                        Ok(ProjectMuralArtifact {
+                            project_path: row.get(0)?,
+                            data_url: row.get(1)?,
+                            content_hash: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Store a host-rendered mural only when its content identity changes.
+    ///
+    /// A transform can carry the same host artifact on every pass. Updating `updated_at` in that
+    /// case would turn ordinary defer traffic into a write stream, so the hash is the sole gate.
+    pub fn upsert_project_mural_artifact(
+        &self,
+        project_path: &str,
+        data_url: &[u8],
+        content_hash: &str,
+        updated_at: i64,
+    ) -> Result<bool, McStoreError> {
+        self.inner
+            .with_conn_fenced(|tx| {
+                let changed = tx.execute(
+                    "INSERT INTO mc_project_mural_artifacts(
+                         project_path, data_url, content_hash, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(project_path) DO UPDATE SET
+                         data_url = excluded.data_url,
+                         content_hash = excluded.content_hash,
+                         updated_at = excluded.updated_at
+                     WHERE mc_project_mural_artifacts.content_hash <> excluded.content_hash",
+                    params![project_path, data_url, content_hash, updated_at],
+                )?;
+                Ok(changed != 0)
+            })
+            .map_err(Into::into)
+    }
+
     /// Delete every row whose ownership is expressed by an exact `session_id` column.
     /// Project memories and smart notes survive because their ownership is project-scoped;
     /// session notes and every cache/overlay/producer ledger row are removed atomically.
@@ -6913,9 +7207,11 @@ impl McStore {
         &self,
         session_id: &str,
         observation: &PassSchedulerObservation,
+        _request_observed_at_ms: Option<u64>,
+        _full_array_fingerprint: Option<&str>,
     ) -> Result<(), McStoreError> {
-        let observation_json = serde_json::to_string(observation)
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+        let observation_json = serialize_scheduler_observation(observation)?;
+        let interesting_json: Option<String> = None;
         self.inner.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO mc_pass_trace (
@@ -6927,8 +7223,12 @@ impl McStore {
                      reject_count,
                      receive_count,
                      first_divergence,
-                     scheduler_history
-                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0, NULL, json_array(json(?3)))
+                     scheduler_history,
+                     scheduler_interesting_history
+                 ) VALUES (
+                     ?1, 0, ?2, NULL, NULL, 0, 0, NULL, json_array(json(?3)),
+                     CASE WHEN ?4 IS NOT NULL THEN json_array(json(?4)) ELSE '[]' END
+                 )
                  ON CONFLICT(session_id) DO UPDATE SET
                      first_divergence = NULL,
                      last_completed_at_ms = excluded.last_completed_at_ms,
@@ -6942,8 +7242,30 @@ impl McStore {
                                    WHERE key >= json_array_length(mc_pass_trace.scheduler_history) - 255),
                                  '$[#]', json(?3)
                              )
+                     END,
+                     scheduler_interesting_history = CASE
+                         WHEN ?4 IS NULL THEN mc_pass_trace.scheduler_interesting_history
+                         WHEN json_array_length(mc_pass_trace.scheduler_interesting_history) < 256 THEN
+                             json_insert(
+                                 mc_pass_trace.scheduler_interesting_history,
+                                 '$[#]', json(?4)
+                             )
+                         ELSE
+                             json_insert(
+                                 (SELECT json_group_array(json(value))
+                                    FROM json_each(mc_pass_trace.scheduler_interesting_history)
+                                   WHERE key >= json_array_length(
+                                       mc_pass_trace.scheduler_interesting_history
+                                   ) - 255),
+                                 '$[#]', json(?4)
+                             )
                      END",
-                params![session_id, observation.timestamp_ms, observation_json],
+                params![
+                    session_id,
+                    observation.timestamp_ms,
+                    observation_json,
+                    interesting_json
+                ],
             )?;
             Ok(())
         })?;
@@ -7076,6 +7398,109 @@ impl McStore {
             )?;
             let rows = statement
                 .query_map(params![session_id, start_ms, end_ms], |row| {
+                    let raw = row.get::<_, String>(0)?;
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?)
+    }
+
+    /// Load incident-worthy scheduler observations from the independently bounded retention set.
+    /// The inclusive module-clock range narrows candidates; sender time and fingerprint remain
+    /// available on each result for exact cross-system correlation.
+    pub fn load_interesting_pass_scheduler_history(
+        &self,
+        session_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
+        if start_ms > end_ms {
+            return Ok(Vec::new());
+        }
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT history.value
+                   FROM mc_pass_trace AS trace,
+                        json_each(trace.scheduler_interesting_history) AS history
+                  WHERE trace.session_id = ?1
+                    AND CAST(json_extract(history.value, '$.timestamp_ms') AS INTEGER)
+                        BETWEEN ?2 AND ?3
+                  ORDER BY CAST(history.key AS INTEGER)",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, start_ms, end_ms], |row| {
+                    let raw = row.get::<_, String>(0)?;
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?)
+    }
+
+    /// Find retained passes by the sender-stamped instant shared by both sides of an exchange.
+    pub fn load_interesting_pass_scheduler_history_by_request_time(
+        &self,
+        session_id: &str,
+        request_observed_at_ms: u64,
+    ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
+        let request_observed_at_ms = request_observed_at_ms.to_string();
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT history.value
+                   FROM mc_pass_trace AS trace,
+                        json_each(trace.scheduler_interesting_history) AS history
+                  WHERE trace.session_id = ?1
+                    AND CAST(json_extract(
+                        history.value, '$.request_observed_at_ms'
+                    ) AS TEXT) = ?2
+                  ORDER BY CAST(history.key AS INTEGER)",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, request_observed_at_ms], |row| {
+                    let raw = row.get::<_, String>(0)?;
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?)
+    }
+
+    /// Find retained passes by the caller-owned full-array fingerprint.
+    pub fn load_interesting_pass_scheduler_history_by_fingerprint(
+        &self,
+        session_id: &str,
+        full_array_fingerprint: &str,
+    ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT history.value
+                   FROM mc_pass_trace AS trace,
+                        json_each(trace.scheduler_interesting_history) AS history
+                  WHERE trace.session_id = ?1
+                    AND json_extract(history.value, '$.full_array_fingerprint') = ?2
+                  ORDER BY CAST(history.key AS INTEGER)",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, full_array_fingerprint], |row| {
                     let raw = row.get::<_, String>(0)?;
                     serde_json::from_str(&raw).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -8472,6 +8897,13 @@ impl McStore {
                 project_root: None,
                 first_divergence: None,
                 scheduler_observation: None,
+                scheduler_request_observed_at_ms: None,
+                scheduler_full_array_fingerprint: None,
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
+                scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
         )
@@ -8494,6 +8926,13 @@ impl McStore {
             project_root,
             first_divergence,
             scheduler_observation,
+            scheduler_request_observed_at_ms,
+            scheduler_full_array_fingerprint,
+            scheduler_eligible_supersession_count,
+            scheduler_withheld_by_tag_window,
+            scheduler_withheld_by_exempt_message,
+            scheduler_applied_supersession_count,
+            scheduler_applied_reductions,
             overlays,
         } = request;
         let max_seen_ordinal = overlays
@@ -8528,10 +8967,28 @@ impl McStore {
         let meta_json =
             serde_json::to_string(meta).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let scheduler_observation_json = scheduler_observation
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+            .map(serialize_scheduler_observation)
+            .transpose()?;
         let next = expected.unwrap_or(0) + 1;
+        let scheduler_interesting_json = scheduler_observation
+            .filter(|_| {
+                scheduler_pass_is_interesting(
+                    scheduler_applied_reductions,
+                    first_divergence.is_some(),
+                )
+            })
+            .map(|observation| {
+                serialize_interesting_scheduler_observation(
+                    observation,
+                    scheduler_request_observed_at_ms,
+                    scheduler_full_array_fingerprint,
+                    scheduler_eligible_supersession_count,
+                    scheduler_withheld_by_tag_window,
+                    scheduler_withheld_by_exempt_message,
+                    scheduler_applied_supersession_count,
+                )
+            })
+            .transpose()?;
         let canonical_project_root = project_root
             .filter(|root| !root.is_empty())
             .map(|root| canonical_root(root).to_string_lossy().into_owned());
@@ -8639,13 +9096,15 @@ impl McStore {
                      receive_count,
                      first_divergence,
                      last_divergence,
-                     scheduler_history
+                     scheduler_history,
+                     scheduler_interesting_history
                  ) VALUES (
                      ?1, 0, 0, NULL, NULL, 0, 0, ?2,
                      CASE WHEN ?2 IS NOT NULL THEN
                          json_object('pass_id', ?3, 'timestamp_ms', ?4, 'divergence', json(?2))
                      ELSE NULL END,
-                     CASE WHEN ?5 IS NOT NULL THEN json_array(json(?5)) ELSE '[]' END
+                     CASE WHEN ?5 IS NOT NULL THEN json_array(json(?5)) ELSE '[]' END,
+                     CASE WHEN ?6 IS NOT NULL THEN json_array(json(?6)) ELSE '[]' END
                  )
                  ON CONFLICT(session_id) DO UPDATE SET
                      first_divergence = excluded.first_divergence,
@@ -8666,15 +9125,33 @@ impl McStore {
                                     FROM json_each(mc_pass_trace.scheduler_history)
                                    WHERE key >= json_array_length(mc_pass_trace.scheduler_history) - 255),
                                  '$[#]', json(?5)
-                             )
-                     END",
-                params![
-                    session_id,
-                    first_divergence,
-                    divergence_pass_id,
-                    divergence_at_ms,
-                    scheduler_observation_json
-                ],
+                              )
+                      END,
+                      scheduler_interesting_history = CASE
+                          WHEN ?6 IS NULL THEN mc_pass_trace.scheduler_interesting_history
+                          WHEN json_array_length(mc_pass_trace.scheduler_interesting_history) < 256 THEN
+                              json_insert(
+                                  mc_pass_trace.scheduler_interesting_history,
+                                  '$[#]', json(?6)
+                              )
+                          ELSE
+                              json_insert(
+                                  (SELECT json_group_array(json(value))
+                                     FROM json_each(mc_pass_trace.scheduler_interesting_history)
+                                    WHERE key >= json_array_length(
+                                        mc_pass_trace.scheduler_interesting_history
+                                    ) - 255),
+                                  '$[#]', json(?6)
+                              )
+                      END",
+                 params![
+                     session_id,
+                     first_divergence,
+                     divergence_pass_id,
+                     divergence_at_ms,
+                     scheduler_observation_json,
+                     scheduler_interesting_json
+                 ],
             )?;
             if let Some(project_root) = canonical_project_root.as_deref() {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
@@ -9385,6 +9862,7 @@ impl McStore {
         &self,
         request: LineageDescentRequest<'_>,
     ) -> Result<LineageDescentOutcome, McStoreError> {
+        let note_caller_project = Arc::clone(&self.note_caller_project);
         let outcome = self.inner.with_conn_fenced(|tx| {
             let current_target = tx
                 .query_row(
@@ -9859,6 +10337,52 @@ impl McStore {
                     params![request.target_key],
                 )?;
             }
+            // Session notes follow the descended conversation key. Do not copy smart notes:
+            // their project-wide visibility is independent of one lineage's retained history.
+            let note_projects = {
+                let mut statement = tx.prepare(
+                    "SELECT DISTINCT project_path FROM mc_notes
+                      WHERE session_id = ?1 AND type = 'session'",
+                )?;
+                let projects = statement
+                    .query_map(params![source_key], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                projects
+            };
+            for note_project in note_projects {
+                let previous_project = note_caller_project
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(note_project.clone());
+                let copy_result = (|| -> rusqlite::Result<()> {
+                    tx.execute(
+                        "DELETE FROM mc_notes
+                          WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
+                        params![request.target_key, note_project],
+                    )?;
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
+                             SELECT type, project_path, ?1, content, status, surface_condition,
+                                    ready_at, ready_reason, manifest_json, compiled_check, check_hash,
+                                    check_cron, check_failure_count, check_network_failure_count,
+                                    check_quarantined_until, check_next_due_at, check_compiled_at,
+                                    check_false_since_at, check_last_liveness_at, last_checked_at,
+                                    check_status, check_version, policy_version, harness,
+                                    anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution,
+                                    status_version, created_at_ms, updated_at_ms, NULL, NULL
+                               FROM mc_notes
+                              WHERE session_id = ?2 AND project_path = ?3 AND type = 'session'"
+                        ),
+                        params![request.target_key, source_key, note_project],
+                    )?;
+                    Ok(())
+                })();
+                *note_caller_project
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous_project;
+                copy_result?;
+            }
             tx.execute(
                 "INSERT INTO mc_compartments (
                      session_id, sequence, start_message, end_message, start_message_id,
@@ -9874,10 +10398,10 @@ impl McStore {
             tx.execute(
                 "INSERT INTO mc_chunk_transcripts (
                      session_id, compartment_seq, start_ordinal, end_ordinal,
-                     transcript_deflate, created_at_ms
+                     transcript_deflate, raw_messages_deflate, created_at_ms
                  )
                  SELECT ?1, compartment_seq, start_ordinal, end_ordinal,
-                        transcript_deflate, created_at_ms
+                        transcript_deflate, raw_messages_deflate, created_at_ms
                    FROM mc_chunk_transcripts WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -11138,13 +11662,14 @@ impl McStore {
                     });
                 }
             }
-            if let Some(transcript) = request.chunk_transcript {
+            if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
                 insert_chunk_transcripts_tx(
                     tx,
                     session_id,
                     first_appended_sequence,
                     request.compartments,
-                    transcript,
+                    request.chunk_transcript,
+                    request.raw_chunk_messages,
                 )?;
             }
             let promoted_refs = if request.promote_facts {
@@ -12130,23 +12655,28 @@ impl McStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT compartment_seq, start_ordinal, end_ordinal, transcript_deflate, created_at_ms
+                "SELECT compartment_seq, start_ordinal, end_ordinal, transcript_deflate,
+                        raw_messages_deflate, created_at_ms
                    FROM mc_chunk_transcripts
-                  WHERE session_id = ?1
-                    AND end_ordinal >= ?2
-                    AND start_ordinal <= ?3
-                  ORDER BY compartment_seq ASC
-                  LIMIT ?4",
+                   WHERE session_id = ?1
+                     AND end_ordinal >= ?2
+                     AND start_ordinal <= ?3
+                   ORDER BY compartment_seq ASC
+                   LIMIT ?4",
             )?;
             let mapped = stmt
                 .query_map(params![session_id, start, end, limit], |r| {
-                    let blob: Vec<u8> = r.get(3)?;
+                    let transcript_blob: Vec<u8> = r.get(3)?;
+                    let raw_messages_blob: Option<Vec<u8>> = r.get(4)?;
                     Ok(StoredChunkTranscript {
                         compartment_seq: r.get(0)?,
                         start_ordinal: r.get(1)?,
                         end_ordinal: r.get(2)?,
-                        transcript: decompress_transcript(&blob).ok(),
-                        created_at_ms: r.get(4)?,
+                        transcript: decompress_transcript(&transcript_blob).ok(),
+                        raw_messages_json: raw_messages_blob
+                            .as_deref()
+                            .and_then(|blob| decompress_raw_messages(blob).ok()),
+                        created_at_ms: r.get(5)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -15371,26 +15901,41 @@ fn insert_chunk_transcripts_tx(
     session_id: &str,
     first_sequence: i64,
     compartments: &[StoredCompartment],
-    transcript: &str,
+    transcript: Option<&str>,
+    raw_messages: Option<&str>,
 ) -> rusqlite::Result<()> {
     if compartments.is_empty() {
         return Ok(());
     }
-    let compressed = match compress_transcript(transcript) {
-        Ok(compressed) if compressed.len() <= MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES => compressed,
-        _ => return Ok(()),
-    };
+    let compressed = transcript.and_then(|transcript| {
+        compress_transcript(transcript)
+            .ok()
+            .filter(|compressed| compressed.len() <= MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES)
+    });
+    let raw_messages_compressed = raw_messages
+        .map(compress_raw_messages)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    if compressed.is_none() && raw_messages_compressed.is_none() {
+        return Ok(());
+    }
+    // The original schema keeps transcript_deflate NOT NULL. A raw-only row still needs a
+    // harmless condensed payload so durable raw recovery is not discarded with an oversized
+    // historian transcript.
+    let compressed = compressed.unwrap_or_else(|| compress_transcript("").unwrap_or_default());
     for (idx, compartment) in compartments.iter().enumerate() {
         tx.execute(
             "INSERT OR REPLACE INTO mc_chunk_transcripts
-               (session_id, compartment_seq, start_ordinal, end_ordinal, transcript_deflate, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+               (session_id, compartment_seq, start_ordinal, end_ordinal,
+                transcript_deflate, raw_messages_deflate, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id,
                 first_sequence + idx as i64,
                 compartment.start_message,
                 compartment.end_message,
                 &compressed,
+                raw_messages_compressed.as_deref(),
                 compartment.created_at,
             ],
         )?;
@@ -15402,6 +15947,7 @@ fn evict_chunk_transcripts_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
 ) -> rusqlite::Result<()> {
+    let empty_transcript = compress_transcript("").unwrap_or_default();
     loop {
         let total: i64 = tx.query_row(
             "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
@@ -15412,24 +15958,36 @@ fn evict_chunk_transcripts_tx(
         if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
             return Ok(());
         }
-        let victim: Option<i64> = tx
+        let victim: Option<(i64, bool)> = tx
             .query_row(
-                "SELECT compartment_seq
+                "SELECT compartment_seq, raw_messages_deflate IS NOT NULL
                    FROM mc_chunk_transcripts
                   WHERE session_id = ?1
+                    AND (raw_messages_deflate IS NULL OR transcript_deflate <> ?2)
                   ORDER BY created_at_ms ASC, compartment_seq ASC
                   LIMIT 1",
-                params![session_id],
-                |r| r.get(0),
+                params![session_id, &empty_transcript],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(victim) = victim else {
+        let Some((victim, retains_raw_messages)) = victim else {
             return Ok(());
         };
-        tx.execute(
-            "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
-            params![session_id, victim],
-        )?;
+        if retains_raw_messages {
+            // Full message recovery is durable by contract. Retain its raw payload and reclaim
+            // only the optional condensed transcript when the legacy transcript budget fills.
+            tx.execute(
+                "UPDATE mc_chunk_transcripts
+                    SET transcript_deflate = ?3
+                  WHERE session_id = ?1 AND compartment_seq = ?2",
+                params![session_id, victim, &empty_transcript],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
+                params![session_id, victim],
+            )?;
+        }
     }
 }
 
@@ -15437,6 +15995,19 @@ fn compress_transcript(transcript: &str) -> std::io::Result<Vec<u8>> {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(transcript.as_bytes())?;
     encoder.finish()
+}
+
+fn compress_raw_messages(raw_messages: &str) -> std::io::Result<Vec<u8>> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(raw_messages.as_bytes())?;
+    encoder.finish()
+}
+
+fn decompress_raw_messages(blob: &[u8]) -> std::io::Result<String> {
+    let mut decoder = DeflateDecoder::new(blob);
+    let mut raw_messages = String::new();
+    decoder.read_to_string(&mut raw_messages)?;
+    Ok(raw_messages)
 }
 
 fn decompress_transcript(blob: &[u8]) -> std::io::Result<String> {
@@ -16466,6 +17037,59 @@ mod tests {
         }
     }
 
+    fn commit_scheduler_observation(
+        store: &McStore,
+        session_id: &str,
+        expected: Option<u64>,
+        observation: &PassSchedulerObservation,
+        interest: (
+            bool,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            u64,
+        ),
+        request_observed_at_ms: Option<u64>,
+        full_array_fingerprint: Option<&str>,
+    ) -> u64 {
+        let (
+            produced_output_divergence,
+            eligible_supersession_count,
+            withheld_by_tag_window_count,
+            withheld_by_exempt_message_count,
+            applied_supersession_count,
+            applied_reduction_count,
+        ) = interest;
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        store
+            .commit_transform(
+                session_id,
+                TransformCommit {
+                    expected,
+                    core: &core,
+                    meta: &meta,
+                    consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
+                    memory_revision: None,
+                    compartment_max_seq: None,
+                    project_root: None,
+                    first_divergence: produced_output_divergence.then_some("{}"),
+                    scheduler_observation: Some(observation),
+                    scheduler_request_observed_at_ms: request_observed_at_ms,
+                    scheduler_full_array_fingerprint: full_array_fingerprint,
+                    scheduler_eligible_supersession_count: eligible_supersession_count,
+                    scheduler_withheld_by_tag_window: withheld_by_tag_window_count,
+                    scheduler_withheld_by_exempt_message: withheld_by_exempt_message_count,
+                    scheduler_applied_supersession_count: applied_supersession_count,
+                    scheduler_applied_reductions: applied_reduction_count > 0,
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap()
+    }
+
     fn command_ledger_ids(store: &McStore, session_id: &str) -> Vec<String> {
         command_ledger_rows(store, session_id)
             .into_iter()
@@ -16710,6 +17334,13 @@ mod tests {
                         project_root: Some("/root-a"),
                         first_divergence: None,
                         scheduler_observation: None,
+                        scheduler_request_observed_at_ms: None,
+                        scheduler_full_array_fingerprint: None,
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
+                        scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch {
                             created_at_ms: observed_at,
                             ..Default::default()
@@ -16782,6 +17413,13 @@ mod tests {
                     project_root: Some(link_text),
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -16851,6 +17489,13 @@ mod tests {
                     project_root: Some(missing_text),
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -16983,6 +17628,13 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tag_mints,
@@ -17062,6 +17714,13 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tags,
@@ -17213,6 +17872,13 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -17916,6 +18582,13 @@ mod tests {
                         project_root: None,
                         first_divergence: None,
                         scheduler_observation: None,
+                        scheduler_request_observed_at_ms: None,
+                        scheduler_full_array_fingerprint: None,
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
+                        scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
                             temporal_marks: &temporal_marks,
@@ -17974,6 +18647,13 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
                         temporal_marks: &late_mark,
@@ -18193,8 +18873,12 @@ mod tests {
             scheduler_decision: "Force85".to_string(),
             drain_latch_active: true,
         };
-        store.trace_pass_stable("scheduler-trace", &defer).unwrap();
-        store.trace_pass_stable("scheduler-trace", &force).unwrap();
+        store
+            .trace_pass_stable("scheduler-trace", &defer, None, None)
+            .unwrap();
+        store
+            .trace_pass_stable("scheduler-trace", &force, None, None)
+            .unwrap();
         let scheduler_trace = store.load_pass_trace("scheduler-trace").unwrap().unwrap();
         assert_eq!(
             scheduler_trace.scheduler_history,
@@ -18216,6 +18900,8 @@ mod tests {
                         scheduler_decision: "Execute".to_string(),
                         drain_latch_active: false,
                     },
+                    None,
+                    None,
                 )
                 .unwrap();
         }
@@ -18236,6 +18922,431 @@ mod tests {
             capped.last_reject_error.as_ref().unwrap().chars().count(),
             2_000
         );
+    }
+
+    #[test]
+    fn scheduler_interesting_pass_survives_latched_execute_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let interesting = PassSchedulerObservation {
+            timestamp_ms: 1,
+            scheduler_decision: "Force85".to_string(),
+            drain_latch_active: true,
+        };
+
+        commit_scheduler_observation(
+            &store,
+            "scheduler-flood",
+            None,
+            &interesting,
+            (false, Some(3), Some(0), Some(0), Some(3), 1),
+            Some(10_001),
+            Some("oldest-interest"),
+        );
+        for timestamp_ms in 2..=513 {
+            store
+                .trace_pass_stable(
+                    "scheduler-flood",
+                    &PassSchedulerObservation {
+                        timestamp_ms,
+                        scheduler_decision: "Execute".to_string(),
+                        drain_latch_active: true,
+                    },
+                    Some(10_000 + timestamp_ms as u64),
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .load_interesting_pass_scheduler_history("scheduler-flood", 1, 1)
+                .unwrap(),
+            vec![InterestingPassSchedulerObservation::from_observation(
+                &interesting,
+                Some(10_001),
+                Some("oldest-interest"),
+                Some(3),
+                Some(0),
+                Some(0),
+                Some(3),
+            )],
+            "the oldest reduction pass must survive a flood of latched Execute passes that applied nothing"
+        );
+        let recency = store.load_pass_trace("scheduler-flood").unwrap().unwrap();
+        assert_eq!(recency.scheduler_history.len(), PASS_SCHEDULER_HISTORY_CAP);
+        assert_eq!(recency.scheduler_history.first().unwrap().timestamp_ms, 258);
+    }
+
+    #[test]
+    fn scheduler_interesting_history_selects_only_reductions_and_divergence() {
+        const POPULATION_SIZE: usize = 402;
+        const LATCHED_PASSES: usize = 306;
+        const INTERESTING_PASSES: usize = 26;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let divergence_indices = [19, 79, 139, 219, 319, 401];
+        let mut expected = None;
+        let mut expected_timestamps = Vec::new();
+        let mut latched_count = 0;
+
+        for index in 0..POPULATION_SIZE {
+            let drain_latch_active = index < LATCHED_PASSES;
+            latched_count += usize::from(drain_latch_active);
+            let scheduler_decision = match index {
+                0..214 => "Execute",
+                214..306 => "Force85",
+                306..386 => "Execute",
+                386..400 => "Defer",
+                400 => "Force85",
+                _ => "Emergency95",
+            };
+            let applied_reduction = index < 400 && index % 20 == 0;
+            let produced_output_divergence = divergence_indices.contains(&index);
+            let timestamp_ms = index as i64 + 1;
+            if applied_reduction || produced_output_divergence {
+                expected_timestamps.push(timestamp_ms);
+            }
+            let fingerprint = format!("population-{index}");
+            expected = Some(commit_scheduler_observation(
+                &store,
+                "interesting-selectivity",
+                expected,
+                &PassSchedulerObservation {
+                    timestamp_ms,
+                    scheduler_decision: scheduler_decision.to_string(),
+                    drain_latch_active,
+                },
+                (
+                    produced_output_divergence,
+                    Some((index % 7) as u64),
+                    Some(0),
+                    Some(0),
+                    Some((index % 7) as u64),
+                    u64::from(applied_reduction),
+                ),
+                Some(20_000 + index as u64),
+                Some(&fingerprint),
+            ));
+        }
+
+        let retained = store
+            .load_interesting_pass_scheduler_history("interesting-selectivity", i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(latched_count, LATCHED_PASSES);
+        assert_eq!(expected_timestamps.len(), INTERESTING_PASSES);
+        assert_eq!(retained.len(), INTERESTING_PASSES);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|observation| observation.timestamp_ms)
+                .collect::<Vec<_>>(),
+            expected_timestamps,
+            "only passes that applied a reduction or diverged belong in the interesting ring"
+        );
+
+        let recency = store
+            .load_pass_trace("interesting-selectivity")
+            .unwrap()
+            .unwrap()
+            .scheduler_history;
+        assert_eq!(recency.len(), PASS_SCHEDULER_HISTORY_CAP);
+        assert_eq!(recency.first().unwrap().timestamp_ms, 147);
+        assert_eq!(recency.last().unwrap().timestamp_ms, 402);
+    }
+
+    #[test]
+    fn scheduler_interesting_history_preserves_attributes_and_variable_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let reduction = PassSchedulerObservation {
+            timestamp_ms: 700,
+            scheduler_decision: "Execute".to_string(),
+            drain_latch_active: true,
+        };
+        let divergence = PassSchedulerObservation {
+            timestamp_ms: 701,
+            scheduler_decision: "Emergency95".to_string(),
+            drain_latch_active: false,
+        };
+
+        let first_version = commit_scheduler_observation(
+            &store,
+            "interesting-attributes",
+            None,
+            &reduction,
+            (false, Some(3), Some(1), Some(0), Some(1), 1),
+            Some(70_000),
+            Some("reduction-fingerprint"),
+        );
+        commit_scheduler_observation(
+            &store,
+            "interesting-attributes",
+            Some(first_version),
+            &divergence,
+            (false, Some(3), Some(0), Some(1), Some(2), 3),
+            None,
+            Some("divergence-fingerprint"),
+        );
+
+        let retained = store
+            .load_interesting_pass_scheduler_history("interesting-attributes", i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(
+            retained,
+            vec![
+                InterestingPassSchedulerObservation::from_observation(
+                    &reduction,
+                    Some(70_000),
+                    Some("reduction-fingerprint"),
+                    Some(3),
+                    Some(1),
+                    Some(0),
+                    Some(1),
+                ),
+                InterestingPassSchedulerObservation::from_observation(
+                    &divergence,
+                    None,
+                    Some("divergence-fingerprint"),
+                    Some(3),
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                ),
+            ]
+        );
+        assert_ne!(
+            retained[0].scheduler_decision, retained[1].scheduler_decision,
+            "interesting entries must record each pass's actual scheduler decision"
+        );
+        assert_eq!(retained[1].request_observed_at_ms, None);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|observation| observation.eligible_supersession_count)
+                .collect::<Vec<_>>(),
+            vec![Some(3), Some(3)],
+            "both passes must retain the identical pre-gate accumulator depth"
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .map(|observation| observation.applied_supersession_count)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)],
+            "the applied count must distinguish one landing member from the whole eligible group"
+        );
+    }
+
+    #[test]
+    fn scheduler_interesting_history_is_oldest_first_bounded_and_byte_bounded() {
+        let worst_observation = PassSchedulerObservation {
+            timestamp_ms: i64::MIN,
+            scheduler_decision: "Emergency95".to_string(),
+            drain_latch_active: false,
+        };
+        assert_eq!(
+            serialize_scheduler_observation(&worst_observation)
+                .unwrap()
+                .len(),
+            MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES
+        );
+        assert_eq!(
+            serialize_interesting_scheduler_observation(
+                &worst_observation,
+                Some(u64::MAX),
+                Some(&"\0".repeat(MAX_FULL_ARRAY_FINGERPRINT_BYTES)),
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(u64::MAX),
+            )
+            .unwrap()
+            .len(),
+            MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fingerprint = "x".repeat(MAX_FULL_ARRAY_FINGERPRINT_BYTES);
+        let mut expected = None;
+        for timestamp_ms in 0..=256 {
+            expected = Some(commit_scheduler_observation(
+                &store,
+                "interesting-bound",
+                expected,
+                &PassSchedulerObservation {
+                    timestamp_ms,
+                    scheduler_decision: "Emergency95".to_string(),
+                    drain_latch_active: true,
+                },
+                (false, Some(3), Some(0), Some(0), Some(3), 1),
+                Some(timestamp_ms as u64),
+                Some(&fingerprint),
+            ));
+        }
+
+        let retained = store
+            .load_interesting_pass_scheduler_history("interesting-bound", i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(retained.len(), PASS_SCHEDULER_INTERESTING_HISTORY_CAP);
+        assert_eq!(retained.first().unwrap().timestamp_ms, 1);
+        assert_eq!(retained.last().unwrap().timestamp_ms, 256);
+        let telemetry_bytes = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT length(CAST(scheduler_history AS BLOB))
+                          + length(CAST(scheduler_interesting_history AS BLOB))
+                       FROM mc_pass_trace WHERE session_id = 'interesting-bound'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert!(telemetry_bytes as usize <= PASS_SCHEDULER_TELEMETRY_MAX_BYTES);
+    }
+
+    #[test]
+    fn scheduler_interesting_history_queries_time_and_shared_request_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let entries = [
+            (100, "Execute", 9_001, "fingerprint-a"),
+            (100, "Force85", 9_024, "fingerprint-b"),
+            (300, "Emergency95", 9_300, "fingerprint-c"),
+        ];
+        let mut expected = None;
+        for (timestamp_ms, decision, request_time, fingerprint) in entries {
+            expected = Some(commit_scheduler_observation(
+                &store,
+                "interesting-query",
+                expected,
+                &PassSchedulerObservation {
+                    timestamp_ms,
+                    scheduler_decision: decision.to_string(),
+                    drain_latch_active: decision == "Execute",
+                },
+                (false, Some(3), Some(0), Some(0), Some(3), 1),
+                Some(request_time),
+                Some(fingerprint),
+            ));
+        }
+
+        let range = store
+            .load_interesting_pass_scheduler_history("interesting-query", 100, 299)
+            .unwrap();
+        assert_eq!(range.len(), 2, "the module-clock range is inclusive");
+        assert_eq!(range[0].scheduler_decision, "Execute");
+        assert_eq!(range[1].scheduler_decision, "Force85");
+
+        for (request_time, fingerprint, expected_decision) in [
+            (9_001, "fingerprint-a", "Execute"),
+            (9_024, "fingerprint-b", "Force85"),
+        ] {
+            let by_request_time = store
+                .load_interesting_pass_scheduler_history_by_request_time(
+                    "interesting-query",
+                    request_time,
+                )
+                .unwrap();
+            assert_eq!(by_request_time.len(), 1);
+            assert_eq!(by_request_time[0].scheduler_decision, expected_decision);
+            assert_eq!(
+                by_request_time[0].full_array_fingerprint.as_deref(),
+                Some(fingerprint)
+            );
+
+            let by_fingerprint = store
+                .load_interesting_pass_scheduler_history_by_fingerprint(
+                    "interesting-query",
+                    fingerprint,
+                )
+                .unwrap();
+            assert_eq!(by_fingerprint.len(), 1);
+            assert_eq!(by_fingerprint[0].scheduler_decision, expected_decision);
+            assert_eq!(by_fingerprint[0].request_observed_at_ms, Some(request_time));
+        }
+
+        commit_scheduler_observation(
+            &store,
+            "interesting-query",
+            expected,
+            &PassSchedulerObservation {
+                timestamp_ms: 400,
+                scheduler_decision: "Force85".to_string(),
+                drain_latch_active: false,
+            },
+            (false, Some(3), Some(0), Some(0), Some(3), 1),
+            None,
+            Some("fingerprint-without-sender-time"),
+        );
+        let absent = store
+            .load_interesting_pass_scheduler_history_by_fingerprint(
+                "interesting-query",
+                "fingerprint-without-sender-time",
+            )
+            .unwrap();
+        assert_eq!(absent.len(), 1);
+        assert_eq!(absent[0].request_observed_at_ms, None);
+    }
+
+    #[test]
+    fn scheduler_interest_includes_reductions_and_output_divergence_on_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        let observation = PassSchedulerObservation {
+            timestamp_ms: 500,
+            scheduler_decision: "Defer".to_string(),
+            drain_latch_active: false,
+        };
+
+        for (session_id, first_divergence, applied_reductions, fingerprint) in [
+            ("divergence-interest", Some("{}"), false, "diverged"),
+            ("reduction-interest", None, true, "reduced"),
+        ] {
+            store
+                .commit_transform(
+                    session_id,
+                    TransformCommit {
+                        expected: None,
+                        core: &core,
+                        meta: &meta,
+                        consumed_drop_ids: &[],
+                        first_applied_command_ids: &[],
+                        memory_revision: None,
+                        compartment_max_seq: None,
+                        project_root: None,
+                        first_divergence,
+                        scheduler_observation: Some(&observation),
+                        scheduler_request_observed_at_ms: Some(500),
+                        scheduler_full_array_fingerprint: Some(fingerprint),
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
+                        scheduler_applied_reductions: applied_reductions,
+                        overlays: TransformOverlayBatch::default(),
+                    },
+                )
+                .unwrap();
+            let retained = store
+                .load_interesting_pass_scheduler_history(session_id, 500, 500)
+                .unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].scheduler_decision, "Defer");
+            assert_eq!(
+                retained[0].eligible_supersession_count, None,
+                "Defer did not run supersession selection, so its depth must remain absent"
+            );
+            assert_eq!(
+                retained[0].full_array_fingerprint.as_deref(),
+                Some(fingerprint)
+            );
+        }
     }
 
     #[test]
@@ -18625,10 +19736,70 @@ mod tests {
     }
 
     #[test]
+    fn project_mural_artifact_upsert_is_hash_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+        assert!(store
+            .upsert_project_mural_artifact(
+                "git:project",
+                b"data:image/png;base64,YQ==",
+                "mural-a",
+                100,
+            )
+            .unwrap());
+        let first = store
+            .load_project_mural_artifact("git:project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.data_url, b"data:image/png;base64,YQ==");
+        assert_eq!(first.content_hash, "mural-a");
+        assert_eq!(first.updated_at, 100);
+
+        assert!(!store
+            .upsert_project_mural_artifact(
+                "git:project",
+                b"data:image/png;base64,unexpected-but-same-hash",
+                "mural-a",
+                200,
+            )
+            .unwrap());
+        let unchanged = store
+            .load_project_mural_artifact("git:project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged, first,
+            "same hash must not bump artifact identity"
+        );
+
+        assert!(store
+            .upsert_project_mural_artifact(
+                "git:project",
+                b"data:image/png;base64,Yg==",
+                "mural-b",
+                300,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .load_project_mural_artifact("git:project")
+                .unwrap()
+                .unwrap(),
+            ProjectMuralArtifact {
+                project_path: "git:project".to_string(),
+                data_url: b"data:image/png;base64,Yg==".to_vec(),
+                content_hash: "mural-b".to_string(),
+                updated_at: 300,
+            }
+        );
+    }
+
+    #[test]
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=47).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=LATEST_MIGRATION_VERSION as i64).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -18685,18 +19856,46 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_table.as_deref(), Some("mc_pass_trace"));
-        let fresh_has_scheduler_history = fresh
+        let fresh_has_durable_raw_messages = fresh
             .inner
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('mc_pass_trace')
-                      WHERE name = 'scheduler_history'",
+                    "SELECT COUNT(*) FROM pragma_table_info('mc_chunk_transcripts')
+                      WHERE name = 'raw_messages_deflate'",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
             })
             .unwrap();
-        assert_eq!(fresh_has_scheduler_history, 1);
+        assert_eq!(fresh_has_durable_raw_messages, 1);
+        let fresh_has_scheduler_histories = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mc_pass_trace')
+                      WHERE name IN ('scheduler_history', 'scheduler_interesting_history')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(fresh_has_scheduler_histories, 2);
+        let fresh_has_mural_artifacts = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'table' AND name = 'mc_project_mural_artifacts'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(
+            fresh_has_mural_artifacts.as_deref(),
+            Some("mc_project_mural_artifacts")
+        );
         let fresh_has_import_table = fresh
             .inner
             .with_conn(|conn| {
@@ -18817,18 +20016,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_has_table.as_deref(), Some("mc_pass_trace"));
-        let migrated_has_scheduler_history = migrated
+        let migrated_has_scheduler_histories = migrated
             .inner
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('mc_pass_trace')
-                      WHERE name = 'scheduler_history'",
+                      WHERE name IN ('scheduler_history', 'scheduler_interesting_history')",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
             })
             .unwrap();
-        assert_eq!(migrated_has_scheduler_history, 1);
+        assert_eq!(migrated_has_scheduler_histories, 2);
+        let migrated_has_mural_artifacts = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'table' AND name = 'mc_project_mural_artifacts'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(
+            migrated_has_mural_artifacts.as_deref(),
+            Some("mc_project_mural_artifacts")
+        );
         let migrated_has_import_table = migrated
             .inner
             .with_conn(|conn| {
@@ -20638,6 +21853,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
         assert_eq!(first.row_version, 2);
@@ -20657,6 +21873,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(
@@ -20707,6 +21924,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -20772,6 +21990,7 @@ mod tests {
                     user_memory_candidates: std::slice::from_ref(&observation),
                     publication_floor_ordinal: 21,
                     chunk_transcript: None,
+                    raw_chunk_messages: None,
                 })
                 .unwrap();
 
@@ -20851,6 +22070,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
         assert_eq!(
@@ -20900,6 +22120,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("U: hello\nA: world"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -20938,6 +22159,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("U: orphan"),
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(err, HistorianPublishError::CasConflict { .. }));
@@ -20985,6 +22207,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some(&transcript),
+                raw_chunk_messages: None,
             })
             .unwrap();
         assert!(store
@@ -21026,6 +22249,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 25,
                 chunk_transcript: Some("U: bounded row"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -21085,6 +22309,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 101,
                 chunk_transcript: Some(&oversized),
+                raw_chunk_messages: None,
             })
             .unwrap();
         let transcript = store
@@ -21552,6 +22777,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("stale transcript"),
+                raw_chunk_messages: None,
             })
             .unwrap_err();
 
@@ -21602,6 +22828,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(err, HistorianPublishError::StateMismatch { .. }));
@@ -21637,6 +22864,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(
@@ -21755,6 +22983,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -22044,7 +23273,10 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=47).collect::<Vec<_>>());
+        assert_eq!(
+            versions,
+            (1_i64..=LATEST_MIGRATION_VERSION as i64).collect::<Vec<_>>()
+        );
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
@@ -24444,7 +25676,6 @@ mod lineage_descent_tests {
         }]
     }
 
-
     /// The CC-leg mid assigner is zero-based: a fresh replacement array's
     /// anchor sits at ordinal 0 (measured on the rig — ccm-0#1 carrying the
     /// stored summary). A fresh-origin anchor at 0 must descend exactly like
@@ -24519,17 +25750,28 @@ mod lineage_descent_tests {
     }
 
     #[test]
-        fn descent_copies_verbatim_ranges_writes_real_boundary_and_replay_does_not_rebump() {
+    fn descent_copies_verbatim_ranges_and_session_notes_without_replay_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_lineage(&store, "A", 10);
+        let source_note = store
+            .insert_note(NoteInput {
+                project_path: "git:project",
+                route_project_root: None,
+                session_id: "A",
+                content: "remember the inherited note",
+                surface_condition: None,
+                anchor_block_id: Some("m2#0"),
+                now_ms: 1,
+            })
+            .unwrap();
         store
             .inner
             .with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO mc_tags
                          (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
-                     VALUES ('A', 1, 'm2#0', 'message', 7, 1, X'61')",
+                      VALUES ('A', 1, 'm2#0', 'message', 7, 1, X'61')",
                     [],
                 )?;
                 conn.execute(
@@ -24605,6 +25847,14 @@ mod lineage_descent_tests {
             })
             .unwrap();
         assert_eq!(copied_markers, (1, 1));
+        let inherited_notes = store.read_notes("git:project", "B", 10, 0).unwrap();
+        assert_eq!(inherited_notes.len(), 1);
+        assert_ne!(inherited_notes[0].id, source_note.id);
+        assert_eq!(inherited_notes[0].content, source_note.content);
+        assert_eq!(
+            inherited_notes[0].anchor_block_id.as_deref(),
+            source_note.anchor_block_id.as_deref()
+        );
         let transcript = store.load_chunk_transcripts_for_range("B", 1, 3).unwrap();
         assert_eq!(transcript.len(), 1);
         assert_eq!(
@@ -24635,6 +25885,11 @@ mod lineage_descent_tests {
             store.load("A").unwrap().meta.revert_epoch,
             before_epoch + 1,
             "write-free replay must not re-bump the prior publish fence"
+        );
+        assert_eq!(
+            store.read_notes("git:project", "B", 10, 0).unwrap().len(),
+            1,
+            "a replay must not duplicate inherited session notes"
         );
     }
 
@@ -24928,12 +26183,7 @@ mod lineage_descent_tests {
         let store = store(dir.path());
         seed_lineage(&store, "A", 10);
         store
-            .commit(
-                "B",
-                None,
-                &CoreState::default(),
-                &ModuleMeta::default(),
-            )
+            .commit("B", None, &CoreState::default(), &ModuleMeta::default())
             .unwrap();
         let target_before = store.load("B").unwrap();
         let prior_before = store.load("A").unwrap();

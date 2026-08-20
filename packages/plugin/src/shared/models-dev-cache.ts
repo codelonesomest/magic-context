@@ -30,9 +30,15 @@ import { join } from "node:path";
 import type { ContextLimitProvenance } from "./context-limit-provenance";
 import { getMagicContextStorageDir } from "./data-path";
 import { getHarness } from "./harness";
-import { piModelRefToCanonical } from "./harness-provider-map";
+import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
 import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
+import {
+    deriveWindowGeometry,
+    getWindowOverlay,
+    resolveWindowOverlayFacts,
+    type WindowGeometryResult,
+} from "./window-geometry";
 
 interface OpencodeClientLike {
     config: {
@@ -196,22 +202,20 @@ function isFinitePositive(value: number | undefined): value is number {
 }
 
 function modelKeyLookupOrder(providerID: string, modelID: string): string[] {
-    const full = `${providerID}/${modelID}`;
-    const canonicalFull = piModelRefToCanonical(full);
-    const candidates = [full, canonicalFull, modelID];
+    const candidates = [...modelRefLookupOrder(`${providerID}/${modelID}`), modelID];
     const colon = modelID.lastIndexOf(":");
     if (colon > 0) {
         const bareModel = modelID.slice(0, colon);
-        const providerBare = `${providerID}/${bareModel}`;
-        candidates.push(providerBare, piModelRefToCanonical(providerBare), bareModel);
+        candidates.push(...modelRefLookupOrder(`${providerID}/${bareModel}`), bareModel);
     }
     return [...new Set(candidates)];
 }
 
-function configuredOutputReserve(
-    config: OutputReserveConfig | undefined,
+/** Resolve the user-tier output reservation for one runtime model. */
+export function resolveOutputReserve(
     providerID: string,
     modelID: string,
+    config: OutputReserveConfig | undefined = outputReserveConfig,
 ): number | undefined {
     if (typeof config === "number")
         return Number.isFinite(config) && config >= 0 ? config : undefined;
@@ -256,7 +260,7 @@ export function resolveLimit(
     if (input !== undefined && (context === undefined || input < context)) return input;
     if (context === undefined) return undefined;
 
-    const configuredReserve = configuredOutputReserve(reserveConfig, providerID, modelID);
+    const configuredReserve = resolveOutputReserve(providerID, modelID, reserveConfig);
     let reserve: number;
     if (configuredReserve !== undefined) {
         reserve = configuredReserve;
@@ -493,6 +497,50 @@ async function refreshModelLimitsOnce(client: OpencodeClientLike): Promise<boole
  * `ctx.model.contextWindow`), so for Pi this returns `undefined` and Pi's
  * own resolution path is used.
  */
+export function getSdkWindowGeometry(
+    providerID: string,
+    modelID: string,
+    detectedContextLimit?: number,
+    options?: {
+        detectedLimitProvenance?: ContextLimitProvenance;
+        harness?: "opencode" | "pi";
+    },
+): WindowGeometryResult | undefined {
+    loadPersistedApiCacheOnce();
+    const metadata = lookupMetadataWithTagFallback(apiCache, providerID, modelID);
+    if (!metadata) return undefined;
+    const rawContext = metadata.contextLimit ?? metadata.limit;
+    const promptOnlyDetected =
+        options?.detectedLimitProvenance === "prompt_only" && isFinitePositive(detectedContextLimit)
+            ? detectedContextLimit
+            : undefined;
+    const result = deriveWindowGeometry(
+        providerID,
+        modelID,
+        {
+            context: rawContext,
+            input: metadata.inputLimit,
+            output: metadata.outputLimit,
+        },
+        {
+            overlay: resolveWindowOverlayFacts(providerID, modelID, getWindowOverlay()),
+            outputReserveOverride: resolveOutputReserve(providerID, modelID),
+            harness: options?.harness ?? "opencode",
+            contextCap:
+                promptOnlyDetected === undefined && isFinitePositive(detectedContextLimit)
+                    ? detectedContextLimit
+                    : undefined,
+        },
+    );
+    if (!result || promptOnlyDetected === undefined) return result;
+    const usableSoft = promptOnlyDetected;
+    return {
+        ...result,
+        usableSoft,
+        usableHard: Math.max(usableSoft, Math.min(result.usableHard, promptOnlyDetected)),
+    };
+}
+
 export function getSdkContextLimit(
     providerID: string,
     modelID: string,
@@ -502,6 +550,11 @@ export function getSdkContextLimit(
         detectedLimitProvenance?: ContextLimitProvenance;
     },
 ): number | undefined {
+    if (options?.reservation !== "none") {
+        return getSdkWindowGeometry(providerID, modelID, detectedContextLimit, {
+            detectedLimitProvenance: options?.detectedLimitProvenance,
+        })?.usableSoft;
+    }
     loadPersistedApiCacheOnce();
     const metadata = lookupMetadataWithTagFallback(apiCache, providerID, modelID);
     if (!metadata) return undefined;

@@ -33,9 +33,19 @@ import {
 	formatThresholdClampNote,
 	formatThresholdPercent,
 } from "@magic-context/core/shared/format-threshold";
+import type { TailHygieneStatus } from "@magic-context/core/shared/rpc-types";
+import {
+	formatTailHygiene,
+	resolveTailHygieneStatus,
+} from "@magic-context/core/shared/tail-hygiene-status";
+import {
+	formatWindowDerivationLine,
+	type WindowGeometryResult,
+} from "@magic-context/core/shared/window-geometry";
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
-import { resolvePiUsableContextLimit } from "../pi-context-limit";
+import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
+import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 // Mirror packages/plugin/src/tui/slots/sidebar-content.tsx COLORS so the Pi
@@ -93,6 +103,7 @@ interface StatusDialogDetail {
 	lastTransformError: string | null;
 	isSubagent: boolean;
 	contextLimit: number;
+	windowGeometry?: WindowGeometryResult;
 	executeThreshold: number;
 	/** Which config source produced `executeThreshold` (tokens vs percentage). */
 	executeThresholdMode: "percentage" | "tokens";
@@ -116,6 +127,7 @@ interface StatusDialogDetail {
 	conversationTokens: number;
 	toolCallTokens: number;
 	toolDefinitionTokens: number;
+	tailHygiene?: TailHygieneStatus;
 	newWorkTokens: number;
 	totalInputTokens: number;
 	/** Compartments still needing a v2 upgrade (legacy or tierless). */
@@ -268,9 +280,20 @@ function renderInner(
 			theme.bold(`${s.usagePercentage.toFixed(1)}%`),
 		)} · ${fmt(s.inputTokens)} / ${s.contextLimit > 0 ? fmt(s.contextLimit) : "?"} tokens`,
 	);
+	if (s.windowGeometry) {
+		lines.push(
+			formatWindowDerivationLine(s.inputTokens, s.windowGeometry).replace(
+				/^Context:.* — window /,
+				"Window ",
+			),
+		);
+	}
 	lines.push(
 		`Work tokens ${fmt(s.newWorkTokens)} new · ${fmt(s.totalInputTokens)} total input`,
 	);
+	if (s.tailHygiene !== undefined) {
+		lines.push(`Hygiene ${formatTailHygiene(s.tailHygiene)}`);
+	}
 
 	// Segmented bar (fills the full inner content width)
 	lines.push(renderBar(s, innerWidth));
@@ -285,6 +308,7 @@ function renderInner(
 		const right = theme.fg("muted", `${fmt(seg.tokens)} (${pct}%)`);
 		lines.push(`${left}   ${right}`);
 	}
+	lines.push("* Conversation includes model Reasoning; hygiene excludes it.");
 	lines.push("");
 
 	// Quick counts + historian. v2: facts retired (promoted to memories), so the
@@ -402,8 +426,13 @@ export function buildPiStatusDetail(
 ): StatusDialogDetail {
 	const usage = ctx.getContextUsage?.();
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
-	const inputTokens =
-		typeof usage?.tokens === "number" ? usage.tokens : meta.lastInputTokens;
+	const hasPersistedPressure =
+		meta.lastInputTokens > 0 && meta.lastContextPercentage > 0;
+	const inputTokens = hasPersistedPressure
+		? meta.lastInputTokens
+		: typeof usage?.tokens === "number"
+			? usage.tokens
+			: 0;
 	let detectedContextLimit: number | undefined;
 	try {
 		const detected = getOverflowState(deps.db, sessionId).detectedContextLimit;
@@ -411,15 +440,14 @@ export function buildPiStatusDetail(
 	} catch {
 		// Status remains available when overflow metadata cannot be read.
 	}
-	const contextLimit =
-		resolvePiUsableContextLimit({
-			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
-			model: ctx.model,
-			detectedContextLimit,
-		}) ??
-		(meta.lastContextPercentage > 0
-			? Math.round(inputTokens / (meta.lastContextPercentage / 100))
-			: 0);
+	const windowGeometry = resolvePiWindowGeometry({
+		rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+		model: ctx.model,
+		detectedContextLimit,
+		persistedInputTokens: meta.lastInputTokens,
+		persistedPercentage: meta.lastContextPercentage,
+	});
+	const contextLimit = windowGeometry?.usableSoft ?? 0;
 	const usagePercentage =
 		contextLimit > 0 && inputTokens > 0
 			? (inputTokens / contextLimit) * 100
@@ -520,6 +548,9 @@ export function buildPiStatusDetail(
 			toolDefinitionTokens,
 	);
 	const workMetrics = getSessionWorkMetrics(deps.db, sessionId);
+	const tailHygiene = resolveTailHygieneStatus(
+		getPiChannel1Baseline(sessionId),
+	);
 
 	const modelKey = ctx.model
 		? `${ctx.model.provider}/${ctx.model.id}`
@@ -607,6 +638,7 @@ export function buildPiStatusDetail(
 		lastTransformError: meta.lastTransformError,
 		isSubagent: meta.isSubagent,
 		contextLimit,
+		windowGeometry,
 		executeThreshold: threshold.percentage,
 		executeThresholdMode: threshold.mode,
 		executeThresholdClamped: threshold.clamped,
@@ -630,6 +662,7 @@ export function buildPiStatusDetail(
 		conversationTokens,
 		toolCallTokens,
 		toolDefinitionTokens,
+		...(tailHygiene === undefined ? {} : { tailHygiene }),
 		newWorkTokens: workMetrics.newWorkTokens,
 		totalInputTokens: workMetrics.totalInputTokens,
 		upgradeNeededCount: safeRead(
@@ -695,7 +728,7 @@ function breakdownSegments(s: StatusDialogDetail): Array<{
 		});
 	if (s.conversationTokens > 0)
 		segs.push({
-			label: "Conversation",
+			label: "Conversation*",
 			tokens: s.conversationTokens,
 			color: COLORS.conversation,
 		});

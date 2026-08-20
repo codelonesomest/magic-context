@@ -28,6 +28,8 @@ export interface TestHarnessOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /** Set false only when the test intentionally verifies conflict-based self-disable behavior. */
+    expectMagicContext?: boolean;
     /**
      * Default response used when the mock queue is empty. Lets tests send extra
      * prompts without worrying about scripting every one.
@@ -70,12 +72,19 @@ export class TestHarness {
     readonly rustStack: SpawnedOpencode["rustStack"];
 
     private contextDbCached: Database | null = null;
+    private readonly expectMagicContext: boolean;
 
-    private constructor(mock: MockProvider, opencode: SpawnedOpencode, client: SdkClient) {
+    private constructor(
+        mock: MockProvider,
+        opencode: SpawnedOpencode,
+        client: SdkClient,
+        expectMagicContext: boolean,
+    ) {
         this.mock = mock;
         this.opencode = opencode;
         this.client = client;
         this.rustStack = opencode.rustStack;
+        this.expectMagicContext = expectMagicContext;
     }
 
     static async create(options: TestHarnessOptions = {}): Promise<TestHarness> {
@@ -85,18 +94,25 @@ export class TestHarness {
         // Always install a default so unexpected extra requests don't 500.
         mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
 
+        const expectMagicContext = options.expectMagicContext !== false;
         const spawnOpts: SpawnOptions = {
             mockProviderURL: baseURL,
             magicContextConfig: options.magicContextConfig,
             openCodeConfigExtra: options.openCodeConfigExtra,
             modelContextLimit: options.modelContextLimit,
+            prepareContextDatabase: expectMagicContext,
+            expectedMagicContextState: expectMagicContext ? "enabled" : "conflict-disabled",
         };
-        const opencode = await spawnOpencode(spawnOpts);
-
-        const sdk = await import("@opencode-ai/sdk");
-        const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
-
-        return new TestHarness(mock, opencode, client);
+        let opencode: SpawnedOpencode | undefined;
+        try {
+            opencode = await spawnOpencode(spawnOpts);
+            const sdk = await import("@opencode-ai/sdk");
+            const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
+            return new TestHarness(mock, opencode, client, expectMagicContext);
+        } catch (error) {
+            await Promise.allSettled([opencode?.kill() ?? Promise.resolve(), mock.stop()]);
+            throw error;
+        }
     }
 
     /** Create a session bound to the isolated workdir. Throws on failure. */
@@ -266,7 +282,56 @@ export class TestHarness {
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencode.stderr().slice(-2000)}`,
             );
         }
+        this.assertMagicContextProcessed(sessionId);
         return result;
+    }
+
+    /**
+     * Require durable evidence that Magic Context processed this exact OpenCode session.
+     * A successful provider reply alone can belong to an uninstrumented or delayed path.
+     */
+    assertMagicContextProcessed(sessionId: string): void {
+        if (!this.expectMagicContext) return;
+        const processed = this
+            .contextDb()
+            .prepare("SELECT 1 FROM session_meta WHERE session_id = ?")
+            .get(sessionId);
+        if (!processed) {
+            throw new Error(`OpenCode Magic Context did not process session ${sessionId}`);
+        }
+    }
+
+    /**
+     * Wait until every captured provider request has answered and no new request
+     * arrives during a short quiet window. Call this before replacing mock routes
+     * or selecting a final capture so delayed background work cannot cross phases.
+     */
+    async waitForMockQuiescence(opts: { quietMs?: number; label?: string } = {}): Promise<void> {
+        const quietMs = opts.quietMs ?? 250;
+        let stableRequestCount: number | null = null;
+        let quietSince = 0;
+        await this.waitFor(
+            () => {
+                const requests = this.mock.requests();
+                const allResponsesCompleted = requests.every(
+                    (request) => request.responseCompletedAt !== undefined,
+                );
+                if (!allResponsesCompleted) {
+                    stableRequestCount = null;
+                    return false;
+                }
+                if (stableRequestCount !== requests.length) {
+                    stableRequestCount = requests.length;
+                    quietSince = Date.now();
+                    return false;
+                }
+                return Date.now() - quietSince >= quietMs;
+            },
+            {
+                intervalMs: Math.min(50, quietMs),
+                label: opts.label ?? "mock provider quiescence",
+            },
+        );
     }
 
     /**

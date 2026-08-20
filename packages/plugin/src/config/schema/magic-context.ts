@@ -508,6 +508,8 @@ export interface MagicContextConfig {
     prompt_surface: PromptSurfaceConfig;
     /** User-only output-token reservation override. Zero disables reservation. */
     output_reserve?: number | { default: number; [modelKey: string]: number };
+    /** User-only model metadata inputs. */
+    models?: { window_overlay_path?: string };
     /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
     toast_duration_ms?: number;
     execute_threshold_percentage: number | { default: number; [modelKey: string]: number };
@@ -750,7 +752,15 @@ export const MagicContextConfigSchema = z
             ])
             .optional()
             .describe(
-                'User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.',
+                'User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. Takes precedence over every derived source: an explicit value here always wins against catalog output limits, provider window-geometry facts, and the 25%-of-context fallback (usable window = context window minus this reserve). When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.',
+            ),
+        models: z
+            .object({
+                window_overlay_path: z.string().trim().min(1).optional(),
+            })
+            .optional()
+            .describe(
+                "User-only Fusiform window-overlay settings. The path defaults to <dataDir>/fusiform/window-overlay.json.",
             ),
         toast_duration_ms: z
             .number()
@@ -970,7 +980,7 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
+                "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 3), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
             ),
         caveman_text_compression: z
             .object({

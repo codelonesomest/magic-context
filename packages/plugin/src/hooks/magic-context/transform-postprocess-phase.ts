@@ -26,11 +26,17 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    addMergedReasoningStrippedIds,
+    addTrailingBlankDecisions,
+    getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
+    getTrailingBlankDecisions,
     type PersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
+    getOldestActiveUnprotectedToolTags,
     getTagNumberByMessageId,
+    getTailHygieneTags,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
@@ -41,6 +47,10 @@ import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { runAutoSearchHint } from "./auto-search-runner";
+import {
+    rearmChannel2AfterCoverageAdvancingHardFold,
+    rearmChannel2AfterMeasuredCollapse,
+} from "./channel2-cycle";
 import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
 import type {
@@ -54,7 +64,9 @@ import {
     resolveToolPermissionDenied,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
+import type { Channel1State } from "./ctx-reduce-nudge";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
+import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
     clearInjectionCache,
@@ -72,15 +84,26 @@ import type { PassOutcome } from "./pass-outcome";
 import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
+    applyFrozenTrailingBlankDecisions,
     clearOldReasoning,
+    findMergedReasoningStripCandidateIds,
+    findTrailingBlankDecisionCandidates,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
+    type TrailingBlankDecision,
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
+import {
+    assertTailHygieneContentUnchanged,
+    refreshTailHygieneBaseline,
+    sameTailHygieneStructuralSignature,
+    type TailHygieneStructuralSignature,
+    tailHygieneStructuralSignature,
+} from "./tail-hygiene-walk";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
@@ -115,13 +138,15 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-already-cleared";
 
 function isSyntheticHeadMessage(message: MessageLike): boolean {
-    // The flag alone is input-controlled metadata: a persisted or foreign row
-    // could carry it and absorb a real message into the injected head, shifting
-    // the summary's canonical position. Require the exact shape only
-    // prependM0M1Messages produces: an ID-less user message whose every part is
-    // marked synthetic. Persisted OpenCode rows always carry an id, so they can
-    // never satisfy this regardless of their metadata.
-    if (message.info.syntheticHead !== true) return false;
+    // Structural shape only — an ID-less user message whose every part is
+    // marked synthetic. Persisted OpenCode rows always carry an id, so no
+    // persisted or foreign row can satisfy this regardless of its metadata;
+    // the shape is exactly what the TS lane's prependM0M1Messages and the
+    // Rust module's m0/m1 encode both produce. The TS lane additionally sets
+    // info.syntheticHead, but the Rust encode does not — requiring the flag
+    // here made the head walk stop at index 0 on rust-mode output and splice
+    // the compaction summary AHEAD of m0, failing the m0 wire invariant on
+    // every pass for sessions with persisted marker state.
     if (message.info.id !== undefined) return false;
     if (message.info.role !== "user") return false;
     const parts = message.parts;
@@ -325,9 +350,9 @@ export async function applyTodoSynthesis(args: {
 }
 
 /**
- * Apply the host-resident note and recall overlays after native Rust serving.
- * These anchors are deliberately appended after the module response lands: they
- * are TypeScript cache decisions, not module-owned CK bytes.
+ * Rebuild host-owned canonical representation after native Rust serving.
+ * The persisted compaction summary is restored with the same canonicalizer as the
+ * TypeScript lane, then note and recall anchors are replayed onto the native result.
  */
 export function runRustModePostprocess(args: {
     db: ContextDatabase;
@@ -335,8 +360,11 @@ export function runRustModePostprocess(args: {
     messages: MessageLike[];
     projectPath?: string;
     fullFeatureMode: boolean;
+    compactionOff?: boolean;
+    tagger: Tagger;
+    ctxReduceAvailability: CtxReduceAvailabilityVerdict;
 }): void {
-    if (!args.fullFeatureMode) return;
+    if (!args.fullFeatureMode || args.compactionOff) return;
     // Test doubles and older integrations may return the legacy bare message shape.
     // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
     // those responses untouched instead of treating a missing `info` object as a failure.
@@ -350,6 +378,16 @@ export function runRustModePostprocess(args: {
     ) {
         return;
     }
+    reconcileMarkerRepresentation(
+        args.messages,
+        getPersistedCompactionMarkerState(args.db, args.sessionId),
+        {
+            db: args.db,
+            sessionId: args.sessionId,
+            tagger: args.tagger,
+            ctxReduceAvailability: args.ctxReduceAvailability,
+        },
+    );
     for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
@@ -519,6 +557,8 @@ interface RunPostTransformPhaseArgs {
     messageTagNumbers: Map<MessageLike, number>;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
+    /** Final-array counts of reclaimable tagged mass (U) and total eligible mass (T). */
+    channel1StateBySession?: Map<string, Channel1State>;
     /** Frozen-per-session verdict for the native `todowrite` tool. Gates the
      *  synthetic todo-pair injection below: a session whose tools map filters
      *  todowrite out must not get a synthetic pair for a tool it cannot call. */
@@ -725,6 +765,10 @@ export function finalizeMessageRepresentation(
         prependedMessageCount?: number;
         reasoningMutatedMessages?: Iterable<MessageLike>;
         reasoningMutationExemptMessage?: MessageLike;
+        mergedReasoningStrippedIds?: ReadonlySet<string>;
+        trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
+        skipMergedReasoningStrip?: boolean;
+        skipTrailingWhitespaceStrip?: boolean;
     },
 ): { clearedParts: number; mergedReasoningParts: number } {
     let clearedParts = 0;
@@ -747,9 +791,28 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
-    const mergedReasoningParts = stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
-        mutationExemptMessage: options?.reasoningMutationExemptMessage,
-    });
+    let newestAssistant = options?.reasoningMutationExemptMessage;
+    if (!newestAssistant) {
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            const message = messages[index];
+            if (message.info.role !== "assistant") continue;
+            newestAssistant = message;
+            break;
+        }
+    }
+    const mergedReasoningParts = options?.skipMergedReasoningStrip
+        ? 0
+        : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
+              mutationExemptMessage: options?.reasoningMutationExemptMessage,
+              frozenMessageIds: options?.mergedReasoningStrippedIds,
+          });
+    if (!options?.skipTrailingWhitespaceStrip && modelAcceptsEmptyContent(resolvedProviderID)) {
+        applyFrozenTrailingBlankDecisions(
+            messages,
+            typeof newestAssistant?.info.id === "string" ? newestAssistant.info.id : undefined,
+            options?.trailingBlankDecisions ?? new Map(),
+        );
+    }
     return { clearedParts, mergedReasoningParts };
 }
 
@@ -804,19 +867,12 @@ export async function runPostTransformPhase(
         activeCompartmentRun !== undefined;
     const deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
     const materializationRequested = isExplicitFlush || deferredMaterialize;
-    // Known-bust fold: if m[0] is going to HARD-fold this pass (epoch / model /
-    // system-hash / ttl-idle / mutation-id / upgrade — whatever mustMaterialize
-    // decides), the Anthropic prefix is being re-cached regardless. Drain the
-    // queued tool-drops + run heuristics into THAT bust instead of busting a
-    // second time on a later execute pass. ADVISORY-ONLY: early-true widens the
-    // gates below; early-false changes nothing — injectM0M1 keeps its own
-    // independent late mustMaterialize recheck, so a cross-process epoch/mutation
-    // bump arriving after this point still folds (and its drops drain on a later
-    // pass, exactly as today). Correctness is never worse than today; the cost is
-    // one extra mustMaterialize (indexed DB reads + a cached docs stat).
-    // Kept a SEPARATE boolean — NEVER folded into materializationRequested, which
-    // drives the lastResponseTime TTL reset and pendingMaterialization cleanup;
-    // folding in would suppress those and oscillate.
+    // A HARD decision alone is not a cache bust. Execute it off-wire first, then
+    // let pending drops and heuristics ride the bust only when persistence reports
+    // that m[0] actually materialized. A contention fallback or failed attempt
+    // leaves the mutation gates closed, preserving byte-identical defer replay.
+    // injectM0M1 still rechecks later, so a cross-process marker bump after this
+    // pre-execution can fold safely without retroactively authorizing mutations.
     // Re-gated for compaction-off mode (issue #266): injection runs when the
     // memory/docs identity is present AND (fullFeatureMode || compactionOff),
     // so the mode cannot swallow m[0]/m[1] delivery — and a compaction-off
@@ -826,7 +882,7 @@ export async function runPostTransformPhase(
         args.m0M1 !== undefined &&
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&
         (args.fullFeatureMode || compactionOff);
-    const m0HardFoldThisPass =
+    const foldDueDecision =
         m0M1EnabledForFold && args.m0M1
             ? mustMaterialize({
                   db: args.db,
@@ -839,13 +895,69 @@ export async function runPostTransformPhase(
                   memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                   historyBudgetTokens: args.m0M1.historyBudgetTokens,
                   hardSignals: args.m0M1.hardSignals,
-              }).value
-            : false;
+              })
+            : { value: false, reason: null };
+    let foldExecutedThisPass = false;
+    let m0RematerializedThisPass = false;
+    const m0CoverageBeforeFold =
+        args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
+    let m0MaterializeReason: string | null = null;
+    if (foldDueDecision.value && args.m0M1) {
+        try {
+            // Persist the fold before opening mutation gates. Omitting messages
+            // keeps this pre-execution off the outgoing wire; the injection phase
+            // below replays the persisted pair into the real message array.
+            const foldResult = injectM0M1({
+                db: args.db,
+                sessionId: args.sessionId,
+                state: args.sessionMeta as M0M1State,
+                projectPath: args.m0M1.projectPath,
+                projectDirectory: args.m0M1.projectDirectory,
+                injectDocs: args.m0M1.injectDocs,
+                memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
+                historyBudgetTokens: args.m0M1.historyBudgetTokens,
+                temporalAwareness: args.m0M1.temporalAwareness,
+                isCacheBustingPass: true,
+                hardSignals: args.m0M1.hardSignals,
+                muralEnabled: args.m0M1.muralEnabled,
+                compactionOff,
+            });
+            foldExecutedThisPass = foldExecutesThisPass(
+                foldDueDecision.value,
+                foldResult.m0RematerializedThisPass,
+            );
+            m0RematerializedThisPass = foldResult.m0RematerializedThisPass;
+            m0MaterializeReason = foldResult.decision.reason;
+            try {
+                rearmChannel2AfterCoverageAdvancingHardFold({
+                    db: args.db,
+                    sessionId: args.sessionId,
+                    foldExecuted: foldExecutedThisPass,
+                    compactionOff,
+                    previousCoverage: m0CoverageBeforeFold,
+                    currentCoverage: args.sessionMeta.cachedM0MaxCompartmentSeq,
+                });
+            } catch (error) {
+                sessionLog(args.sessionId, "channel2 fold-cycle reset failed (ignored):", error);
+            }
+        } catch (error) {
+            args.passOutcome?.record("m0-m1-fold-preexecution-degradation");
+            sessionLog(
+                args.sessionId,
+                "transform: m[0] HARD fold pre-execution failed:",
+                getErrorMessage(error),
+            );
+        }
+        sessionLog(
+            args.sessionId,
+            `m[0] HARD fold decision: reason=${foldDueDecision.reason ?? "unknown"} executed=${foldExecutedThisPass}`,
+        );
+    }
     // Bypass the compartment-running veto when this pass is busting the Anthropic
     // prefix REGARDLESS — so the pending-op drain + heuristics ride that one bust
     // instead of being deferred into a SECOND bust ~a turn later. Two cases:
     //   - forceMaterialization (the derived force band): overflow prevention trumps cache stability.
-    //   - m0HardFoldThisPass: a HARD m[0] fold (model/system-hash/epoch/etc.) is
+    //   - foldExecutedThisPass: a HARD m[0] fold (model/system-hash/epoch/etc.) is
     //     re-caching m[0] this pass; the prefix is already gone, so draining into
     //     it is free. Without this, a hard fold landing while the historian runs
     //     leaves the drop vetoed -> it spills to a later soft bust (observed: a
@@ -859,13 +971,13 @@ export async function runPostTransformPhase(
     //   - The historian's post-publish queueDropsForCompartmentalizedMessages is
     //     idempotent against already-dropped tags (status !== "active"), so any
     //     drain/publish ordering is benign.
-    const bypassCompartmentGate = forceMaterialization || m0HardFoldThisPass;
+    const bypassCompartmentGate = forceMaterialization || foldExecutedThisPass;
     const shouldReadPendingOps =
         !compactionOff &&
         (materializationRequested ||
             args.schedulerDecision === "execute" ||
             forceMaterialization ||
-            m0HardFoldThisPass ||
+            foldExecutedThisPass ||
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
@@ -877,7 +989,7 @@ export async function runPostTransformPhase(
         (args.schedulerDecision === "execute" ||
             materializationRequested ||
             forceMaterialization ||
-            m0HardFoldThisPass) &&
+            foldExecutedThisPass) &&
         (!compartmentRunning || bypassCompartmentGate);
     // Heuristic cleanup runs for ALL sessions — primary and subagent. Subagents
     // previously skipped heuristics entirely (via fullFeatureMode gate), which
@@ -908,12 +1020,10 @@ export async function runPostTransformPhase(
         (!compartmentRunning || bypassCompartmentGate) &&
         (materializationRequested ||
             forceMaterialization ||
-            // Known m[0] hard-fold this pass: the prefix busts regardless, so
-            // running heuristics here folds the drops into the one bust. Bypasses
-            // the once-per-turn guard deliberately (the guard exists to avoid
-            // mid-turn cache busts; this pass busts anyway), so a hard fold that
-            // lands mid-turn still drains.
-            m0HardFoldThisPass ||
+            // The off-wire fold landed, so the prefix already busted. Heuristics
+            // may ride it and bypass the once-per-turn guard without creating an
+            // independent mid-turn rewrite.
+            foldExecutedThisPass ||
             // the derived force band emergency floor for BOTH primary and subagent. For a primary
             // this coincides with forceMaterialization (fullFeatureMode && the derived force band);
             // for a subagent (no forceMaterialization) it's the only path that
@@ -982,8 +1092,8 @@ export async function runPostTransformPhase(
               ? "deferred_materialization"
               : forceMaterialization
                 ? `force_materialization (${args.contextUsage.percentage.toFixed(1)}% >= ${args.forceMaterializationPercentage}%)`
-                : m0HardFoldThisPass && args.schedulerDecision !== "execute"
-                  ? `m0_hard_fold (drain folded into known m[0] bust, scheduler=${args.schedulerDecision})`
+                : foldExecutedThisPass && args.schedulerDecision !== "execute"
+                  ? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
                   : subagentRerun
                     ? `scheduler_execute_subagent_rerun (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`
                     : `scheduler_execute (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`;
@@ -1031,8 +1141,6 @@ export async function runPostTransformPhase(
     const droppedTokens = 0;
     let emergencyReclaimedTokens = 0;
     let emergency = false;
-    let m0RematerializedThisPass = false;
-    let m0MaterializeReason: string | null = null;
     let m0M1InjectedThisPass = false;
     let prependedMessageCount = 0;
     const reasoningMutatedMessages = new Set<MessageLike>();
@@ -1050,7 +1158,9 @@ export async function runPostTransformPhase(
                 ? "explicit_flush"
                 : deferredMaterialize
                   ? "deferred_materialization"
-                  : `scheduler_execute (scheduler=${args.schedulerDecision})`;
+                  : foldExecutedThisPass && args.schedulerDecision !== "execute"
+                    ? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
+                    : `scheduler_execute (scheduler=${args.schedulerDecision})`;
             sessionLog(
                 args.sessionId,
                 `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,
@@ -1894,7 +2004,7 @@ export async function runPostTransformPhase(
         m0RematerializedThisPass ||
         explicitMaterializedSuccessfully ||
         deferredMaterializedSuccessfully;
-    const bustedThisPass =
+    let bustedThisPass =
         args.didMutateFromFlushedStatuses ||
         pendingOpsDidMutate ||
         heuristicOrReasoningDidMutate ||
@@ -1929,6 +2039,67 @@ export async function runPostTransformPhase(
     // head count plus owning mutation targets preserves the old full-array result
     // without repeating its O(session) walk. A legacy/custom target that omits its
     // owner pays one mutation-pass discovery scan above; steady defer never does.
+    // Merged-assistant reasoning follows the same frozen WRITE/REPLAY split as
+    // stale ctx_reduce and processed images. Detection opens only on the shared
+    // cache-busting gate; replay applies the persisted id set on every pass.
+    // Persist before first mutation so a fresh defer rebuild can always reproduce
+    // any stripped bytes. The newest assistant is excluded from both detection
+    // and replay because Anthropic requires its signed blocks byte-identically.
+    const mergedReasoningStrippedIds = new Set<string>();
+    if (canUseEmptySentinels && !compactionOff) {
+        try {
+            for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+                mergedReasoningStrippedIds.add(id);
+            }
+            if (isCacheBustingPass) {
+                const candidates = findMergedReasoningStripCandidateIds(
+                    args.messages,
+                    args.resolvedProviderID,
+                    { mutationExemptMessage: reasoningMutationExemptMessage },
+                );
+                const newlyDetectedIds = candidates.filter(
+                    (id) => !mergedReasoningStrippedIds.has(id),
+                );
+                if (newlyDetectedIds.length > 0) {
+                    const persisted = addMergedReasoningStrippedIds(
+                        args.db,
+                        args.sessionId,
+                        newlyDetectedIds,
+                    );
+                    if (persisted) {
+                        for (const id of newlyDetectedIds) mergedReasoningStrippedIds.add(id);
+                        bustedThisPass = true;
+                    } else {
+                        args.passOutcome?.record("merged-reasoning-strip-persistence-failure");
+                        sessionLog(
+                            args.sessionId,
+                            "merged reasoning strip: persistence failed; leaving newly detected assistants intact",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            args.passOutcome?.record("merged-reasoning-strip-exception");
+            sessionLog(args.sessionId, "transform failed freezing merged reasoning strip:", error);
+        }
+    }
+
+    const trailingBlankDecisions = new Map<string, TrailingBlankDecision>();
+    if (canUseEmptySentinels && !compactionOff) {
+        try {
+            for (const [id, decision] of getTrailingBlankDecisions(args.db, args.sessionId)) {
+                trailingBlankDecisions.set(id, decision);
+            }
+        } catch (error) {
+            args.passOutcome?.record("trailing-blank-decision-load-exception");
+            sessionLog(args.sessionId, "transform failed loading trailing blank decisions:", error);
+        }
+    }
+
+    const newestAssistantId =
+        typeof reasoningMutationExemptMessage?.info.id === "string"
+            ? reasoningMutationExemptMessage.info.id
+            : undefined;
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -1937,8 +2108,71 @@ export async function runPostTransformPhase(
             prependedMessageCount,
             reasoningMutatedMessages,
             reasoningMutationExemptMessage,
+            mergedReasoningStrippedIds,
+            trailingBlankDecisions,
+            skipMergedReasoningStrip: compactionOff,
+            skipTrailingWhitespaceStrip: compactionOff,
         },
     );
+
+    if (canUseEmptySentinels && !compactionOff) {
+        // Observe every served pass, including defers. A newly completed assistant is
+        // recorded while it is newest, before a provider can append a blank to the
+        // rebuilt historical message. If a late blank arrives while it is still newest,
+        // refresh its choice; the newest exemption leaves those live bytes untouched.
+        const detectedCandidates = findTrailingBlankDecisionCandidates(
+            args.messages,
+            trailingBlankDecisions,
+            { refreshMessageId: newestAssistantId },
+        );
+        // A defer pass can safely establish only the newest assistant's shape: it
+        // has no cached continuation after it. Historical messages without a prior
+        // decision wait for an independent cache-busting pass rather than guessing
+        // from bytes that the provider may already have changed.
+        const candidates = isCacheBustingPass
+            ? detectedCandidates
+            : detectedCandidates.filter(([id]) => id === newestAssistantId);
+        if (candidates.length > 0) {
+            try {
+                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
+                    overwriteMessageId: newestAssistantId,
+                });
+                if (persisted) {
+                    const committed = getTrailingBlankDecisions(args.db, args.sessionId);
+                    const newlyFrozen = new Map<string, TrailingBlankDecision>();
+                    for (const [id] of candidates) {
+                        const decision = committed.get(id);
+                        if (!decision) continue;
+                        trailingBlankDecisions.set(id, decision);
+                        newlyFrozen.set(id, decision);
+                    }
+                    // Apply a new keep decision while the assistant is still newest
+                    // so whitespace becomes canonical without changing the recorded
+                    // suffix length. A strip decision remains exempt while it is live.
+                    applyFrozenTrailingBlankDecisions(
+                        args.messages,
+                        newestAssistantId,
+                        newlyFrozen,
+                    );
+                    if (isCacheBustingPass) bustedThisPass = true;
+                } else {
+                    args.passOutcome?.record("trailing-blank-decision-persistence-failure");
+                    sessionLog(
+                        args.sessionId,
+                        "trailing blank decision: persistence failed; leaving newly observed assistants intact",
+                    );
+                }
+            } catch (error) {
+                args.passOutcome?.record("trailing-blank-decision-exception");
+                sessionLog(
+                    args.sessionId,
+                    "transform failed freezing trailing blank decision:",
+                    error,
+                );
+            }
+        }
+    }
+
     sessionLog(
         args.sessionId,
         `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,
@@ -1949,6 +2183,103 @@ export async function runPostTransformPhase(
         tFinalRepresentation,
         `clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,
     );
+
+    let assertedBaseline:
+        | {
+              tags: TagEntry[];
+              protectedTags: number;
+              contentSignature: string;
+              structuralSignature: TailHygieneStructuralSignature;
+          }
+        | undefined;
+    if (args.channel1StateBySession) {
+        if (args.ctxReduceAvailability.callable && !compactionOff) {
+            try {
+                const tags = getTailHygieneTags(args.db, args.sessionId);
+                const previous = args.channel1StateBySession.get(args.sessionId);
+                const baseline = refreshTailHygieneBaseline({
+                    messages: args.messages,
+                    tags,
+                    protectedTags: args.protectedTags,
+                    cacheBusting: bustedThisPass,
+                    previous,
+                });
+                const structuralSignature = tailHygieneStructuralSignature(args.messages);
+                args.channel1StateBySession.set(args.sessionId, {
+                    ...baseline,
+                    reducedSinceRefresh:
+                        baseline.baselineGeneration !== previous?.baselineGeneration
+                            ? false
+                            : (previous?.reducedSinceRefresh ?? false),
+                    oldestReclaimableToolTags: getOldestActiveUnprotectedToolTags(
+                        args.db,
+                        args.sessionId,
+                        args.protectedTags,
+                    ),
+                });
+                try {
+                    rearmChannel2AfterMeasuredCollapse({
+                        db: args.db,
+                        sessionId: args.sessionId,
+                        baseline,
+                    });
+                } catch (error) {
+                    sessionLog(
+                        args.sessionId,
+                        "channel2 U-collapse reset failed (ignored):",
+                        error,
+                    );
+                }
+                assertedBaseline = {
+                    tags,
+                    protectedTags: args.protectedTags,
+                    contentSignature: baseline.contentSignature,
+                    structuralSignature,
+                };
+            } catch (error) {
+                const stale = args.channel1StateBySession.get(args.sessionId);
+                if (stale) {
+                    stale.evaluable = false;
+                    stale.generationInvalidated = true;
+                }
+                sessionLog(args.sessionId, "tail hygiene baseline refresh failed (held):", error);
+            }
+        } else {
+            args.channel1StateBySession.delete(args.sessionId);
+        }
+    }
+    if (assertedBaseline) {
+        try {
+            const servedSignature = tailHygieneStructuralSignature(args.messages);
+            if (
+                !sameTailHygieneStructuralSignature(
+                    assertedBaseline.structuralSignature,
+                    servedSignature,
+                )
+            ) {
+                sessionLog(
+                    args.sessionId,
+                    `ERROR [tail-hygiene-last-writer-mismatch]: served messages changed after tail-hygiene baseline refresh (expected messages=${assertedBaseline.structuralSignature.messageCount}, parts=[${assertedBaseline.structuralSignature.partCounts.join(",")}], bytes=${assertedBaseline.structuralSignature.totalBytes}; actual messages=${servedSignature.messageCount}, parts=[${servedSignature.partCounts.join(",")}], bytes=${servedSignature.totalBytes})`,
+                );
+            }
+        } catch (error) {
+            // This diagnostic must never interrupt a turn. The tail baseline still
+            // guides the nudge, and the next served pass can refresh it.
+            sessionLog(
+                args.sessionId,
+                "ERROR [tail-hygiene-last-writer-check-failed]: structural production guard failed open:",
+                error,
+            );
+        }
+        if (process.env.NODE_ENV !== "production") {
+            assertTailHygieneContentUnchanged({
+                messages: args.messages,
+                tags: assertedBaseline.tags,
+                protectedTags: assertedBaseline.protectedTags,
+                expectedSignature: assertedBaseline.contentSignature,
+            });
+        }
+    }
 
     return {
         explicitMaterializedSuccessfully,

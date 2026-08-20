@@ -1,8 +1,15 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
-import { encodeOpenCodeMessagesToCk, resolveOrdinalsForModule } from "./module-wire";
+import {
+    buildPagedModuleTransformPayloads,
+    encodeOpenCodeMessagesToCk,
+    MODULE_PAGE_MAX_BYTES,
+    resolveOrdinalsForModule,
+} from "./module-wire";
 import { setRawMessageProvider } from "./read-session-chunk";
 import type { MessageLike } from "./transform-operations";
 
@@ -31,6 +38,36 @@ describe("encodeOpenCodeMessagesToCk", () => {
             harness_id: "msg_synthetic_todo",
             synthetic: true,
         });
+    });
+
+    it("matches the module golden generated from raw OpenCode reasoning parts", () => {
+        const golden = JSON.parse(
+            readFileSync(
+                join(
+                    import.meta.dir,
+                    "../../../../../crates/mc-module/testdata/merged-reasoning-adapter-golden.json",
+                ),
+                "utf8",
+            ),
+        ) as {
+            generator_version: number;
+            cases: Array<{
+                name: string;
+                raw_messages: unknown[];
+                encoded_input: unknown[];
+            }>;
+        };
+
+        expect(golden.generator_version).toBe(1);
+        expect(golden.cases.map((fixture) => fixture.name)).toEqual([
+            "reasoning",
+            "thinking",
+            "redacted_thinking",
+            "reasoning_cache_control",
+        ]);
+        for (const fixture of golden.cases) {
+            expect(encodeOpenCodeMessagesToCk(fixture.raw_messages)).toEqual(fixture.encoded_input);
+        }
     });
 });
 
@@ -185,6 +222,38 @@ describe("resolveOrdinalsForModule provisional tails", () => {
             }
         } finally {
             result.unregister();
+        }
+    });
+});
+
+describe("buildPagedModuleTransformPayloads byte reuse", () => {
+    it("returns the first stringify length on the unpaged path", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-unpaged",
+            input: [{ mid: "m1", ordinal: 1, ck: { text: "hi" } }],
+        };
+        const pages = buildPagedModuleTransformPayloads(body);
+        expect(pages).toHaveLength(1);
+        expect(pages[0]?.page).toBe(body);
+        expect(pages[0]?.bytes).toBe(Buffer.byteLength(JSON.stringify(body)));
+    });
+
+    it("returns paging sizes that match a later stringify of each page", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-paged",
+            input: Array.from({ length: 80 }, (_, index) => ({
+                mid: `m${index}`,
+                ordinal: index + 1,
+                ck: { text: "x".repeat(8_000) },
+            })),
+        };
+        expect(Buffer.byteLength(JSON.stringify(body))).toBeGreaterThan(MODULE_PAGE_MAX_BYTES);
+        const pages = buildPagedModuleTransformPayloads(body);
+        expect(pages.length).toBeGreaterThan(1);
+        for (const { page, bytes } of pages) {
+            expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
         }
     });
 });

@@ -32,6 +32,7 @@ import * as logger from "../../shared/logger";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
@@ -42,6 +43,7 @@ import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
     __rustModeTransformTest,
+    applyNativeMessagesVerbatim,
     createRustModeTransform as createRustModeTransformImpl,
     RUST_EMERGENCY_WALL_PCT,
     RUST_FAILURE_PARK_THRESHOLD,
@@ -349,6 +351,76 @@ describe("Rust mode authority adapter", () => {
         expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
     });
 
+    it("transports the host-resolved output_reserve as Rust usable_soft", () => {
+        const resolved = deriveWindowGeometry(
+            "openai-codex",
+            "gpt-5.6-sol",
+            { context: 400_000, input: 272_000, output: 128_000 },
+            { outputReserveOverride: 16_384, harness: "opencode" },
+        );
+        const geometry = __rustModeTransformTest.transformGeometryForWire(resolved);
+
+        expect(geometry).toEqual({
+            usable_soft: 255_616,
+            usable_hard: 368_000,
+            derivation:
+                "s1-shared/context-output/context=272000/output=16384/mode=shared_upfront/usable-hard=368000",
+        });
+    });
+
+    it("transports S1 geometry and bases host preflight on the hard wall", () => {
+        const geometry = __rustModeTransformTest.transformGeometryForWire({
+            usableSoft: 128_000,
+            usableHard: 168_000,
+            geometry: "separate",
+            derivation: {
+                window: 168_000,
+                reserve: 40_000,
+                reserveSource: "output_catalog",
+                geometry: "separate",
+            },
+        });
+        expect(geometry).toEqual({
+            usable_soft: 128_000,
+            usable_hard: 168_000,
+            derivation: "s1-pre-carve/input=128000",
+        });
+        expect(
+            __rustModeTransformTest.hardWallUsagePercentage(
+                { inputTokens: 130_000, percentage: (130_000 / 128_000) * 100 },
+                geometry,
+            ),
+        ).toBeCloseTo((130_000 / 168_000) * 100);
+
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "geometry-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: {},
+            usage: { context_limit_tokens: 128_000 },
+            geometry,
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect(body.usage).toEqual({ context_limit_tokens: 128_000 });
+        expect(body.geometry).toEqual(geometry);
+    });
+
+    it("omits geometry without changing the legacy transform shape", () => {
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "legacy-geometry-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: {},
+            usage: { context_limit_tokens: 128_000 },
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect("geometry" in body).toBe(false);
+    });
+
     it("copies the resolved history budget onto the authority wire", () => {
         const body = __rustModeTransformTest.buildTransformBody({
             sessionId: "budget-wire",
@@ -361,6 +433,44 @@ describe("Rust mode authority adapter", () => {
             midTurn: false,
         });
         expect(body.history_budget_tokens).toBe(42_000);
+    });
+
+    it("gates and copies a mural payload onto the transform wire", () => {
+        const resolved = {
+            enabled: true,
+            supportsVision: true,
+            dataUrl: "data:image/png;base64,cG5n",
+            contentHash: "mural-epoch-a",
+        };
+        const mural = __rustModeTransformTest.muralInputForWire(resolved);
+        expect(mural).toEqual({
+            enabled: true,
+            supports_vision: true,
+            data_url: resolved.dataUrl,
+            content_hash: resolved.contentHash,
+        });
+        expect(
+            __rustModeTransformTest.muralInputForWire({ ...resolved, enabled: false }),
+        ).toBeUndefined();
+        expect(
+            __rustModeTransformTest.muralInputForWire({ ...resolved, supportsVision: false }),
+        ).toBeUndefined();
+        expect(
+            __rustModeTransformTest.muralInputForWire({ ...resolved, dataUrl: undefined }),
+        ).toBeUndefined();
+
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "mural-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: { mural },
+            usage: {},
+            modelKey: "anthropic/vision-model",
+            providerId: "anthropic",
+            midTurn: false,
+        });
+
+        expect(body.mural).toEqual(mural);
     });
 
     it("passes lineage-switch transport fields through opaquely", () => {
@@ -478,7 +588,7 @@ describe("Rust mode authority adapter", () => {
                 moduleElapsedMs: 8.765,
             }),
         ).toBe(
-            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
+            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 mirror_pull:0.0 compartment_mirror:0.0 other:12.3",
         );
     });
 
@@ -960,6 +1070,91 @@ describe("Rust mode authority adapter", () => {
         expect(secondOutput.messages).toEqual(native);
     });
 
+    it("forwards resolved auto-search controls, including an explicit disabled state", async () => {
+        const db = makeDb();
+        const requests: Record<string, unknown>[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requests.push(body as Record<string, unknown>);
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+
+        const enabledSession = `rust-auto-search-enabled-${Date.now()}`;
+        sessions.push(enabledSession);
+        installRawProvider(enabledSession);
+        deps.autoSearch = { enabled: true, scoreThreshold: 0.73, minPromptChars: 47 };
+        const enabledMessages = makeMessages(enabledSession);
+        await transform.run(
+            enabledSession,
+            enabledMessages,
+            { messages: enabledMessages as unknown[] },
+            makeMeta(db, enabledSession),
+        );
+
+        expect(requests.at(-1)).toEqual(
+            expect.objectContaining({
+                auto_search_enabled: true,
+                auto_search_score_threshold: 0.73,
+                auto_search_min_prompt_chars: 47,
+            }),
+        );
+
+        const disabledSession = `rust-auto-search-disabled-${Date.now()}`;
+        sessions.push(disabledSession);
+        installRawProvider(disabledSession);
+        deps.autoSearch = { enabled: false, scoreThreshold: 0.91, minPromptChars: 83 };
+        const disabledMessages = makeMessages(disabledSession);
+        await transform.run(
+            disabledSession,
+            disabledMessages,
+            { messages: disabledMessages as unknown[] },
+            makeMeta(db, disabledSession),
+        );
+
+        expect(requests.at(-1)).toEqual(
+            expect.objectContaining({
+                auto_search_enabled: false,
+                auto_search_score_threshold: 0.91,
+                auto_search_min_prompt_chars: 83,
+            }),
+        );
+    });
+
+    it("sends canonical model identity to the Rust wire for a Pi-native alias", async () => {
+        const sessionId = `rust-model-alias-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        let transformRequest: Record<string, unknown> | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") transformRequest = body as Record<string, unknown>;
+                return method === "transform"
+                    ? { native_messages: makeMessages(sessionId) }
+                    : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0].info.model = { providerID: "openai-codex", modelID: "gpt-5.6-sol" };
+
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: messages as unknown[] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(transformRequest?.model_key).toBe("openai/gpt-5.6-sol");
+        expect(transformRequest?.prompt_surface_model_key).toBe("openai/gpt-5.6-sol");
+        expect(transformRequest?.render_config).toContain("model:openai/gpt-5.6-sol");
+    });
+
     it("forwards the model-routed prompt preset and description overrides", async () => {
         const sessionId = `rust-prompt-surface-${Date.now()}`;
         sessions.push(sessionId);
@@ -979,7 +1174,18 @@ describe("Rust mode authority adapter", () => {
         deps.promptSurface = {
             default: "full",
             models: { "anthropic/opus": "light" },
+            guidance_override_path: "trusted-guidance.md",
             tool_descriptions: { ctx_search: "Search the project memory index." },
+        };
+        deps.promptSurfaceRuntime = {
+            resolveRegistration: () => ({
+                preset: "full",
+                descriptionFor: (_toolId, fullDescription) => fullDescription,
+            }),
+            resolveGuidance: () => ({
+                preset: "light",
+                primaryOverride: "## Magic Context\n\nTrusted user guidance.",
+            }),
         };
         const transform = createRustModeTransform(deps, { moduleClient });
         const messages = makeMessages(sessionId);
@@ -1000,6 +1206,12 @@ describe("Rust mode authority adapter", () => {
         expect(transformRequest?.prompt_surface_tool_descriptions).toEqual({
             ctx_search: "Search the project memory index.",
         });
+        expect(transformRequest?.prompt_surface_guidance_override).toBe(
+            "## Magic Context\n\nTrusted user guidance.",
+        );
+        expect(transformRequest?.prompt_surface_guidance_override).not.toBe(
+            deps.promptSurface.guidance_override_path,
+        );
     });
 
     it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
@@ -1115,7 +1327,47 @@ describe("Rust mode authority adapter", () => {
         ).toEqual({ title: "receiver-bound compartment" });
     });
 
-    it("sends tool_present false while availability remains provisional", async () => {
+    it("does not block transform completion on a compartment mirror backlog", async () => {
+        const sessionId = `rust-compartment-backlog-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let releaseMirror!: () => void;
+        const mirrorBacklog = new Promise<void>((resolve) => {
+            releaseMirror = resolve;
+        });
+        let mirrorCompleted = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform" ? { native_messages: [] } : { ok: true },
+            getCompartmentsAfter: async () => {
+                await mirrorBacklog;
+                mirrorCompleted = true;
+                return { max_sequence: 0, compartments: [] };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages = makeMessages(sessionId);
+        const run = transform.run(
+            sessionId,
+            messages,
+            { messages: [...messages] },
+            makeMeta(db, sessionId),
+        );
+
+        const disposition = await Promise.race([
+            run.then(() => "served" as const),
+            Bun.sleep(500).then(() => "blocked" as const),
+        ]);
+        expect(disposition).toBe("served");
+        expect(mirrorCompleted).toBe(false);
+        releaseMirror();
+        await run;
+        await Bun.sleep(0);
+        expect(mirrorCompleted).toBe(true);
+    });
+
+    it("sends fail-closed tool verdicts while availability remains provisional", async () => {
         const sessionId = `rust-availability-provisional-${Date.now()}`;
         sessions.push(sessionId);
         installAvailabilityDb(sessionId);
@@ -1145,7 +1397,7 @@ describe("Rust mode authority adapter", () => {
 
         expect(requestBodies).toHaveLength(1);
         expect(requestBodies[0]?.tool_present).toBe(false);
-        expect(requestBodies[0]).not.toHaveProperty("todo_tool_present");
+        expect(requestBodies[0]?.todo_tool_present).toBe(false);
     });
 
     it("sends a frozen disabled todowrite verdict on the transform wire", async () => {
@@ -1172,6 +1424,45 @@ describe("Rust mode authority adapter", () => {
             makeMeta(db, sessionId),
         );
 
+        expect(requestBody?.todo_tool_present).toBe(false);
+    });
+
+    it("sends the combined todowrite map and live-permission verdict", async () => {
+        const sessionId = `rust-todo-permission-denied-${Date.now()}`;
+        sessions.push(sessionId);
+        installAvailabilityDb(sessionId, {});
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let requestBody: Record<string, unknown> | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requestBody = body as Record<string, unknown>;
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const agents = mock(async () => ({
+            data: [{ name: "build", permission: { todowrite: "deny" } }],
+        }));
+        deps.client = {
+            app: { agents },
+            session: {
+                get: async () => ({ data: { agent: "build", directory: "/tmp/project" } }),
+            },
+        } as never;
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0]!.info.tools = {};
+        (messages[0]!.info as { agent?: string }).agent = "build";
+
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: messages as unknown[] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(agents).toHaveBeenCalledTimes(1);
         expect(requestBody?.todo_tool_present).toBe(false);
     });
 
@@ -1331,6 +1622,166 @@ describe("Rust mode authority adapter", () => {
         expect(transformBodies.at(-1)?.todo_tool_present).toBe(true);
         expect(capabilityInvalidations).toBe(1);
         expect(output.messages).toEqual(native);
+    });
+
+    it("restarts a paged transform series after an attempt mismatch", async () => {
+        const sessionId = `rust-series-restart-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const native = [{ role: "assistant", parts: [] }];
+        const transformBodies: Array<Record<string, unknown>> = [];
+        let failedPageId: unknown;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformBodies.push(page);
+                if (page.transform_page_index === 1 && failedPageId === undefined) {
+                    failedPageId = page.transform_page_id;
+                    throw Object.assign(
+                        new Error(
+                            "transform page generation or envelope changed during collection",
+                        ),
+                        { code: "authority_transform_page_attempt_mismatch" },
+                    );
+                }
+                return page.transform_page_complete === true
+                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    : { staged: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: messages as unknown[] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+            const seriesStarts = transformBodies.filter((page) => page.transform_page_index === 0);
+            const pageIds = new Set(seriesStarts.map((page) => page.transform_page_id));
+            expect(seriesStarts).toHaveLength(2);
+            expect(pageIds.size).toBe(2);
+            expect(failedPageId).toBe(seriesStarts[0]?.transform_page_id);
+            expect(seriesStarts[1]?.transform_page_id).not.toBe(seriesStarts[0]?.transform_page_id);
+            expect(output.messages).toEqual(native);
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            expect(logged).toContain(
+                `transform_series_restart reason=attempt_mismatch pages=${seriesStarts[0]?.transform_page_total} at_page=1`,
+            );
+            expect(logged.some((message) => message.includes("served_from=transform"))).toBe(true);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("restarts a paged transform series after a mid-series reconnect", async () => {
+        const sessionId = `rust-series-reconnect-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const native = [{ role: "assistant", parts: [] }];
+        const transformCalls: Array<{
+            body: Record<string, unknown>;
+            generationSensitive: boolean | undefined;
+        }> = [];
+        let reconnectReported = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body, generationSensitive }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformCalls.push({ body: page, generationSensitive });
+                if (page.transform_page_index === 1 && !reconnectReported) {
+                    reconnectReported = true;
+                    return {
+                        transport_status: "connection_generation_changed",
+                        previous_generation: 3,
+                        current_generation: 4,
+                    };
+                }
+                return page.transform_page_complete === true
+                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    : { staged: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: messages as unknown[] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+            const seriesStarts = transformCalls.filter(
+                ({ body }) => body.transform_page_index === 0,
+            );
+            expect(seriesStarts).toHaveLength(2);
+            expect(new Set(seriesStarts.map(({ body }) => body.transform_page_id)).size).toBe(2);
+            expect(
+                transformCalls.find(({ body }) => body.transform_page_index === 1)
+                    ?.generationSensitive,
+            ).toBe(true);
+            expect(output.messages).toEqual(native);
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            expect(logged).toContain(
+                `transform_series_restart reason=reconnect pages=${seriesStarts[0]?.body.transform_page_total} at_page=1`,
+            );
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("falls through after a second paged transform series mismatch", async () => {
+        const sessionId = `rust-series-restart-bound-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const transformBodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformBodies.push(page);
+                if (page.transform_page_index === 1) {
+                    throw Object.assign(new Error("attempt mismatch"), {
+                        code: "authority_transform_page_attempt_mismatch",
+                    });
+                }
+                return { staged: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: [] as unknown[] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+            const seriesStarts = transformBodies.filter((page) => page.transform_page_index === 0);
+            expect(seriesStarts).toHaveLength(2);
+            expect(new Set(seriesStarts.map((page) => page.transform_page_id)).size).toBe(2);
+            expect(output.messages).toEqual(messages);
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            expect(
+                logged.filter((message) => message.startsWith("transform_series_restart")),
+            ).toHaveLength(1);
+            expect(logged.some((message) => message.startsWith("rust transform failed"))).toBe(
+                true,
+            );
+        } finally {
+            logSpy.mockRestore();
+        }
     });
 
     it("re-primes all ordinal memo state after a durable message removal", async () => {
@@ -2727,6 +3178,98 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
                 )
                 .run(projectPath),
         ).toThrow("managed by the Rust module");
+    });
+});
+
+describe("native output delta", () => {
+    it("retries with full arrays when a delta response omits native content", async () => {
+        const sessionId = `rust-native-omission-retry-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const transformBodies: Array<Record<string, unknown>> = [];
+        let healedNative: unknown[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                const request = body as Record<string, unknown>;
+                transformBodies.push(request);
+                if (transformBodies.length === 1) {
+                    return { native_messages: structuredClone(request.native_messages) };
+                }
+                if (request.tail_delta) return { status: "ok", served_from: "transform" };
+                return { native_messages: structuredClone(healedNative) };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const initial = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: [...initial] },
+            makeMeta(db, sessionId),
+        );
+
+        const changed = structuredClone(initial);
+        changed[0]!.parts = [{ type: "text", text: "changed after warm prime" }];
+        healedNative = structuredClone(changed);
+        const output = { messages: [...changed] as unknown[] };
+        await transform.run(sessionId, changed, output, makeMeta(db, sessionId));
+
+        expect(transformBodies).toHaveLength(3);
+        expect(transformBodies[1]?.tail_delta).toEqual({
+            after: transformBodies[0]?.full_array_fingerprint,
+            replace_from: 0,
+            native_replace_from: 0,
+        });
+        expect(transformBodies[2]?.tail_delta).toBeUndefined();
+        expect(transformBodies[2]?.native_messages).toEqual(changed);
+        expect(output.messages).toEqual(healedNative);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+    });
+
+    it("reconstructs the exact acknowledged prefix plus replacement suffix", () => {
+        const previous = [
+            { info: { id: "m0" }, parts: [{ type: "text", text: "stable" }] },
+            { info: { id: "m1" }, parts: [{ type: "text", text: "old" }] },
+        ];
+        const suffix = [
+            { info: { id: "m1" }, parts: [{ type: "text", text: "new" }] },
+            { info: { id: "m2" }, parts: [{ type: "text", text: "tail" }] },
+        ];
+        const output = { messages: [] as unknown[] };
+
+        const applied = applyNativeMessagesVerbatim(
+            output,
+            {
+                native_messages_delta: {
+                    after: "fp-before",
+                    replace_from: 1,
+                    messages: suffix,
+                },
+            },
+            { messages: previous, fingerprint: "fp-before" },
+        );
+
+        expect(applied).toEqual([previous[0], ...suffix]);
+        expect(output.messages).toEqual(applied);
+        expect(applied[0]).toBe(previous[0]);
+    });
+
+    it("rejects a delta whose prefix fingerprint is not acknowledged", () => {
+        expect(() =>
+            applyNativeMessagesVerbatim(
+                { messages: [] },
+                {
+                    native_messages_delta: {
+                        after: "stale",
+                        replace_from: 1,
+                        messages: [],
+                    },
+                },
+                { messages: [{ info: { id: "m0" } }], fingerprint: "current" },
+            ),
+        ).toThrow("did not match the acknowledged output");
     });
 });
 

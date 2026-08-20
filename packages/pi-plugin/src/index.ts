@@ -175,6 +175,7 @@ import {
 import {
 	buildMagicContextBlock,
 	clearPiSystemPromptSession,
+	composeMagicContextSystemPrompt,
 	processSystemPromptForCache,
 } from "./system-prompt";
 import { withTimeout } from "./timeout";
@@ -797,10 +798,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 		const migration = getMigrationOnOpenRefusal();
 		const blockingProcesses =
-			migration?.serverPids.map((pid) => ({
-				harness: "OpenCode server",
-				pid,
-			})) ?? [];
+			migration?.blockingProcesses ??
+			migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
+			[];
 		const fence = getSchemaFenceRejection();
 		const reason: FailClosedReason =
 			migration && blockingProcesses.length > 0
@@ -1823,9 +1823,10 @@ async function startPiMagicContextRuntime(
 			// composed string so even sessions with no data block (e.g.
 			// memories disabled, no docs, no key files) still get
 			// sticky-date freezing and hash-change tracking.
-			const composedPrompt = block
-				? `${event.systemPrompt}\n\n${block}`
-				: event.systemPrompt;
+			const composedPrompt = composeMagicContextSystemPrompt(
+				event.systemPrompt,
+				block,
+			);
 
 			if (!sessionId) {
 				// No session id yet — return the composed prompt without
@@ -1925,13 +1926,15 @@ async function startPiMagicContextRuntime(
 		// Channel 2 (ceiling) nudge delivery — the Pi analog of OpenCode's
 		// event-handler delivery on terminal message.updated. The pipeline
 		// records a `pending` intent near the threshold; deliver it here at the
-		// turn boundary via sendUserMessage(followUp). Internally CAS-gated to
-		// one delivery per session lifetime, and no-ops unless `pending`.
+		// turn boundary via sendMessage(nextTurn). The synthetic message rides
+		// with the next real user turn instead of starting a competing turn.
+		// Internally CAS-gated to one delivery per tail-reset cycle and no-ops
+		// unless `pending`.
 		// Fire-and-forget; never block agent_end.
 		//
 		// Deliver ONLY on a clean final stop. Pi emits agent_end for error /
 		// aborted responses and for retry attempts too (agent-loop); delivering
-		// on those would inject the follow-up mid-retry and burn the one-shot cap
+		// on those would inject the follow-up mid-retry and consume the cycle
 		// before the turn actually completed. OpenCode's equivalent gates on
 		// finish === "stop". Mirror that with the final assistant's stopReason.
 		try {
@@ -2061,18 +2064,18 @@ async function startPiMagicContextRuntime(
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
-			// Channel 2 mid-turn delivery: a pending ceiling intent steers a
-			// queued user message into the NEXT STEP of the in-flight turn so
-			// the agent is warned while the pile is still growing (agent_end
-			// stays as the idle fallback). No-ops unless pending + revalidated.
+			// Channel 2 mid-turn delivery: queue a pending ceiling intent for the
+			// next real user turn. It must not steer the active turn or spawn a
+			// follow-up that races an external prompt. No-ops unless pending and
+			// revalidated; agent_end stays as the fallback delivery site.
 			if (compactionOff) return;
-			if (db) maybeDeliverChannel2Pi(pi, db, sessionId, "steer");
 			const block = maybeChannel1ReminderForToolResult({
 				db,
 				sessionId,
 				toolName: event.toolName,
 				content: event.content,
 			});
+			if (db) maybeDeliverChannel2Pi(pi, db, sessionId);
 			if (!block) return;
 			return { content: [...event.content, block] };
 		} catch (err) {

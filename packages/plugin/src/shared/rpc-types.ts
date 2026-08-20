@@ -7,6 +7,21 @@ import type {
     DreamTaskBacklogMap,
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
+import type { LoggerDiagnostics } from "./logger";
+
+export interface TailHygieneStatus {
+    /** Tokens in active, non-protected tail content that the agent can reclaim. */
+    u: number;
+    /** Tokens in rendered-tail content eligible for hygiene accounting in the same scan. */
+    t: number;
+    /** Reclaimable-to-eligible token ratio, clamped to 0–1 and shared by both nudge mechanisms. */
+    severity: number;
+    /** False until a fresh scan runs after existing tail content changes, preventing stale measurements. */
+    evaluable: boolean;
+    generationInvalidated: boolean;
+    baselineGeneration: number;
+    computedAt: number;
+}
 
 export interface SidebarSnapshot {
     sessionId: string;
@@ -77,6 +92,8 @@ export interface SidebarSnapshot {
      * shows this as "Tool Definitions".
      */
     toolDefinitionTokens: number;
+    /** Persisted reclaimable (U) and eligible (T) token counts used by both nudge mechanisms. */
+    tailHygiene?: TailHygieneStatus;
     /**
      * Effective execute-threshold percentage for this session's active model,
      * after per-model resolution and the tokens→percentage conversion (when
@@ -135,6 +152,17 @@ export interface StatusDetail extends SidebarSnapshot {
     isSubagent: boolean;
     pendingOps: Array<{ tagId: number; operation: string }>;
     contextLimit: number;
+    windowGeometry?: {
+        usableSoft: number;
+        usableHard: number;
+        geometry: "shared_upfront" | "shared_truncating" | "separate";
+        derivation: {
+            window: number;
+            reserve: number;
+            reserveSource: "output_catalog" | "output_config" | "wall_margin" | "none";
+            geometry: "shared_upfront" | "shared_truncating" | "separate";
+        };
+    };
     /**
      * Parsed cache TTL in ms. -1 = never expires (cacheTtl "never"; Infinity
      * cannot ride JSON-RPC and 0 would be indistinguishable from unset). The
@@ -170,6 +198,8 @@ export interface StatusDetail extends SidebarSnapshot {
     toastDurationMs: number;
     /** One-line status data for the experimental memory mural. */
     mural?: { present: boolean; ageMs: number | null };
+    /** Runtime logger write failures observed by this plugin process. */
+    loggerDiagnostics: LoggerDiagnostics;
     /**
      * Stable storage-version probe: "which schema is the DB at, which fence does
      * this binary carry". Field names are deliberately snake_case, mirroring the

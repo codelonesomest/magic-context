@@ -12,11 +12,15 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use mc_store::{McStore, McStoreError, MemoryRevision};
+use sha2::{Digest, Sha256};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
-use crate::decay_render::DecayRenderCompartment;
+use crate::decay_render::{extract_m0_block, DecayRenderCompartment};
 use crate::memory_render::{render_m0, render_memory_line, workspace_source_names, M0Inputs};
 use crate::project_docs::read_project_docs_canonical;
+
+pub(crate) const MEMORY_MURAL_BLOCK: &str =
+    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
 
 /// Why composing the HARD m0 from the store failed.
 #[derive(Debug)]
@@ -48,6 +52,8 @@ impl From<McStoreError> for M0ComposeError {
 pub struct M0Composition {
     /// The frozen m0 baseline bytes (docs + profile + decayed compartments + memories).
     pub m0_bytes: String,
+    /// Optional image block appended after the m0 text block on the OpenCode wire.
+    pub mural: Option<M0MuralBlock>,
     /// The last raw message id covered by m0 — the cache/revert anchor. Empty when the
     /// session has no compartments (nothing summarized → no covered prefix → the whole
     /// live array is the tail).
@@ -75,6 +81,24 @@ pub struct M0Composition {
     /// HARD trigger — see `M0ContentEpoch`). Records which docs version is in m0 so the
     /// next natural HARD re-reads current docs.
     pub docs_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct M0MuralInput {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
+    #[serde(default)]
+    pub data_url: Option<String>,
+    #[serde(default, alias = "content_epoch")]
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct M0MuralBlock {
+    pub data_url: String,
+    pub content_hash: String,
 }
 
 /// The fixed expiry/budget inputs for an m0 compose, threaded from the caller so the
@@ -107,6 +131,30 @@ pub struct M0ComposeInputs<'a> {
     pub inject_docs: bool,
     /// Gate temporal heading dates at render time, including rows persisted by a prior pass.
     pub temporal_awareness: bool,
+    /// OpenCode-only image bytes already resolved and capability-gated by the host.
+    pub mural: Option<&'a M0MuralInput>,
+}
+
+pub(crate) fn resolved_mural(input: Option<&M0MuralInput>) -> Option<M0MuralBlock> {
+    let input = input?;
+    if !input.enabled || !input.supports_vision {
+        return None;
+    }
+    let data_url = input
+        .data_url
+        .as_deref()
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let content_hash = input
+        .content_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(data_url.as_bytes())));
+    Some(M0MuralBlock {
+        data_url,
+        content_hash,
+    })
 }
 
 fn memory_selection_order(
@@ -277,6 +325,47 @@ pub(crate) fn trim_user_profile_to_budget(
         .collect()
 }
 
+/// Count only the rendered `<session-history>` slice, matching the history budget's scope.
+fn history_slice_tokens(m0_text: &str, estimate_tokens: impl Fn(&str) -> usize) -> usize {
+    extract_m0_block(m0_text, "session-history").map_or(0, |slice| estimate_tokens(&slice))
+}
+
+/// Render m0 and, when the history slice overshoots, tighten decay pressure at most three times.
+/// The capped final render is retained even when its history still exceeds the slack threshold.
+fn render_m0_with_decay_pressure_retry(
+    inputs: &M0Inputs<'_>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> String {
+    let render = |decay_pressure_multiplier| {
+        render_m0(
+            &M0Inputs {
+                project_docs: inputs.project_docs,
+                user_profile: inputs.user_profile,
+                covered_system_messages: inputs.covered_system_messages,
+                compartments: inputs.compartments,
+                memories: inputs.memories,
+                source_name_by_id: inputs.source_name_by_id,
+                history_budget_tokens: inputs.history_budget_tokens,
+                decay_pressure_multiplier,
+            },
+            estimate_tokens,
+        )
+    };
+    let mut decay_pressure_multiplier = 1.0;
+    let mut m0_bytes = render(decay_pressure_multiplier);
+    let mut attempts = 0;
+    while inputs.history_budget_tokens > 0.0
+        && history_slice_tokens(&m0_bytes, estimate_tokens) as f64
+            > inputs.history_budget_tokens * 1.05
+        && attempts < 3
+    {
+        decay_pressure_multiplier *= 1.15;
+        m0_bytes = render(decay_pressure_multiplier);
+        attempts += 1;
+    }
+    m0_bytes
+}
+
 /// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
 /// token estimator used for every injection budget and the history fit.
 pub fn compose_m0_from_store(
@@ -362,7 +451,8 @@ pub fn compose_m0_from_store(
             rendered
         })
         .collect();
-    let m0_bytes = render_m0(
+    let mural = resolved_mural(inputs.mural);
+    let mut m0_bytes = render_m0_with_decay_pressure_retry(
         &M0Inputs {
             project_docs: &docs.rendered_block,
             user_profile: &user_profile,
@@ -375,9 +465,14 @@ pub fn compose_m0_from_store(
         },
         estimate_tokens,
     );
+    if mural.is_some() {
+        m0_bytes.push_str("\n\n");
+        m0_bytes.push_str(MEMORY_MURAL_BLOCK);
+    }
 
     Ok(M0Composition {
         m0_bytes,
+        mural,
         boundary_id,
         coverage_ordinal,
         first_covered_ordinal,
@@ -415,6 +510,40 @@ mod tests {
     }
 
     #[test]
+    fn mural_requires_enabled_vision_and_data_url() {
+        let enabled = M0MuralInput {
+            enabled: true,
+            supports_vision: true,
+            data_url: Some("data:image/png;base64,cG5n".to_string()),
+            content_hash: Some("mural-epoch-a".to_string()),
+        };
+        assert_eq!(
+            resolved_mural(Some(&enabled)),
+            Some(M0MuralBlock {
+                data_url: "data:image/png;base64,cG5n".to_string(),
+                content_hash: "mural-epoch-a".to_string(),
+            })
+        );
+
+        for disabled in [
+            M0MuralInput {
+                enabled: false,
+                ..enabled.clone()
+            },
+            M0MuralInput {
+                supports_vision: false,
+                ..enabled.clone()
+            },
+            M0MuralInput {
+                data_url: None,
+                ..enabled.clone()
+            },
+        ] {
+            assert!(resolved_mural(Some(&disabled)).is_none());
+        }
+    }
+
+    #[test]
     fn composes_m0_from_compartments_with_coverage_anchor() {
         let fixture = FixtureBuilder::store();
         let dir = &fixture.dir;
@@ -439,6 +568,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -471,6 +601,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: false,
             temporal_awareness: true,
+            mural: None,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert!(!composed.m0_bytes.contains("secret docs"));
@@ -498,6 +629,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -539,6 +671,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
 
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
@@ -574,10 +707,290 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
         assert_eq!(composed.boundary_id, "m30");
+    }
+
+    fn pressure_compartments() -> Vec<StoredCompartment> {
+        (1..=40).map(pressure_comp).collect()
+    }
+
+    fn pressure_comp(seq: i64) -> StoredCompartment {
+        StoredCompartment {
+            sequence: seq,
+            start_message: seq,
+            end_message: seq,
+            end_message_id: format!("m{seq}"),
+            title: format!("Pressure {seq}"),
+            content: format!("legacy {seq}"),
+            p1: Some(format!("P1 {seq} {}", "full ".repeat(40))),
+            p2: Some(format!("P2 {seq} {}", "medium ".repeat(12))),
+            p3: Some(format!("P3 {seq} {}", "brief ".repeat(4))),
+            p4: Some(format!("P4 {seq}")),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn retries_decay_pressure_when_history_slice_over_budget() {
+        use std::cell::Cell;
+
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project_dir = fixture.dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let compartments = pressure_compartments();
+        store
+            .replace_compartments("pressure", &compartments)
+            .unwrap();
+        let inputs = M0ComposeInputs {
+            session_id: "pressure",
+            project_path: "git:pressure",
+            project_directory: project_dir.to_str().unwrap(),
+            now_ms: 0,
+            history_budget_tokens: 300.0,
+            covered_system_messages: &[],
+            memory_enabled: false,
+            memory_budget_tokens: 0.0,
+            user_profile_budget_tokens: 0.0,
+            inject_docs: false,
+            temporal_awareness: true,
+            mural: None,
+        };
+        let decay_compartments = compartments
+            .iter()
+            .map(DecayRenderCompartment::from)
+            .collect::<Vec<_>>();
+        let baseline = render_m0(
+            &M0Inputs {
+                project_docs: "",
+                user_profile: &[],
+                covered_system_messages: &[],
+                compartments: &decay_compartments,
+                memories: &[],
+                source_name_by_id: &HashMap::new(),
+                history_budget_tokens: inputs.history_budget_tokens,
+                decay_pressure_multiplier: 1.0,
+            },
+            no_estimate,
+        );
+        let history_measurements = Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                history_measurements.set(history_measurements.get() + 1);
+                1_000
+            } else {
+                0
+            }
+        };
+
+        let composed = compose_m0_from_store(store, &inputs, estimator).unwrap();
+
+        assert_eq!(
+            history_measurements.get(),
+            4,
+            "one initial render plus the three bounded retries"
+        );
+        assert!(
+            composed.m0_bytes.len() < baseline.len(),
+            "retry pressure must select lower tiers than the initial render"
+        );
+    }
+
+    fn pressure_render_compartments() -> Vec<DecayRenderCompartment> {
+        let stored = pressure_compartments();
+        stored.iter().map(DecayRenderCompartment::from).collect()
+    }
+
+    #[test]
+    fn exact_history_slack_boundary_does_not_retry() {
+        use std::cell::Cell;
+
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: 300.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        let baseline = render_m0(&inputs, no_estimate);
+        let history_measurements = Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                history_measurements.set(history_measurements.get() + 1);
+                315
+            } else {
+                0
+            }
+        };
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, estimator);
+
+        assert_eq!(history_measurements.get(), 1, "315 is exactly 1.05 × 300");
+        assert_eq!(
+            rendered, baseline,
+            "the retry gate is strictly greater-than"
+        );
+    }
+
+    #[test]
+    fn zero_history_budget_skips_retry_measurement() {
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: 0.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        let baseline = render_m0(&inputs, no_estimate);
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, |_| {
+            panic!("zero budget must not measure the history slice")
+        });
+
+        assert_eq!(rendered, baseline);
+    }
+
+    #[test]
+    fn retry_fixture_requires_two_pressure_bumps() {
+        use std::cell::Cell;
+
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: 300.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        let history_measurements = Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                let measurement = history_measurements.get() + 1;
+                history_measurements.set(measurement);
+                if measurement <= 2 {
+                    1_000
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, estimator);
+        let expected = render_m0(
+            &M0Inputs {
+                decay_pressure_multiplier: 1.15 * 1.15,
+                ..inputs
+            },
+            no_estimate,
+        );
+
+        assert_eq!(
+            history_measurements.get(),
+            3,
+            "the fixture must take two retries"
+        );
+        assert_eq!(rendered, expected, "each retry multiplies pressure by 1.15");
+    }
+
+    #[test]
+    fn ts_retry_fixture_converges_to_the_same_tier_demotions() {
+        #[derive(serde::Deserialize)]
+        struct RetryFixture {
+            budget: f64,
+            attempts: usize,
+            tier_counts: [usize; 5],
+            m0_sha256: String,
+        }
+
+        let fixture: RetryFixture =
+            serde_json::from_str(include_str!("../testdata/m0-decay-pressure-retry.json"))
+                .expect("parse TS m0 retry fixture");
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: fixture.budget,
+            decay_pressure_multiplier: 1.0,
+        };
+        let history_measurements = std::cell::Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                history_measurements.set(history_measurements.get() + 1);
+            }
+            mc_tokenizer::estimate_tokens(text)
+        };
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, estimator);
+        let history = extract_m0_block(&rendered, "session-history").expect("history slice");
+        let body = history
+            .strip_prefix("<session-history>\n")
+            .and_then(|value| value.strip_suffix("\n</session-history>"))
+            .unwrap_or("");
+        let sections = if body.is_empty() {
+            Vec::new()
+        } else {
+            body.split("\n\n").collect::<Vec<_>>()
+        };
+        let mut tier_counts = [0usize; 5];
+        for compartment in &compartments {
+            let heading = format!(
+                "## {}-{}",
+                compartment.start_message, compartment.end_message
+            );
+            let section = sections
+                .iter()
+                .find(|section| section.starts_with(&heading))
+                .copied();
+            let tier = (1..=5u8)
+                .find(|tier| {
+                    crate::decay_render::render_compartment_at_tier(compartment, *tier).as_str()
+                        == section.unwrap_or("")
+                })
+                .unwrap_or(5);
+            tier_counts[tier as usize - 1] += 1;
+        }
+
+        assert_eq!(
+            history_measurements.get(),
+            fixture.attempts + 1,
+            "the TS fixture's history slice must drive the same retry count"
+        );
+        assert_eq!(tier_counts, fixture.tier_counts);
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(rendered.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hash, fixture.m0_sha256,
+            "m0 bytes drift from the TS fixture"
+        );
     }
 
     #[test]
@@ -603,6 +1016,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let a = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         let b = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();

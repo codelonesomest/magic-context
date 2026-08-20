@@ -172,6 +172,26 @@ describe("applyForwardPressureFloor", () => {
 	});
 });
 
+describe("Pi hard cache expiry", () => {
+	const { isPiHardCacheExpired } = contextHandlerInternals;
+
+	it("defers rather than hard-folds at the exact TTL boundary", () => {
+		const lastResponseTime = 1_700_000_000_000;
+		const ttlMs = 5 * 60 * 1_000;
+
+		expect(
+			isPiHardCacheExpired(lastResponseTime, ttlMs, lastResponseTime + ttlMs),
+		).toBe(false);
+		expect(
+			isPiHardCacheExpired(
+				lastResponseTime,
+				ttlMs,
+				lastResponseTime + ttlMs + 1,
+			),
+		).toBe(true);
+	});
+});
+
 describe("stable tag identity reuse window", () => {
 	it("contains only real ids from the latest successful pass", () => {
 		const sessionId = "ses-reuse-window";
@@ -1054,18 +1074,83 @@ describe("registerPiContextHandler", () => {
 		clearAutoSearchForPiSession("ses-sticky-context");
 	});
 
+	it("does not reset Pi model-specific state when canonical and native alias spellings flip", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-model-alias-switch";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const baseContext = {
+				...fakeContext(sessionId),
+				model: { provider: "openai", id: "gpt-5.6-sol" },
+			};
+
+			// Record the initial model before populating session metadata; only a
+			// genuine model change may clear this metadata.
+			recordPiLiveModel(sessionId, "openai/gpt-5.6-sol");
+			await handler(
+				{ messages: [userMessage("warm", 1)] as never[] },
+				baseContext as never,
+			);
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 61,
+				lastInputTokens: 61_000,
+				clearedReasoningThroughTag: 7,
+			});
+			incrementHistorianFailure(db, sessionId, "retain across alias flip");
+			recordOverflowDetected(db, sessionId, 64_000, "openai/gpt-5.6-sol");
+
+			await handler({ messages: [userMessage("native alias", 2)] as never[] }, {
+				...baseContext,
+				model: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			} as never);
+			let meta = getOrCreateSessionMeta(db, sessionId);
+			expect(meta.clearedReasoningThroughTag).toBe(7);
+			expect(
+				getHistorianFailureState(db, sessionId).failureCount,
+			).toBeGreaterThan(0);
+			expect(getOverflowState(db, sessionId).detectedContextLimit).toBe(64_000);
+
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 62,
+				lastInputTokens: 62_000,
+				clearedReasoningThroughTag: 8,
+			});
+			await handler(
+				{ messages: [userMessage("canonical alias", 3)] as never[] },
+				baseContext as never,
+			);
+			meta = getOrCreateSessionMeta(db, sessionId);
+			expect(meta.clearedReasoningThroughTag).toBe(8);
+			expect(
+				getHistorianFailureState(db, sessionId).failureCount,
+			).toBeGreaterThan(0);
+			expect(getOverflowState(db, sessionId).detectedContextLimit).toBe(64_000);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("evicts the least-recently-tracked session's per-session caches past the cap", () => {
 		// Register a victim session with observable per-session state, then track
 		// >100 newer sessions so the victim is evicted via clearContextHandlerSession.
 		const victim = "ses-evict-victim";
 		setPiChannel1Baseline(victim, {
-			tailToolTokens: 1,
-			historyBudgetTokens: 0,
-			contextLimit: 0,
-			executeThresholdPercentage: 65,
-			lastInputTokens: 0,
-			turnToolTokens: 0,
-			usableTokens: 0,
+			baselineU: 0,
+			baselineT: 0,
+			turnDeltaU: 0,
+			turnDeltaT: 0,
+			baselineGeneration: 1,
+			computedAt: 1,
+			evaluable: true,
+			generationInvalidated: false,
+			baselineParts: [],
+			contentSignature: "fixture",
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [],
 		});
@@ -1498,6 +1583,71 @@ describe("registerPiContextHandler", () => {
 				getTagsBySession(db, "ses-context").map((tag) => tag.type),
 			).toEqual(["message", "message", "tool", "message"]);
 		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("replays a queued-pending-op defer pass byte-identically without a pending-ops read", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-pending-read-gate";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				scheduler: { executeThresholdPercentage: 80 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const runDeferPass = async () => {
+				const messages = [
+					userMessage("keep user", 1),
+					assistantMessage("queued drop stays pending", 2),
+				] as never[];
+				return handler(
+					{ messages },
+					fakeContext(
+						sessionId,
+						process.cwd(),
+						["entry-user", "entry-assistant"],
+						messages as never,
+					) as never,
+				);
+			};
+
+			await runDeferPass();
+			const baseline = await runDeferPass();
+			const baselineBytes = JSON.stringify(baseline.messages);
+			const pendingTag = getTagsBySession(db, sessionId).find(
+				(tag) => tag.type === "message" && tag.tagNumber === 2,
+			);
+			if (!pendingTag) throw new Error("expected assistant tag to queue");
+			queuePendingOp(db, sessionId, pendingTag.tagNumber, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now(),
+				cacheTtl: "59m",
+			});
+
+			const originalPrepare = db.prepare.bind(db);
+			let pendingOpsReads = 0;
+			db.prepare = ((sql: string) => {
+				if (sql.includes("FROM pending_ops")) pendingOpsReads += 1;
+				return originalPrepare(sql);
+			}) as typeof db.prepare;
+			let queued: { messages: never[] };
+			try {
+				queued = await runDeferPass();
+			} finally {
+				db.prepare = originalPrepare as typeof db.prepare;
+			}
+
+			expect(JSON.stringify(queued.messages)).toBe(baselineBytes);
+			expect(pendingOpsReads).toBe(0);
+			expect(getPendingOps(db, sessionId)).toHaveLength(1);
+		} finally {
+			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
 	});
@@ -2187,6 +2337,21 @@ describe("registerPiContextHandler", () => {
 				userMessage("next request", 4),
 				assistantMessage("newer answer", 5),
 				userMessage("latest request", 6),
+				assistantToolCall("reduce-2", "ctx_reduce", {}, 7),
+				{
+					...toolResultMessage("reduce-2", "reduced two", 8),
+					toolName: "ctx_reduce",
+				},
+				assistantToolCall("reduce-3", "ctx_reduce", {}, 9),
+				{
+					...toolResultMessage("reduce-3", "reduced three", 10),
+					toolName: "ctx_reduce",
+				},
+				assistantToolCall("reduce-4", "ctx_reduce", {}, 11),
+				{
+					...toolResultMessage("reduce-4", "reduced four", 12),
+					toolName: "ctx_reduce",
+				},
 			] as never[];
 		const entryIds = [
 			"entry-1",
@@ -2195,6 +2360,12 @@ describe("registerPiContextHandler", () => {
 			"entry-4",
 			"entry-5",
 			"entry-6",
+			"entry-reduce-2-owner",
+			"entry-reduce-2-result",
+			"entry-reduce-3-owner",
+			"entry-reduce-3-result",
+			"entry-reduce-4-owner",
+			"entry-reduce-4-result",
 		];
 
 		async function runProviderScenario(
@@ -3565,7 +3736,7 @@ describe("registerPiContextHandler", () => {
 			closeQuietly(db);
 		}
 	});
-	describe("known m[0] hard-fold folds the execute pass in", () => {
+	describe("executed m[0] hard-fold folds the execute pass in", () => {
 		const BASE_MODEL = "anthropic/opus";
 		const HARD_MODEL = "anthropic/sonnet";
 		const BASE_SYSTEM_HASH = "sys-v1";
@@ -3606,7 +3777,10 @@ describe("registerPiContextHandler", () => {
 				db,
 				protectedTags: 0,
 				heuristics: {},
-				injection: { injectionBudgetTokens: 10_000 },
+				injection: {
+					injectionBudgetTokens: 10_000,
+					muralEnabled: true,
+				},
 				scheduler: { executeThresholdPercentage: 80 },
 			});
 			const handler = fake.handlers.get("context") as (
@@ -3638,8 +3812,20 @@ describe("registerPiContextHandler", () => {
 		it("drains queued pending ops on a DEFER scheduler pass when m[0] HARD-folds", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-hardfold-drain";
+			const gateSnapshots: Array<{
+				foldDue: boolean;
+				foldExecuted: boolean;
+				shouldApplyPendingOps: boolean;
+				shouldRunHeuristics: boolean;
+				shouldRunReasoningCleanup: boolean;
+			}> = [];
+			const restoreObserver =
+				contextHandlerInternals.setMutationGateObserverForTests((snapshot) => {
+					gateSnapshots.push(snapshot);
+				});
 			try {
 				const { handler, toolTagNumber } = await primeBaseline(db, sessionId);
+				gateSnapshots.length = 0;
 				recordPiLiveModel(sessionId, HARD_MODEL);
 
 				const secondMessages = buildMessages();
@@ -3648,6 +3834,15 @@ describe("registerPiContextHandler", () => {
 					contextFor(sessionId, secondMessages),
 				);
 
+				expect(gateSnapshots).toEqual([
+					{
+						foldDue: true,
+						foldExecuted: true,
+						shouldApplyPendingOps: true,
+						shouldRunHeuristics: true,
+						shouldRunReasoningCleanup: true,
+					},
+				]);
 				expect(
 					getTagsBySession(db, sessionId).find(
 						(tag) => tag.tagNumber === toolTagNumber,
@@ -3655,12 +3850,79 @@ describe("registerPiContextHandler", () => {
 				).toBe("dropped");
 				expect(getPendingOps(db, sessionId)).toHaveLength(0);
 			} finally {
+				restoreObserver();
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
 			}
 		});
 
-		it("leaves queued drops untouched on a plain DEFER pass with unchanged markers", async () => {
+		it("keeps every mutation gate closed when a due fold is suppressed", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-hardfold-suppressed";
+			const gateSnapshots: Array<{
+				foldDue: boolean;
+				foldExecuted: boolean;
+				shouldApplyPendingOps: boolean;
+				shouldRunHeuristics: boolean;
+				shouldRunReasoningCleanup: boolean;
+			}> = [];
+			let restoreInjection = () => {};
+			const restoreObserver =
+				contextHandlerInternals.setMutationGateObserverForTests((snapshot) => {
+					gateSnapshots.push(snapshot);
+				});
+			try {
+				const { handler, toolTagNumber } = await primeBaseline(db, sessionId);
+				gateSnapshots.length = 0;
+				recordPiLiveModel(sessionId, HARD_MODEL);
+				restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+					() => ({
+						injected: true,
+						compartmentCount: 0,
+						factCount: 0,
+						memoryCount: 0,
+						skippedVisibleMessages: 0,
+						m0Materialized: false,
+						m0Reason: "model_change",
+						m0Bytes: 1,
+						m1Bytes: 1,
+						contentionExhausted: false,
+						renderedBoundary: { endMessageId: null, ordinal: null },
+						m1RenderedCoverage: null,
+						syntheticLeadingCount: 0,
+					}),
+				);
+
+				const secondMessages = buildMessages();
+				await handler(
+					{ messages: secondMessages },
+					contextFor(sessionId, secondMessages),
+				);
+
+				expect(gateSnapshots).toEqual([
+					{
+						foldDue: true,
+						foldExecuted: false,
+						shouldApplyPendingOps: false,
+						shouldRunHeuristics: false,
+						shouldRunReasoningCleanup: false,
+					},
+				]);
+				expect(
+					getTagsBySession(db, sessionId).find(
+						(tag) => tag.tagNumber === toolTagNumber,
+					)?.status,
+				).toBe("active");
+				expect(getPendingOps(db, sessionId)).toHaveLength(1);
+			} finally {
+				restoreInjection();
+				restoreObserver();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("keeps queued drops gated when a mural-enabled HARD fold is only advisory", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-hardfold-nodrain";
 			try {

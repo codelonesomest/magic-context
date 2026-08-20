@@ -75,9 +75,11 @@ current JSON protocol was introduced in `0.16.0`.
   bun run test:rust-e2e
   ```
 
-  Runtime: ~1-2 minutes locally once the binaries are warm (the first run builds
-  `ck-mc` release + reuses a prebuilt `ck-subc`). Each scenario keeps its session
-  small (tens of turns, tiny context limits) so the suite stays fast.
+  Runtime: ~1-2 minutes locally once the binaries are warm. Every invocation asks
+  Cargo to build both release binaries so `ck-mc` and `ck-subc` reflect the same
+  sibling source revision; unchanged builds reuse Cargo's incremental artifacts.
+  Each scenario keeps its session small (tens of turns, tiny context limits) so
+  the suite stays fast.
 
 ### Rust-mode lane: how it works
 
@@ -95,6 +97,19 @@ Environment honesty: `RustTestHarness.detectPrereqs()` preflights the stack
 (cargo present, sibling `subconscious` workspace present, supported platform) and
 the suite SKIPs with a printed reason when any is missing — never green-washing,
 never hanging.
+
+**Pressure technique (load-bearing apparatus rule):** scenarios reach high fill
+by SHRINKING the context limit against REAL message bytes, never by inflating
+reported usage. The two techniques are not interchangeable: inflated usage moves
+only fill-keyed conditions (execute thresholds, force bands) while every
+real-byte-keyed condition (reclaimable-tail pressure, tail-size trigger floors,
+chunk substance) stays silently unreachable — a harness built that way passes
+every fill-keyed test honestly while structurally unable to exercise the other
+axis, with nothing announcing the gap. (Observed live 2026-08-14 in a peer
+gateway's drive container: 44 passes, fill 80→86%, `eligible_chunk_tokens`
+pinned at exactly 0.0 the whole time.) If a scenario needs a shortcut, shrink
+the window; if you must inflate, document which asserted conditions become
+unreachable.
 
 Gated scenarios (skip with a printed reason until their dependency lands):
 

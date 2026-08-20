@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import {
     clearOldReasoning,
+    findMergedReasoningStripCandidateIds,
     replayStrippedInlineThinking,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
@@ -660,6 +661,58 @@ describe("strip-content", () => {
     });
 
     describe("stripReasoningFromMergedAssistants (sentinel-based groupIntoBlocks workaround)", () => {
+        describe("#given a leading whitespace-only text block before the reasoning", () => {
+            it("#then keeps the reasoning — whitespace text is sentinel-invisible to the keep-rule", () => {
+                // Regression shape after OpenCode's Anthropic adapter normalizes
+                // structural sentinels: [" ", thinking, tool_use, " "]. Treating
+                // the leading " " as content made the keep-rule skip the
+                // thinking block, so the assistant kept reasoning while newest
+                // (exempt) and lost it on the first pass after — a byte change at
+                // a new position every turn, re-creating the provider cache from
+                // that point on every pass.
+                const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
+                const a1 = message("m-a", "assistant", [
+                    { type: "text", text: " " },
+                    { type: "reasoning", text: "thinking body" },
+                    { type: "tool", callID: "c1", tool: "bash", state: { status: "completed" } },
+                    { type: "text", text: " " },
+                ]);
+                const u2 = message("m-u2", "user", [{ type: "text", text: "next" }]);
+                const newest = message("m-a2", "assistant", [
+                    { type: "text", text: " " },
+                    { type: "reasoning", text: "newer thinking" },
+                    { type: "tool", callID: "c2", tool: "bash", state: { status: "completed" } },
+                ]);
+
+                // Not exempt: a1 is no longer the newest assistant — the exact
+                // transition that previously stripped it.
+                const stripped = stripReasoningFromMergedAssistants(
+                    [u, a1, u2, newest],
+                    "anthropic",
+                    {
+                        mutationExemptMessage: newest,
+                    },
+                );
+
+                expect(stripped).toBe(0);
+                expect(a1.parts[1]).toMatchObject({ type: "reasoning", text: "thinking body" });
+            });
+
+            it("#then still strips reasoning behind REAL leading text (merge rule intact)", () => {
+                const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
+                const a1 = message("m-a", "assistant", [
+                    { type: "text", text: "real prose first" },
+                    { type: "reasoning", text: "thinking body" },
+                ]);
+                const a2 = message("m-a2", "assistant", [{ type: "text", text: "second in run" }]);
+
+                const stripped = stripReasoningFromMergedAssistants([u, a1, a2], "anthropic");
+
+                expect(stripped).toBe(1);
+                expect(a1.parts[1]).toMatchObject({ type: "text", text: "" });
+            });
+        });
+
         describe("#given a single assistant with reasoning", () => {
             it("#then leaves it untouched (no merge risk — standalone assistant)", () => {
                 const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
@@ -700,6 +753,34 @@ describe("strip-content", () => {
                 expect(a2.parts).toHaveLength(2);
                 expect(a2.parts[0]).toEqual(SENTINEL);
                 expect(a2.parts[1]).toEqual({ type: "text", text: "second response" });
+            });
+        });
+
+        describe("#given cache control on reasoning that would otherwise be stripped", () => {
+            it("#then excludes that reasoning from first-application candidates", () => {
+                const first = message("m-first", "assistant", [
+                    { type: "text", text: "first response" },
+                ]);
+                const cached = message("m-cached", "assistant", [
+                    {
+                        type: "reasoning",
+                        text: "cached reasoning",
+                        cache_control: { type: "ephemeral" },
+                    },
+                    { type: "text", text: "cached response" },
+                ]);
+                const newest = message("m-newest", "assistant", [
+                    { type: "text", text: "newest response" },
+                ]);
+                const messages = [first, cached, newest];
+
+                expect(findMergedReasoningStripCandidateIds(messages, "anthropic")).toEqual([]);
+                expect(stripReasoningFromMergedAssistants(messages, "anthropic")).toBe(0);
+                expect(cached.parts[0]).toEqual({
+                    type: "reasoning",
+                    text: "cached reasoning",
+                    cache_control: { type: "ephemeral" },
+                });
             });
         });
 
@@ -757,6 +838,58 @@ describe("strip-content", () => {
                 expect(JSON.stringify(protectedFixture.latest.parts.slice(0, 2))).toBe(
                     latestBefore,
                 );
+            });
+        });
+
+        describe("#given a frozen message-id replay set", () => {
+            it("#then neutralizes only set members across fresh message objects", () => {
+                const buildFixture = () => {
+                    const newest = message("m-newest", "assistant", [
+                        { type: "reasoning", text: "newest remains exempt" },
+                    ]);
+                    return {
+                        newest,
+                        messages: [
+                            message("m-u", "user", [{ type: "text", text: "continue" }]),
+                            message("m-first", "assistant", [{ type: "text", text: "first" }]),
+                            message("m-frozen", "assistant", [
+                                { type: "thinking", thinking: "frozen reasoning" },
+                                { type: "text", text: "frozen continuation" },
+                            ]),
+                            message("m-unfrozen", "assistant", [
+                                { type: "thinking", thinking: "not frozen yet" },
+                                { type: "text", text: "unfrozen continuation" },
+                            ]),
+                            newest,
+                        ],
+                    };
+                };
+
+                const first = buildFixture();
+                expect(
+                    stripReasoningFromMergedAssistants(first.messages, "anthropic", {
+                        frozenMessageIds: new Set(["m-frozen"]),
+                        mutationExemptMessage: first.newest,
+                    }),
+                ).toBe(1);
+                expect(first.messages[2]?.parts[0]).toEqual(SENTINEL);
+                expect(first.messages[3]?.parts[0]).toEqual({
+                    type: "thinking",
+                    thinking: "not frozen yet",
+                });
+
+                const rebuilt = buildFixture();
+                expect(
+                    stripReasoningFromMergedAssistants(rebuilt.messages, "anthropic", {
+                        frozenMessageIds: new Set(["m-frozen"]),
+                        mutationExemptMessage: rebuilt.newest,
+                    }),
+                ).toBe(1);
+                expect(rebuilt.messages[2]?.parts[0]).toEqual(SENTINEL);
+                expect(rebuilt.messages[3]?.parts[0]).toEqual({
+                    type: "thinking",
+                    thinking: "not frozen yet",
+                });
             });
         });
 

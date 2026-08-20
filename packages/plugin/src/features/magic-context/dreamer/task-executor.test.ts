@@ -65,6 +65,12 @@ function providerFailureMessages(text: string) {
     ];
 }
 
+const CURATE_PSEUDO_TOOL_CALL = `归档与全局用户画像完全重复且无项目特化信息的记忆条目。[historical tool call]
+id: call_2080315
+name: ctx_memory
+arguments:
+{"action":"archive","reason":"与全局用户画像重复","ids":[6]}`;
+
 describe("createDreamTaskExecutor — curate", () => {
     test("runs whole-pool curation without verification gate or watermark patch", async () => {
         db = freshDb();
@@ -122,6 +128,57 @@ describe("createDreamTaskExecutor — curate", () => {
         expect(capturedPrompt).toContain("Prefer concise answers globally.");
         expect(capturedPrompt).not.toContain('ctx_memory(action="verified"');
         expect(capturedPrompt).not.toContain("verified_files");
+    });
+
+    test("rejects a textual pseudo-tool-call and retries with the fallback model", async () => {
+        db = freshDb();
+        const project = "/repo/curate-pseudo-tool-call";
+        insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Use the shared release checklist before publishing.",
+        });
+
+        let promptCalls = 0;
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "dream-child" } })),
+                prompt: mock(async () => {
+                    promptCalls += 1;
+                    return {};
+                }),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        promptCalls === 1 ? CURATE_PSEUDO_TOOL_CALL : "curation complete",
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+
+        const result = await executor(
+            {
+                task: "curate",
+                schedule: "0 4 * * 0",
+                timeoutMinutes: 20,
+                fallbackModels: ["fallback/curator"],
+            },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-curate-pseudo-tool-call",
+                leaseKey: leaseKeyFor("curate", project),
+            },
+        );
+
+        expect(promptCalls).toBe(2);
+        expect(result).toEqual({ status: "completed", schedulePatch: undefined });
     });
 
     test("adds the content language directive to curated prose tasks", async () => {
@@ -239,17 +296,19 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         );
 
         expect(result.status).toBe("completed");
-        expect(result.error).toContain("verify-broad cycle");
-        expect(result.error).toContain("remain");
+        expect(result.error).toBeUndefined();
         const state = getTaskScheduleState(db, project, "verify-broad");
         expect(state?.lastBroadRunAt).toBeGreaterThan(0);
         const run = getDreamRuns(db, project)[0];
         expect(run?.tasks_failed).toBe(0);
         const task = JSON.parse(run?.tasks_json ?? "[]")[0] as {
             error?: string;
+            progress?: string;
             backlog?: { pendingAtStart: number; pendingAtEnd: number; processed: number };
         };
-        expect(task.error).toContain("verify-broad cycle");
+        expect(task.error).toBeUndefined();
+        expect(task.progress).toContain("verify-broad cycle");
+        expect(task.progress).toContain("remain");
         expect(task.backlog).toMatchObject({ pendingAtStart: 51, pendingAtEnd: 1, processed: 50 });
     });
 

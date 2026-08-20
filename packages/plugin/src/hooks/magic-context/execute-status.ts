@@ -12,7 +12,13 @@ import { getTagsBySession } from "../../features/magic-context/storage-tags";
 import { getErrorMessage } from "../../shared/error-message";
 import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
+import type { TailHygieneStatus } from "../../shared/rpc-types";
 import type { Database } from "../../shared/sqlite";
+import { formatTailHygiene } from "../../shared/tail-hygiene-status";
+import {
+    formatWindowDerivationLine,
+    type WindowGeometryResult,
+} from "../../shared/window-geometry";
 import {
     getProactiveCompartmentTriggerPercentage,
     POST_DROP_TARGET_RATIO,
@@ -61,6 +67,8 @@ export function executeStatus(
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined },
     contextLimit?: number,
     dreamer?: { backlog?: DreamTaskBacklogMap; progress?: DreamTaskProgress | null },
+    windowGeometry?: WindowGeometryResult,
+    tailHygiene?: TailHygieneStatus,
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
     // which config source won (tokens vs percentage). Previously /ctx-status
@@ -144,6 +152,15 @@ export function executeStatus(
             `**Subagent session:** ${meta.isSubagent}`,
         ];
 
+        if (tailHygiene !== undefined) {
+            lines.push(
+                "",
+                "### Tail Hygiene",
+                `- Reclaimable / eligible: ${formatTailHygiene(tailHygiene)}`,
+                "- Reasoning is excluded from both terms.",
+            );
+        }
+
         if (dreamer?.backlog && Object.keys(dreamer.backlog).length > 0) {
             lines.push(
                 "",
@@ -164,6 +181,9 @@ export function executeStatus(
                 `- Last percentage: ${meta.lastContextPercentage.toFixed(1)}%`,
                 `- Last input tokens: ${meta.lastInputTokens.toLocaleString()}`,
                 `- Resolved context limit: ${displayContextLimit > 0 ? displayContextLimit.toLocaleString() : "unknown"}`,
+                ...(windowGeometry
+                    ? [`- ${formatWindowDerivationLine(meta.lastInputTokens, windowGeometry)}`]
+                    : []),
                 `- Proactive compartment evaluation: ${proactiveCompartmentTrigger}%`,
                 `- Post-drop target for historian: ${(executeThresholdPercentage * POST_DROP_TARGET_RATIO).toFixed(0)}% (${executeThresholdPercentage}% * ${POST_DROP_TARGET_RATIO})`,
                 `- Commit cluster trigger: ${commitClusterTrigger?.enabled !== false ? `enabled (min ${commitClusterTrigger?.min_clusters ?? 3} clusters)` : "disabled"}, tail-size trigger: > 3x compartment budget`,

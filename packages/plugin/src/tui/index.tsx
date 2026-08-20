@@ -11,6 +11,8 @@ import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
+import { formatTailHygiene } from "../shared/tail-hygiene-status"
+import { formatWindowDerivationLine } from "../shared/window-geometry"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off"
 import { isCompactionEnabled } from "../config/agent-disable"
 import { loadPluginConfig } from "../config"
@@ -201,7 +203,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
             segs.push({ label: "User Profile", tokens: d.profileTokens, color: COLORS.profile })
 
         if (d.conversationTokens > 0)
-            segs.push({ label: "Conversation", tokens: d.conversationTokens, color: COLORS.conversation })
+            segs.push({ label: "Conversation*", tokens: d.conversationTokens, color: COLORS.conversation })
         if (d.toolCallTokens > 0)
             segs.push({ label: "Tool Calls", tokens: d.toolCallTokens, color: COLORS.toolCalls })
         if (d.toolDefinitionTokens > 0)
@@ -239,6 +241,11 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                     {fmt(s().inputTokens)} / {contextLimit() > 0 ? fmt(contextLimit()) : "?"} tokens
                 </text>
             </box>
+            {s().windowGeometry && (
+                <text fg={t().textMuted}>
+                    {formatWindowDerivationLine(s().inputTokens, s().windowGeometry!)}
+                </text>
+            )}
 
             {/* Segmented breakdown bar: flex row of colored boxes filling
                 the dialog width. See barSegments comment above. */}
@@ -265,6 +272,15 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                         </box>
                     )
                 })}
+                <text fg={t().textMuted}>* Conversation includes Reasoning; hygiene excludes it</text>
+                {s().tailHygiene !== undefined && (
+                    <R
+                        t={t()}
+                        l="Hygiene"
+                        v={formatTailHygiene(s().tailHygiene!)}
+                        fg={s().tailHygiene!.evaluable ? t().accent : t().warning}
+                    />
+                )}
             </box>
 
             {/* Recomp / session-upgrade live progress (full width, only while
@@ -387,6 +403,22 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                     <text fg={t().error}>⚠ {s().lastTransformError}</text>
                 </box>
             )}
+
+            <box marginTop={1} width="100%">
+                <text fg={t().text}><b>Logger</b></text>
+                <R
+                    t={t()}
+                    l="Swallowed writes"
+                    v={String(s().loggerDiagnostics?.swallowedWriteCount ?? 0)}
+                    fg={(s().loggerDiagnostics?.swallowedWriteCount ?? 0) > 0 ? t().error : t().textMuted}
+                />
+                {s().loggerDiagnostics?.lastErrorMessage && (
+                    <R t={t()} l="Last error" v={s().loggerDiagnostics.lastErrorMessage} fg={t().error} />
+                )}
+                {s().loggerDiagnostics?.lastErrorTime && (
+                    <R t={t()} l="Last error time" v={s().loggerDiagnostics.lastErrorTime} fg={t().textMuted} />
+                )}
+            </box>
 
             {/* Footer */}
             <box marginTop={1} justifyContent="flex-end" width="100%">

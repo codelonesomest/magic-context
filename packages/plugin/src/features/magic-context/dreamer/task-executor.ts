@@ -189,6 +189,23 @@ function loadActiveMemoryPromptMemories(
     return memories.map((memory) => toCuratePromptMemory(memory, verificationById));
 }
 
+const TEXTUAL_CURATE_TOOL_CALL_PATTERNS = [
+    /\[\s*historical tool call\s*\][\s\S]*?(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
+    /(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
+    /(?:^|\n)\s*(?:```[^\n]*\n\s*)?ctx_memory\s*\(\s*action\s*=/im,
+    /["']name["']\s*:\s*["']ctx_memory["'][\s\S]*?["']arguments["']\s*:/i,
+] as const;
+
+/** Reject serialized or hand-written ctx_memory invocations. They are assistant
+ * text, not executable tool parts, so accepting one would leave its mutation
+ * unapplied while recording the whole curate run as complete. */
+function validateCurateAssistantText(text: string): string {
+    if (TEXTUAL_CURATE_TOOL_CALL_PATTERNS.some((pattern) => pattern.test(text))) {
+        throw new Error("Curate returned an unresolved textual ctx_memory tool call.");
+    }
+    return text;
+}
+
 /**
  * Build the TaskExecutor the v2 scheduler drives. The scheduler owns the keyed
  * domain lease + holderId and hands them in; this executor runs one task's actual
@@ -291,6 +308,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 /** Broad verification closes its cycle before telemetry is recorded,
                  *  so pass the cycle-local backlog explicitly when needed. */
                 backlogAfter?: { pending: number; total: number };
+                /** Successful progress/detail; empty strings are omitted so absent
+                 *  and empty have the same persisted meaning. */
+                progress?: string | null;
             },
         ): void => {
             try {
@@ -304,7 +324,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             name: config.task,
                             durationMs: Date.now() - startedAt,
                             resultChars: 0,
-                            ...(error ? { error } : {}),
+                            ...(status === "failed" && error ? { error } : {}),
+                            ...(extra?.progress ? { progress: extra.progress } : {}),
                             backlog: (() => {
                                 const end =
                                     extra?.backlogAfter ??
@@ -483,11 +504,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     // not drain the complete cycle. Only a zero-progress broad run
                     // is a failure that should raise the dashboard's red status.
                     if (broadProgress && processed > 0) {
-                        recordRun("completed", broadProgress, {
+                        recordRun("completed", null, {
+                            progress: broadProgress,
                             memoryChanges: computeMemoryDelta(memoryBefore),
                             backlogAfter,
                         });
-                        return { status: "completed", error: broadProgress };
+                        return { status: "completed" };
                     }
                     const error = incompleteMessage(result.remaining);
                     recordRun("failed", error, {
@@ -496,13 +518,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     });
                     return { status: "failed", transient: true, error };
                 }
-                recordRun("completed", broadProgress, {
+                recordRun("completed", null, {
+                    progress: broadProgress,
                     memoryChanges: computeMemoryDelta(memoryBefore),
                     backlogAfter,
                 });
-                return broadProgress
-                    ? { status: "completed", error: broadProgress }
-                    : { status: "completed" };
+                return { status: "completed" };
             }
 
             if (config.task === "classify-memories") {
@@ -1223,7 +1244,7 @@ async function runAgenticTask(
                 validateOutput: (messages) => {
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("Dreamer returned no assistant output.");
-                    return text;
+                    return task === "curate" ? validateCurateAssistantText(text) : text;
                 },
             },
         );

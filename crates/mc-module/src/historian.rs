@@ -433,6 +433,8 @@ pub struct ValidatedPublishRequest<'a> {
     pub collect_user_memory_candidates: bool,
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: &'a str,
+    /// Original CK messages for exact durable full-message and verbose recovery.
+    pub raw_chunk_messages: &'a str,
     /// Creation timestamp stamped on the appended compartment rows.
     pub created_at_ms: i64,
     /// YYYY-MM-DD dates keyed by native message id; missing entries remain date-less.
@@ -538,6 +540,7 @@ pub fn publish_validated_chunk(
         user_memory_candidates: &user_memory_candidates,
         publication_floor_ordinal: request.publication_floor_ordinal,
         chunk_transcript: Some(request.chunk_transcript),
+        raw_chunk_messages: Some(request.raw_chunk_messages),
     };
     let publish_result = match request.publication_fence {
         Some(fence) => fence.publish(store, publish_request),
@@ -909,6 +912,7 @@ pub struct HistorianFireRequest<'a> {
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
+    pub raw_chunk_messages: &'a str,
     /// Message boundary dates captured with the native ingress messages.
     pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
@@ -926,6 +930,7 @@ pub struct HistorianReattachRequest<'a> {
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
+    pub raw_chunk_messages: &'a str,
     /// Message boundary dates captured with the native ingress messages.
     pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
@@ -950,15 +955,17 @@ pub fn completion_wait_budget() -> Duration {
     Duration::from_secs(660)
 }
 
-/// Maximum producer rounds driven by one explicit session wrapup.
-pub const MAX_WRAPUP_ROUNDS: usize = 5;
-
 /// The per-attempt deadline a consumer sets, VERBATIM, for `session.wrapup` calls —
 /// margin included, no consumer-side arithmetic on top (the module owns the margin,
-/// mirroring `MAX_EMERGENCY_REQUEST_BUDGET`). Derivation: one busy-join at entry
-/// (bounded by [`completion_wait_budget`], 660s) plus [`MAX_WRAPUP_ROUNDS`] producer
-/// rounds at [`wrapup_round_wait_budget`] (5 x 600s) = 3660s worst case, plus margin.
-/// Bump this in the same commit as any change to those inputs and notify consumers.
+/// mirroring `MAX_EMERGENCY_REQUEST_BUDGET`). The producer loop has NO round-count
+/// cap: it drains chunks until the keep watermark is reached or this budget expires,
+/// so the budget itself — not a chunk count — is the ceiling (the TypeScript wrapup
+/// drain has the same uncapped-until-target shape). Derivation: one busy-join at
+/// entry (bounded by [`completion_wait_budget`], 660s) plus producer rounds each
+/// bounded by [`wrapup_round_wait_budget`] (600s); the loop re-checks the remaining
+/// budget before every round, so the wall time is one join plus as many rounds as
+/// fit under the budget. Sized for a large multi-chunk drain with margin. Bump this
+/// in the same commit as any change to those inputs and notify consumers.
 pub const MAX_WRAPUP_REQUEST_BUDGET: Duration = Duration::from_secs(3_800);
 
 /// Per-round wrapup wait bound. A timed-out producer keeps running under the normal
@@ -1354,6 +1361,7 @@ where
             observed_chunk_fingerprint: request.observed_chunk_fingerprint,
             validation_chunk: request.validation_chunk,
             chunk_transcript: request.chunk_transcript,
+            raw_chunk_messages: request.raw_chunk_messages,
             boundary_dates: request.boundary_dates,
             prior_compartments: request.prior_compartments,
             validate_options: request.validate_options,
@@ -1504,6 +1512,7 @@ where
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
+        raw_chunk_messages: request.raw_chunk_messages,
         boundary_dates: request.boundary_dates,
         prior_compartments: request.prior_compartments,
         validate_options: request.validate_options,
@@ -1532,6 +1541,7 @@ struct PublishOutputRequest<'a> {
     observed_chunk_fingerprint: &'a str,
     validation_chunk: &'a HistorianChunk,
     chunk_transcript: &'a str,
+    raw_chunk_messages: &'a str,
     boundary_dates: &'a BTreeMap<String, String>,
     prior_compartments: &'a [StoredCompartmentRange],
     validate_options: ValidateOptions,
@@ -1554,6 +1564,7 @@ fn publish_output_from_awaiting(
         observed_chunk_fingerprint,
         validation_chunk,
         chunk_transcript,
+        raw_chunk_messages,
         boundary_dates,
         prior_compartments,
         validate_options,
@@ -1628,6 +1639,7 @@ fn publish_output_from_awaiting(
             collect_user_memory_candidates: validate_options.user_memory_collection_enabled,
             publication_floor_ordinal: validated.unprocessed_from,
             chunk_transcript,
+            raw_chunk_messages,
             boundary_dates,
             created_at_ms,
             failure_backoff_at_ms,
@@ -1771,6 +1783,10 @@ mod tests {
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             cache_ttl: None,
+            effective_execute_threshold: None,
+            auto_search_enabled: true,
+            auto_search_score_threshold: 0.35,
+            auto_search_min_prompt_chars: 0,
             kind: "transform".to_string(),
             v: 2,
             serializer_profile: "owned-llmrunner".to_string(),
@@ -1791,17 +1807,21 @@ mod tests {
             prompt_surface_model_key: None,
             prompt_surface_config_identity: String::new(),
             prompt_surface_tool_descriptions: BTreeMap::new(),
+            prompt_surface_guidance_override: None,
+            mural: None,
             serve_native: false,
             native_messages: None,
             full_array_fingerprint: None,
             messages,
             tail_delta: None,
             usage: None,
+            geometry: None,
             provider_error: None,
             mid_turn: false,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
             channel2_nudge_state: String::new(),
+            channel2_delivered_id: None,
             emergency_recovery_armed: false,
             emergency_recovery_no_head_escape: false,
             detected_context_limit: 0,
@@ -1836,6 +1856,7 @@ mod tests {
             temporal_awareness: true,
             now_ms: 0,
             execute_threshold_percentage: 65.0,
+            compaction_enabled: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: crate::config::CacheTtlProvenance::Default,
@@ -2193,6 +2214,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: prior,
             validate_options: validate_options(),
@@ -2215,6 +2237,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: prior,
             validate_options: validate_options(),
@@ -2962,6 +2985,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: left transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
@@ -2978,6 +3002,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: right transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
@@ -3309,11 +3334,7 @@ mod tests {
         let models = vec!["prov/model-a".to_string()];
         let mut producer =
             ScriptedProducer::default().with_start(Err(HistorianProducerError::Subc(
-                subc_protocol::ErrorBody {
-                    code: "route_rejected".to_string(),
-                    message: "no such module".to_string(),
-                }
-                .into(),
+                subc_protocol::ErrorBody::new("route_rejected", "no such module").into(),
             )));
 
         let err = run_historian_firing(
@@ -3453,6 +3474,7 @@ mod tests {
             observed_chunk_fingerprint: "fp-changed",
             validation_chunk: &chunk,
             chunk_transcript: "U: transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
@@ -3802,6 +3824,7 @@ mod tests {
                 collect_user_memory_candidates: true,
                 publication_floor_ordinal: 4,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 123,
                 failure_backoff_at_ms: 0,
@@ -3882,6 +3905,7 @@ mod tests {
                     collect_user_memory_candidates: false,
                     publication_floor_ordinal: 1,
                     chunk_transcript: "U: transcript",
+                    raw_chunk_messages: "[]",
                     boundary_dates: empty_boundary_dates(),
                     created_at_ms: 123,
                     failure_backoff_at_ms: 0,
@@ -4033,6 +4057,7 @@ mod tests {
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
@@ -4119,6 +4144,7 @@ mod tests {
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
@@ -4200,6 +4226,7 @@ mod tests {
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
@@ -4351,6 +4378,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 5,
                 chunk_transcript: Some("U: transcript"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -4431,6 +4459,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 3,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
 

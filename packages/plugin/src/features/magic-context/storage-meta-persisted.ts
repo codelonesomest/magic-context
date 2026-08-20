@@ -3,6 +3,7 @@ import {
     normalizeContextLimitProvenance,
 } from "../../shared/context-limit-provenance";
 import { escalationBands } from "../../shared/escalation-bands";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { stableStringify } from "../../shared/stable-json";
@@ -1084,7 +1085,7 @@ export function resetLastNudgeCycleIfTailShrank(
     return changed;
 }
 
-// ---- Channel 2 (synthetic-user-message ceiling) one-shot lease/outbox ----
+// ---- Channel 2 (synthetic-user-message ceiling) cycle lease/outbox ----
 // State machine stored as a single string in `channel2_nudge_state`:
 //   ''         — no intent (initial)
 //   'pending'  — transform recorded the ceiling condition; deliver on next event
@@ -1094,9 +1095,9 @@ export function resetLastNudgeCycleIfTailShrank(
 //                OpenCode also writes `channel2_nudge_claim_token` so a slow
 //                sender cannot confirm a lease after another process heals and
 //                re-delivers it.
-//   'delivered'— confirmed sent; the one ceiling nudge is consumed (terminal)
+//   'delivered'— confirmed sent; the current tail-reset cycle is consumed
 // On send failure the caller reverts 'claimed' -> 'pending' so a transient error
-// does not permanently burn the single ceiling nudge. After send succeeds, a
+// does not consume the cycle. After send succeeds, a
 // confirm failure must NOT re-arm; callers leave the lease non-pending.
 export type Channel2NudgeState = "" | "pending" | "claimed" | "delivered";
 
@@ -1750,7 +1751,9 @@ export interface PersistedOverflowState {
 }
 
 function normalizeDetectedLimitModelKey(modelKey: string | null | undefined): string | null {
-    return typeof modelKey === "string" && modelKey.length > 0 ? modelKey : null;
+    return typeof modelKey === "string" && modelKey.length > 0
+        ? piModelRefToCanonical(modelKey)
+        : null;
 }
 
 function normalizeEmergencyRecoveryOrigin(value: unknown): EmergencyRecoveryOrigin | null {
@@ -2086,6 +2089,151 @@ export function removeStrippedPlaceholderId(
     }
     applyStrippedPlaceholderDelta(db, sessionId, { remove: [messageId] });
     return true;
+}
+
+// ── Merged-assistant reasoning stripped IDs (frozen replay watermark) ──
+
+/**
+ * Assistant message ids whose merged-run reasoning neutralization has already
+ * been first-applied on a cache-busting pass. The set is replayed on every pass
+ * and never shrinks while the session exists, so tail growth or a fresh object
+ * rebuild cannot introduce a new prefix mutation on a defer pass.
+ */
+export function getMergedReasoningStrippedIds(db: Database, sessionId: string): Set<string> {
+    const row = db
+        .prepare("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { merged_reasoning_stripped_ids?: string } | null;
+    return new Set(parseStrippedBlob(row?.merged_reasoning_stripped_ids));
+}
+
+/**
+ * Atomically merge assistant message ids into the persisted applied set. Persistence
+ * must succeed before callers first mutate newly detected messages; otherwise a
+ * later defer pass could not reproduce those bytes from a fresh rebuild.
+ */
+export function addMergedReasoningStrippedIds(
+    db: Database,
+    sessionId: string,
+    ids: Iterable<string>,
+): boolean {
+    const add = [...ids];
+    if (add.length === 0) return true;
+    ensureSessionMetaRow(db, sessionId);
+
+    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
+        const row = db
+            .prepare("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | undefined;
+        const rawStored = row ? (row.merged_reasoning_stripped_ids ?? null) : null;
+        const current = new Set<string>(parseStrippedBlob(rawStored));
+        let changed = false;
+        for (const id of add) {
+            if (!current.has(id)) {
+                current.add(id);
+                changed = true;
+            }
+        }
+        if (!changed) return true;
+        const nextBlob = JSON.stringify([...current]);
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
+            )
+            .run(nextBlob, sessionId, rawStored);
+        if (result.changes > 0) return true;
+    }
+    sessionLog(
+        sessionId,
+        `merged_reasoning_stripped_ids CAS: ${CAS_RETRY_LIMIT} retries exhausted`,
+    );
+    return false;
+}
+
+// ── Trailing assistant blank decisions (frozen replay map) ──
+
+export type PersistedTrailingBlankDecision = "keep" | `keep:${number}` | "strip";
+
+function isPersistedTrailingBlankDecision(value: unknown): value is PersistedTrailingBlankDecision {
+    if (value === "keep" || value === "strip") return true;
+    if (typeof value !== "string" || !value.startsWith("keep:")) return false;
+    const countText = value.slice("keep:".length);
+    if (!/^[1-9]\d*$/.test(countText)) return false;
+    const count = Number(countText);
+    return Number.isSafeInteger(count) && count > 1 && count <= 10_000;
+}
+
+function parseTrailingBlankDecisions(
+    raw: string | null | undefined,
+): Map<string, PersistedTrailingBlankDecision> {
+    if (!raw) return new Map();
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
+        const decisions = new Map<string, PersistedTrailingBlankDecision>();
+        for (const [id, decision] of Object.entries(parsed)) {
+            if (id.length > 0 && isPersistedTrailingBlankDecision(decision)) {
+                decisions.set(id, decision);
+            }
+        }
+        return decisions;
+    } catch {
+        return new Map();
+    }
+}
+
+/**
+ * Read each assistant's replay choice. A historical choice is immutable; the live
+ * newest assistant may replace its choice until a later assistant freezes it.
+ */
+export function getTrailingBlankDecisions(
+    db: Database,
+    sessionId: string,
+): Map<string, PersistedTrailingBlankDecision> {
+    const row = db
+        .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { trailing_blank_decisions?: string } | null;
+    return parseTrailingBlankDecisions(row?.trailing_blank_decisions);
+}
+
+/** Persist new decisions, optionally refreshing the still-live newest assistant. */
+export function addTrailingBlankDecisions(
+    db: Database,
+    sessionId: string,
+    additions: Iterable<readonly [string, PersistedTrailingBlankDecision]>,
+    options?: { overwriteMessageId?: string },
+): boolean {
+    const add = [...additions];
+    if (add.length === 0) return true;
+    ensureSessionMetaRow(db, sessionId);
+
+    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
+        const row = db
+            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { trailing_blank_decisions?: string | null } | undefined;
+        const rawStored = row ? (row.trailing_blank_decisions ?? null) : null;
+        const current = parseTrailingBlankDecisions(rawStored);
+        let changed = false;
+        for (const [id, decision] of add) {
+            const currentDecision = current.get(id);
+            if (
+                currentDecision === undefined ||
+                (id === options?.overwriteMessageId && currentDecision !== decision)
+            ) {
+                current.set(id, decision);
+                changed = true;
+            }
+        }
+        if (!changed) return true;
+        const nextBlob = JSON.stringify(Object.fromEntries(current));
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ? AND trailing_blank_decisions IS ?",
+            )
+            .run(nextBlob, sessionId, rawStored);
+        if (result.changes > 0) return true;
+    }
+    sessionLog(sessionId, `trailing_blank_decisions CAS: ${CAS_RETRY_LIMIT} retries exhausted`);
+    return false;
 }
 
 // ── Stale ctx_reduce stripped message IDs (frozen replay watermark) ──

@@ -3,9 +3,10 @@
 //! This intentionally reads user and project tiers directly instead of depending on a
 //! daemon config plane. Per-leaf trust policy is enforced during the read: model choice
 //! is user-tier only because it affects spend; project config may only raise the execute
-//! threshold (fire less often), and may override memory, promotion, privacy, and context-limit
-//! settings. The Rust module intentionally keeps stricter model-selection policy than the current
-//! TypeScript implementation until both implementations are deliberately aligned.
+//! threshold (fire less often), and may override trusted memory, auto-search, caveman, promotion,
+//! and privacy settings. User-profile and historian budgets remain user-tier only. The Rust module
+//! intentionally keeps stricter model-selection policy than the current TypeScript implementation
+//! until both implementations are deliberately aligned.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,9 +17,9 @@ use serde_json::Value;
 /// Default execute threshold percentage (65.0). The Rust module reads config without the
 /// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
 pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
-/// Default token budget for project-memory injection. It must remain 8,000 tokens so the Rust
-/// module and the TypeScript renderer use the same default.
-pub const DEFAULT_MEMORY_BUDGET_TOKENS: f64 = 8_000.0;
+/// Default token budget for project-memory injection. This is the twin of
+/// `packages/plugin/src/config/schema/magic-context.ts` and must stay at 4,000 tokens.
+pub const DEFAULT_MEMORY_BUDGET_TOKENS: f64 = 4_000.0;
 /// Default token budget for user-profile injection. It must remain 4,000 tokens so the Rust
 /// module and the TypeScript renderer use the same default.
 pub const DEFAULT_USER_PROFILE_BUDGET_TOKENS: f64 = 4_000.0;
@@ -34,6 +35,11 @@ pub const MAX_HISTORIAN_CHUNK_TOKENS: usize = 50_000;
 /// Matches the TypeScript historian fallback when no model catalog value is available.
 /// The explicit config override still wins when a binding supplies one.
 pub const DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS: usize = 128_000;
+/// Defaults shared with the TypeScript `memory.auto_search` schema.
+pub const DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD: f64 = 0.6;
+pub const DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS: usize = 20;
+/// Defaults shared with the TypeScript `caveman_text_compression` schema.
+pub const DEFAULT_CAVEMAN_MIN_SIZE: usize = 500;
 
 /// Derive the historian producer budget from its own context window, as the TS runner does.
 pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
@@ -42,10 +48,49 @@ pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AutoSearchConfig {
+    pub enabled: bool,
+    pub score_threshold: f64,
+    pub min_prompt_chars: usize,
+}
+
+impl Default for AutoSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            score_threshold: DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            min_prompt_chars: DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CavemanConfig {
+    pub enabled: bool,
+    pub min_size: usize,
+}
+
+impl Default for CavemanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_size: DEFAULT_CAVEMAN_MIN_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
     pub model_chain: Vec<String>,
     pub execute_threshold_percentage: f64,
+    /// Whether compaction is enabled, as resolved during host startup. This determines which
+    /// component controls context-window compaction for the request.
+    pub compaction_enabled: bool,
     pub memory_enabled: bool,
+    /// Independent transform-time hint controls from `memory.auto_search`.
+    pub auto_search: AutoSearchConfig,
+    /// Deterministic age-tier compression controls from `caveman_text_compression`.
+    pub caveman: CavemanConfig,
     /// Mirrors the TS auto-promote switch. Facts are dropped when this is false.
     pub auto_promote: bool,
     /// Privacy gate controlling whether historian user observations may be collected for later
@@ -59,6 +104,10 @@ pub struct McModuleConfig {
     pub inject_docs: bool,
     /// Controls temporal gap overlays when the active wire surface supports overlays.
     pub temporal_awareness: bool,
+    /// Trusted USER-tier guidance bytes resolved from the user config directory at route bind.
+    /// Only the immutable contents are retained; transform and guidance requests never carry a
+    /// filesystem path.
+    pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
     pub cache_ttl: String,
     /// Per-model TTL overrides from the object config shape. Resolution uses the
@@ -71,7 +120,10 @@ impl Default for McModuleConfig {
         Self {
             model_chain: Vec::new(),
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+            compaction_enabled: true,
             memory_enabled: true,
+            auto_search: AutoSearchConfig::default(),
+            caveman: CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS,
@@ -79,6 +131,7 @@ impl Default for McModuleConfig {
             user_profile_budget_tokens: DEFAULT_USER_PROFILE_BUDGET_TOKENS,
             inject_docs: true,
             temporal_awareness: true,
+            prompt_surface_guidance_override: None,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_by_model: std::collections::BTreeMap::new(),
@@ -176,7 +229,11 @@ impl ConfigCache {
         let project_path = project_root.join(".cortexkit").join("magic-context.jsonc");
         let user = read_tier_cached(&mut self.user, user_path.to_path_buf());
         let project = read_tier_cached(&mut self.project, project_path);
-        self.effective = merge_tiers(user.as_ref(), project.as_ref());
+        let (mut effective, mut warnings) =
+            merge_tiers_with_warnings(user.as_ref(), project.as_ref());
+        resolve_user_guidance_override(&mut effective, user.as_ref(), user_path, &mut warnings);
+        emit_warnings(warnings);
+        self.effective = effective;
         self.effective.clone()
     }
 }
@@ -208,8 +265,117 @@ fn read_tier_cached(cache: &mut TierConfig, path: PathBuf) -> Option<Value> {
     cache.value.clone()
 }
 
+#[cfg(test)]
 fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig {
+    let (cfg, warnings) = merge_tiers_with_warnings(user, project);
+    emit_warnings(warnings);
+    cfg
+}
+
+fn emit_warnings(warnings: Vec<String>) {
+    for warning in warnings {
+        eprintln!("mc-module: config warning: {warning}");
+    }
+}
+
+fn resolve_user_guidance_override(
+    cfg: &mut McModuleConfig,
+    user: Option<&Value>,
+    user_config_path: &Path,
+    warnings: &mut Vec<String>,
+) {
+    let Some(configured_path) = user
+        .and_then(|value| value.pointer("/prompt_surface/guidance_override_path"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    if configured_path.is_empty() {
+        return;
+    }
+
+    // When a guidance override path is configured, use it as the only override source. An
+    // invalid path clears any pre-resolved text and falls back to built-in guidance.
+    cfg.prompt_surface_guidance_override = None;
+    let configured_path = Path::new(configured_path);
+    let path = if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        user_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(configured_path)
+    };
+
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warnings.push(format!(
+                "prompt_surface.guidance_override_path ({}) could not be read ({error}); using built-in guidance.",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if !metadata.is_file() {
+        warnings.push(format!(
+            "prompt_surface.guidance_override_path ({}) is not a file; using built-in guidance.",
+            path.display()
+        ));
+        return;
+    }
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warnings.push(format!(
+                "prompt_surface.guidance_override_path ({}) could not be read ({error}); using built-in guidance.",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    if content.trim().is_empty() {
+        warnings.push(format!(
+            "prompt_surface.guidance_override_path ({}) is empty; using built-in guidance.",
+            path.display()
+        ));
+        return;
+    }
+
+    let markers = guidance_marker_count(&content);
+    if markers != 1 {
+        warnings.push(format!(
+            "prompt_surface.guidance_override_path ({}) must contain exactly one {:?} section marker; found {markers}. Using built-in guidance.",
+            path.display(),
+            GUIDANCE_MARKER
+        ));
+        return;
+    }
+
+    cfg.prompt_surface_guidance_override = Some(content);
+}
+
+const GUIDANCE_MARKER: &str = "## Magic Context";
+
+fn guidance_marker_count(content: &str) -> usize {
+    content
+        .split('\n')
+        .filter(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            line.strip_prefix(GUIDANCE_MARKER)
+                .is_some_and(|suffix| suffix.bytes().all(|byte| matches!(byte, b' ' | b'\t')))
+        })
+        .count()
+}
+
+fn merge_tiers_with_warnings(
+    user: Option<&Value>,
+    project: Option<&Value>,
+) -> (McModuleConfig, Vec<String>) {
     let mut cfg = McModuleConfig::default();
+    let mut warnings = Vec::new();
 
     if let Some(user) = user {
         // Module-leg model override. The shared config file serves two consumers whose
@@ -264,11 +430,24 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(threshold) = number_at(user, "/execute_threshold_percentage") {
             cfg.execute_threshold_percentage = threshold;
         }
+        if let Some(enabled) = user.pointer("/compaction/enabled").and_then(Value::as_bool) {
+            cfg.compaction_enabled = enabled;
+        }
         if let Some(enabled) = user.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
-        if let Some(budget) = number_at(user, "/memory/budget_tokens") {
+        apply_auto_search_config(&mut cfg.auto_search, user);
+        apply_caveman_config(&mut cfg.caveman, user);
+        if let Some(budget) = number_at(user, "/memory/injection_budget_tokens") {
             cfg.memory_budget_tokens = budget.max(1.0);
+        } else if let Some(budget) = number_at(user, "/memory/budget_tokens") {
+            cfg.memory_budget_tokens = budget.max(1.0);
+        }
+        if user.pointer("/memory/budget_tokens").is_some() {
+            warnings.push(
+                "deprecated key /memory/budget_tokens in user tier; use /memory/injection_budget_tokens"
+                    .to_string(),
+            );
         }
         if let Some(budget) = number_at(user, "/memory/user_profile_budget_tokens") {
             cfg.user_profile_budget_tokens = budget.max(1.0);
@@ -296,6 +475,13 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         }
         if let Some(enabled) = user.pointer("/temporal_awareness").and_then(Value::as_bool) {
             cfg.temporal_awareness = enabled;
+        }
+        if let Some(guidance) = user
+            .pointer("/prompt_surface/guidance_override_text")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            cfg.prompt_surface_guidance_override = Some(guidance.to_string());
         }
         match user.pointer("/cache_ttl") {
             Some(Value::String(cache_ttl)) => {
@@ -331,8 +517,14 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
                 cfg.execute_threshold_percentage = project_threshold;
             }
         }
+        warn_ignored_project_key(project, "/compaction/enabled", &mut warnings);
         if let Some(enabled) = project.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
+        }
+        apply_auto_search_config(&mut cfg.auto_search, project);
+        apply_caveman_config(&mut cfg.caveman, project);
+        if let Some(budget) = number_at(project, "/memory/injection_budget_tokens") {
+            cfg.memory_budget_tokens = budget.max(1.0);
         }
         if let Some(enabled) = project
             .pointer("/memory/auto_promote")
@@ -343,15 +535,9 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user_memory_collection_at(project) {
             cfg.user_memory_collection_enabled = enabled;
         }
-        if let Some(limit) = positive_usize_at(project, "/historian/context_limit_tokens") {
-            cfg.historian_context_limit_tokens = limit;
-        }
-        if let Some(budget) = number_at(project, "/memory/budget_tokens") {
-            cfg.memory_budget_tokens = budget.max(1.0);
-        }
-        if let Some(budget) = number_at(project, "/memory/user_profile_budget_tokens") {
-            cfg.user_profile_budget_tokens = budget.max(1.0);
-        }
+        warn_ignored_project_key(project, "/memory/budget_tokens", &mut warnings);
+        warn_ignored_project_key(project, "/memory/user_profile_budget_tokens", &mut warnings);
+        warn_ignored_project_key(project, "/historian/context_limit_tokens", &mut warnings);
         if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
         }
@@ -367,13 +553,59 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         {
             cfg.temporal_awareness = enabled;
         }
+        warn_ignored_project_key(
+            project,
+            "/prompt_surface/guidance_override_text",
+            &mut warnings,
+        );
+        warn_ignored_project_key(
+            project,
+            "/prompt_surface/guidance_override_path",
+            &mut warnings,
+        );
     }
 
     cfg.execute_threshold_percentage = cfg
         .execute_threshold_percentage
         .clamp(1.0, MAX_EXECUTE_THRESHOLD_PERCENTAGE);
     cfg.model_chain.dedup();
-    cfg
+    (cfg, warnings)
+}
+
+fn warn_ignored_project_key(value: &Value, pointer: &str, warnings: &mut Vec<String>) {
+    if value.pointer(pointer).is_some() {
+        warnings.push(format!(
+            "ignoring {pointer} from project tier; setting is user-tier only"
+        ));
+    }
+}
+
+fn apply_auto_search_config(config: &mut AutoSearchConfig, value: &Value) {
+    if let Some(enabled) = value
+        .pointer("/memory/auto_search/enabled")
+        .and_then(Value::as_bool)
+    {
+        config.enabled = enabled;
+    }
+    if let Some(threshold) = number_at(value, "/memory/auto_search/score_threshold") {
+        config.score_threshold = threshold.clamp(0.3, 0.95);
+    }
+    if let Some(min_prompt_chars) = positive_usize_at(value, "/memory/auto_search/min_prompt_chars")
+    {
+        config.min_prompt_chars = min_prompt_chars.clamp(5, 500);
+    }
+}
+
+fn apply_caveman_config(config: &mut CavemanConfig, value: &Value) {
+    if let Some(enabled) = value
+        .pointer("/caveman_text_compression/enabled")
+        .and_then(Value::as_bool)
+    {
+        config.enabled = enabled;
+    }
+    if let Some(min_chars) = positive_usize_at(value, "/caveman_text_compression/min_chars") {
+        config.min_size = min_chars.clamp(100, 10_000);
+    }
 }
 
 fn user_memory_collection_at(value: &Value) -> Option<bool> {
@@ -608,6 +840,135 @@ mod tests {
     }
 
     #[test]
+    fn default_memory_budget_matches_typescript_schema() {
+        // Twin: packages/plugin/src/config/schema/magic-context.ts defaults
+        // memory.injection_budget_tokens to 4,000.
+        assert_eq!(DEFAULT_MEMORY_BUDGET_TOKENS, 4_000.0);
+        assert_eq!(merge_tiers(None, None).memory_budget_tokens, 4_000.0);
+    }
+
+    #[test]
+    fn memory_injection_budget_uses_standard_key_and_deprecated_user_fallback() {
+        let standard_user = serde_json::json!({
+            "memory": { "injection_budget_tokens": 3_000, "budget_tokens": 9_000 }
+        });
+        let standard_project = serde_json::json!({
+            "memory": { "injection_budget_tokens": 3_500 }
+        });
+        let (standard, warnings) =
+            merge_tiers_with_warnings(Some(&standard_user), Some(&standard_project));
+        assert_eq!(standard.memory_budget_tokens, 3_500.0);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("/memory/budget_tokens") && warning.contains("deprecated")
+        }));
+
+        let legacy_user = serde_json::json!({ "memory": { "budget_tokens": 3_250 } });
+        let (legacy, warnings) = merge_tiers_with_warnings(Some(&legacy_user), None);
+        assert_eq!(legacy.memory_budget_tokens, 3_250.0);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("/memory/budget_tokens")
+                && warning.contains("user tier")
+                && warning.contains("/memory/injection_budget_tokens")
+        }));
+    }
+
+    #[test]
+    fn rust_only_budget_leaves_are_user_tier_only_and_warn_when_project_supplies_them() {
+        let user = serde_json::json!({
+            "memory": {
+                "injection_budget_tokens": 5_000,
+                "user_profile_budget_tokens": 2_500
+            },
+            "historian": { "context_limit_tokens": 64_000 }
+        });
+        let project = serde_json::json!({
+            "memory": {
+                "budget_tokens": 19_000,
+                "user_profile_budget_tokens": 12_000
+            },
+            "historian": { "context_limit_tokens": 200_000 }
+        });
+        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), Some(&project));
+
+        assert_eq!(cfg.memory_budget_tokens, 5_000.0);
+        assert_eq!(cfg.user_profile_budget_tokens, 2_500.0);
+        assert_eq!(cfg.historian_context_limit_tokens, 64_000);
+        for key in [
+            "/memory/budget_tokens",
+            "/memory/user_profile_budget_tokens",
+            "/historian/context_limit_tokens",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| {
+                    warning.contains(key)
+                        && warning.contains("project tier")
+                        && warning.contains("user-tier only")
+                }),
+                "missing warning for {key}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_enabled_defaults_true_and_is_user_tier_only() {
+        assert!(merge_tiers(None, None).compaction_enabled);
+
+        let user = serde_json::json!({ "compaction": { "enabled": false } });
+        let project = serde_json::json!({ "compaction": { "enabled": true } });
+        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), Some(&project));
+        assert!(!cfg.compaction_enabled);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("/compaction/enabled") && warning.contains("project tier")
+        }));
+
+        let (project_only, warnings) = merge_tiers_with_warnings(None, Some(&project));
+        assert!(project_only.compaction_enabled);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn auto_search_and_caveman_config_follow_user_then_project_tiers() {
+        let user = serde_json::json!({
+            "memory": { "auto_search": {
+                "enabled": false,
+                "score_threshold": 0.4,
+                "min_prompt_chars": 100
+            }},
+            "caveman_text_compression": { "enabled": true, "min_chars": 900 }
+        });
+        let project = serde_json::json!({
+            "memory": { "auto_search": {
+                "enabled": true,
+                "score_threshold": 0.8,
+                "min_prompt_chars": 50
+            }},
+            "caveman_text_compression": { "enabled": false, "min_chars": 700 }
+        });
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert_eq!(
+            cfg.auto_search,
+            AutoSearchConfig {
+                enabled: true,
+                score_threshold: 0.8,
+                min_prompt_chars: 50,
+            }
+        );
+        assert_eq!(
+            cfg.caveman,
+            CavemanConfig {
+                enabled: false,
+                min_size: 700,
+            }
+        );
+
+        assert_eq!(
+            merge_tiers(None, None).auto_search,
+            AutoSearchConfig::default()
+        );
+        assert_eq!(merge_tiers(None, None).caveman, CavemanConfig::default());
+    }
+
+    #[test]
     fn historian_budget_derivation_clamps_at_both_bounds() {
         assert_eq!(derive_historian_chunk_tokens(1), 8_000);
         assert_eq!(derive_historian_chunk_tokens(32_000), 8_000);
@@ -635,7 +996,104 @@ mod tests {
     }
 
     #[test]
-    fn historian_gates_and_context_limit_parse_from_user_and_project_tiers() {
+    fn guidance_override_accepts_resolved_user_text_and_ignores_project_injection() {
+        let user = serde_json::json!({
+            "prompt_surface": {
+                "guidance_override_text": "## Magic Context\n\nTrusted user guidance."
+            }
+        });
+        let project = serde_json::json!({
+            "prompt_surface": {
+                "guidance_override_text": "## Magic Context\n\nProject injection.",
+                "guidance_override_path": "/repo/untrusted.md"
+            }
+        });
+
+        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), Some(&project));
+
+        assert_eq!(
+            cfg.prompt_surface_guidance_override.as_deref(),
+            Some("## Magic Context\n\nTrusted user guidance.")
+        );
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings
+            .iter()
+            .all(|warning| warning.contains("user-tier only")));
+    }
+
+    #[test]
+    fn guidance_override_path_resolves_relative_to_user_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("magic-context.jsonc");
+        let guidance_path = dir.path().join("guidance.md");
+        let guidance = "## Magic Context\r\n\r\nTrusted route guidance.\r\n";
+        fs::write(&guidance_path, guidance).unwrap();
+        fs::write(
+            &user_path,
+            r#"{
+                "prompt_surface": {
+                    "guidance_override_path": "guidance.md"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut cache = ConfigCache::default();
+        let cfg = cache.effective_for_paths(&user_path, dir.path());
+
+        assert_eq!(
+            cfg.prompt_surface_guidance_override.as_deref(),
+            Some(guidance)
+        );
+    }
+
+    #[test]
+    fn guidance_override_invalid_and_missing_files_warn_and_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("magic-context.jsonc");
+        let invalid_path = dir.path().join("invalid.md");
+        fs::write(
+            &invalid_path,
+            "## Magic Context\n\nFirst.\n## Magic Context \t\n\nSecond.",
+        )
+        .unwrap();
+
+        for (configured_path, expected_warning) in [
+            (
+                "invalid.md",
+                "must contain exactly one \"## Magic Context\" section marker; found 2",
+            ),
+            ("missing.md", "could not be read"),
+        ] {
+            let user = serde_json::json!({
+                "prompt_surface": {
+                    "guidance_override_path": configured_path,
+                    "guidance_override_text": "## Magic Context\n\nStale text"
+                }
+            });
+            let (mut cfg, mut warnings) = merge_tiers_with_warnings(Some(&user), None);
+
+            resolve_user_guidance_override(&mut cfg, Some(&user), &user_path, &mut warnings);
+
+            assert!(cfg.prompt_surface_guidance_override.is_none());
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(expected_warning), "{}", warnings[0]);
+            assert!(warnings[0]
+                .to_ascii_lowercase()
+                .contains("using built-in guidance"));
+        }
+    }
+
+    #[test]
+    fn guidance_marker_validation_matches_the_typescript_line_rule() {
+        assert_eq!(guidance_marker_count("## Magic Context"), 1);
+        assert_eq!(guidance_marker_count("## Magic Context \t\r\nbody"), 1);
+        assert_eq!(guidance_marker_count("prefix ## Magic Context\nbody"), 0);
+        assert_eq!(guidance_marker_count("## Magic Context extra\nbody"), 0);
+    }
+
+    #[test]
+    fn historian_gates_follow_tiers_but_context_limit_remains_user_tier_only() {
         let user = serde_json::json!({
             "memory": { "auto_promote": false },
             "dreamer": { "tasks": { "review-user-memories": { "schedule": "daily" } } },
@@ -650,7 +1108,7 @@ mod tests {
         let cfg = merge_tiers(Some(&user), Some(&project));
         assert!(cfg.auto_promote);
         assert!(!cfg.user_memory_collection_enabled);
-        assert_eq!(cfg.historian_context_limit_tokens, 64_000);
+        assert_eq!(cfg.historian_context_limit_tokens, 128_000);
         let legacy_disabled = serde_json::json!({
             "user_memories": { "enabled": false }
         });

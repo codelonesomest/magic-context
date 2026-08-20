@@ -8,9 +8,10 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { prepareContextDatabase } from "../prepare-context-db";
 import {
     buildHermeticBinaries,
     detectRustModePrereqs,
@@ -59,6 +60,10 @@ export interface SpawnOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /** Pre-create the isolated Magic Context DB unless the test expects the plugin to stay disabled. */
+    prepareContextDatabase?: boolean;
+    /** Expected Magic Context state after startup; readiness waits for this state. Defaults to enabled. */
+    expectedMagicContextState?: "enabled" | "conflict-disabled";
     /**
      * Reuse a pre-created isolated env instead of allocating a fresh one. The
      * Rust-mode harness creates the env first so a hermetic subc daemon can
@@ -242,9 +247,32 @@ function writeConfigs(
     // tui.json: not needed for headless serve, but harmless to emit nothing for now.
 }
 
+export interface ReadinessOptions {
+    expectedMagicContextState?: "enabled" | "conflict-disabled";
+    pluginLogPath?: string;
+    pluginLogStartOffset?: number;
+}
+
+const CONFLICT_DISABLE_VERDICT = "[magic-context] disabled due to conflicts:";
+
+function hasConflictDisableVerdict(logPath: string, startOffset: number): boolean {
+    try {
+        return readFileSync(logPath)
+            .subarray(startOffset)
+            .toString("utf8")
+            .includes(CONFLICT_DISABLE_VERDICT);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+    }
+}
+
 /**
- * Wait until the opencode server responds to GET /doc (an endpoint that exists in
- * OpenCode's server). Polls for up to `timeoutMs`.
+ * Wait until OpenCode can list sessions, Magic Context reaches its expected boot
+ * state, and the configured mock model is available. The `/doc` and `/session`
+ * endpoints can respond before provider config and plugin hooks finish loading;
+ * returning at that intermediate state lets the first prompt race startup. Polls
+ * for up to `timeoutMs`.
  *
  * Implementation note — Bun fetch timeout flake:
  *   Bun's default `fetch()` has a hardcoded ~5 minute timeout that ignores
@@ -261,34 +289,115 @@ function writeConfigs(
 // take a few minutes" on first boot per fresh CI XDG_DATA_HOME). Local hardware
 // finishes in <2s. The bump to 300s covers CI cold-start without papering over
 // genuine readiness failures — 5 minutes is still far above any realistic boot.
-async function waitForReady(url: string, timeoutMs = 300_000): Promise<void> {
+export async function waitForReady(
+    url: string,
+    directory: string,
+    timeoutMs = 300_000,
+    options: ReadinessOptions = {},
+): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     const FETCH_TIMEOUT_MS = 2_000;
-    let lastFetchErr: unknown = null;
-    let fetchAttempts = 0;
-
-    while (Date.now() < deadline) {
-        try {
-            fetchAttempts++;
-            const res = await fetch(`${url}/doc`, {
-                method: "GET",
-                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-            });
-            if (res.ok || res.status === 404 || res.status === 401) {
-                // Server is responding — any HTTP response means it booted.
-                return;
-            }
-        } catch (err) {
-            lastFetchErr = err;
-        }
-        await Bun.sleep(200);
+    const expectedMagicContextState = options.expectedMagicContextState ?? "enabled";
+    if (expectedMagicContextState === "conflict-disabled" && !options.pluginLogPath) {
+        throw new Error("conflict-disabled readiness requires a plugin log path");
     }
-    throw new Error(
-        `opencode serve did not become ready in ${timeoutMs}ms.\n` +
-            `  url=${url}/doc\n` +
-            `  fetchAttempts=${fetchAttempts}\n` +
-            `  fetchLastErr=${String(lastFetchErr)}`,
-    );
+
+    const sessionUrl = new URL("/session", url);
+    const toolsUrl = new URL("/experimental/tool/ids", url);
+    const providersUrl = new URL("/config/providers", url);
+    for (const readinessUrl of [sessionUrl, toolsUrl, providersUrl]) {
+        readinessUrl.searchParams.set("directory", directory);
+    }
+
+    const attempts = { session: 0, magicContext: 0, provider: 0 };
+    let lastReadinessError: unknown = null;
+    const fetchJson = async (readinessUrl: URL, label: string): Promise<unknown> => {
+        const res = await fetch(readinessUrl, {
+            method: "GET",
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        });
+        if (!res.ok) throw new Error(`${label} readiness returned HTTP ${res.status}`);
+        return res.json().catch(() => null);
+    };
+    const waitForStage = async (
+        stage: keyof typeof attempts,
+        probe: () => Promise<void> | void,
+    ): Promise<void> => {
+        while (Date.now() < deadline) {
+            attempts[stage] += 1;
+            try {
+                await probe();
+                return;
+            } catch (error) {
+                lastReadinessError = error;
+            }
+            await Bun.sleep(200);
+        }
+        throw new Error(
+            `opencode serve did not become ready in ${timeoutMs}ms.\n` +
+                `  expectedMagicContextState=${expectedMagicContextState}\n` +
+                `  failedStage=${stage}\n` +
+                `  sessionUrl=${sessionUrl.toString()}\n` +
+                `  toolsUrl=${toolsUrl.toString()}\n` +
+                `  providersUrl=${providersUrl.toString()}\n` +
+                `  pluginLogPath=${options.pluginLogPath ?? "unused"}\n` +
+                `  attempts=${JSON.stringify(attempts)}\n` +
+                `  readinessLastErr=${String(lastReadinessError)}`,
+        );
+    };
+
+    await waitForStage("session", async () => {
+        const sessions = await fetchJson(sessionUrl, "session API");
+        if (!Array.isArray(sessions)) {
+            throw new Error("session readiness response was not an array");
+        }
+    });
+
+    // Probe plugin state only after the application route is live. A conflict-disabled
+    // plugin intentionally has no Magic Context tools, so its explicit boot log is the
+    // positive verdict; treating a missing tool as disabled would recreate the race.
+    if (expectedMagicContextState === "conflict-disabled") {
+        await waitForStage("magicContext", () => {
+            if (
+                !hasConflictDisableVerdict(
+                    options.pluginLogPath!,
+                    options.pluginLogStartOffset ?? 0,
+                )
+            ) {
+                throw new Error("Magic Context conflict-disable verdict is not ready");
+            }
+        });
+    } else {
+        await waitForStage("magicContext", async () => {
+            const toolIds = await fetchJson(toolsUrl, "plugin tools");
+            if (!Array.isArray(toolIds) || !toolIds.includes("ctx_search")) {
+                throw new Error("Magic Context tool registry is not ready");
+            }
+        });
+    }
+
+    await waitForStage("provider", async () => {
+        const providerConfig = await fetchJson(providersUrl, "provider config");
+        const providers =
+            providerConfig && typeof providerConfig === "object"
+                ? (providerConfig as { providers?: unknown }).providers
+                : null;
+        const mockProvider = Array.isArray(providers)
+            ? providers.find(
+                  (provider) =>
+                      provider &&
+                      typeof provider === "object" &&
+                      (provider as { id?: unknown }).id === "mock-anthropic",
+              )
+            : null;
+        const models =
+            mockProvider && typeof mockProvider === "object"
+                ? (mockProvider as { models?: unknown }).models
+                : null;
+        if (!models || typeof models !== "object" || !("mock-sonnet" in models)) {
+            throw new Error("mock-anthropic/mock-sonnet provider config is not ready");
+        }
+    });
 }
 
 interface RustSpawnResources {
@@ -342,6 +451,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
     const port = resolvedOpts.port ?? (await pickFreePort());
 
+    if (resolvedOpts.prepareContextDatabase !== false) prepareContextDatabase(env.dataDir);
     writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
 
     // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
@@ -381,6 +491,11 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
         childEnv[key] = value;
     }
+    const pluginLogPath =
+        childEnv.MAGIC_CONTEXT_LOG_PATH?.trim() ||
+        join(env.dataDir, "cortexkit", "magic-context-e2e.log");
+    childEnv.MAGIC_CONTEXT_LOG_PATH = pluginLogPath;
+    const pluginLogStartOffset = existsSync(pluginLogPath) ? statSync(pluginLogPath).size : 0;
 
     // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
     // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results
@@ -410,7 +525,11 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
 
     const url = `http://127.0.0.1:${port}`;
     try {
-        await waitForReady(url);
+        await waitForReady(url, env.workdir, 300_000, {
+            expectedMagicContextState: resolvedOpts.expectedMagicContextState,
+            pluginLogPath,
+            pluginLogStartOffset,
+        });
     } catch (err) {
         // Surface captured output on boot failure to help debugging.
         child.kill("SIGTERM");

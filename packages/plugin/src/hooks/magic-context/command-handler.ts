@@ -17,9 +17,14 @@ import { sessionLog } from "../../shared";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
 import {
+    resolveTailHygieneStatus,
+    type WireTailHygieneBaseline,
+} from "../../shared/tail-hygiene-status";
+import {
     type PartialRecompRange,
     snapRangeToCompartments,
 } from "./compartment-runner-partial-recomp";
+import { resolveContextWindowGeometry } from "./event-resolvers";
 import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
@@ -222,6 +227,12 @@ function formatRustOperationMessage(
                 return `## Magic Wrapup\n\n${summary || "Nothing to compact."}`;
             case "already_in_progress":
                 return `## Magic Wrapup — Skipped\n\n/ctx-wrapup is already running for this session${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"} complete)` : ""}. Wait for it to finish, then run /ctx-wrapup again if more history remains.`;
+            case "retryable":
+                // The module's nonterminal disposition: progress was made but the
+                // drain stopped short of the keep watermark for a retryable reason.
+                // The TypeScript orchestrator presents the same shape as a Partial
+                // with the prescribed continuation, not a terminal failure.
+                return `## Magic Wrapup — Partial\n\n${summary || "Wrapup made progress but stopped before the keep watermark."} Run /ctx-wrapup again to continue.`;
             default:
                 return `## Magic Wrapup — Failed\n\n${summary || "Wrapup failed; try /ctx-wrapup again."}${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"})` : ""}`;
         }
@@ -518,6 +529,8 @@ export function createMagicContextCommandHandler(deps: {
     getDreamerProgress?: () =>
         | import("../../features/magic-context/dreamer/task-registry").DreamTaskProgress
         | null;
+    /** Cached U/T token measurement of the final rendered conversation tail, shared by both nudge mechanisms. */
+    getTailHygiene?: (sessionId: string) => import("./ctx-reduce-nudge").Channel1State | undefined;
     onFlush?: (sessionId: string) => void;
     /** Runs /ctx-recomp. When `range` is provided, runs partial recomp over
      *  that range (snapped to enclosing compartment boundaries). When omitted,
@@ -765,6 +778,22 @@ export function createMagicContextCommandHandler(deps: {
                 }
                 const liveModelKey = deps.getLiveModelKey?.(sessionId);
                 const liveContextLimit = deps.getContextLimit?.(sessionId);
+                const modelSlash = liveModelKey?.indexOf("/") ?? -1;
+                const windowGeometry =
+                    liveModelKey && modelSlash > 0
+                        ? resolveContextWindowGeometry(
+                              liveModelKey.slice(0, modelSlash),
+                              liveModelKey.slice(modelSlash + 1),
+                              { db: deps.db, sessionID: sessionId },
+                          )
+                        : undefined;
+                const rustTailHygiene = rustStatus?.tail_hygiene;
+                const tailHygiene = resolveTailHygieneStatus(
+                    deps.getTailHygiene?.(sessionId),
+                    rustTailHygiene && typeof rustTailHygiene === "object"
+                        ? (rustTailHygiene as WireTailHygieneBaseline)
+                        : undefined,
+                );
                 const statusOutput = executeStatus(
                     deps.db,
                     sessionId,
@@ -785,6 +814,8 @@ export function createMagicContextCommandHandler(deps: {
                               progress: deps.getDreamerProgress?.() ?? null,
                           }
                         : undefined,
+                    windowGeometry,
+                    tailHygiene,
                 );
                 const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
                 const modeStatus = deps.compactionOff
@@ -802,7 +833,10 @@ export function createMagicContextCommandHandler(deps: {
                 } else if (!parsed.ok) {
                     result = `## Magic Wrapup — Invalid Arguments\n\n${parsed.message}`;
                 } else if (rustMode) {
-                    const keep = Math.min(100, Math.max(5, parsed.messagesToKeep));
+                    // The requested keep watermark is forwarded unchanged: it counts raw
+                    // messages and the module honors it as given (the TypeScript
+                    // orchestrator imposes no 5/100 clamp, only a floor of 1).
+                    const keep = parsed.messagesToKeep;
                     await deps.sendNotification(
                         sessionId,
                         "## Magic Wrapup\n\nStarting wrapup…",

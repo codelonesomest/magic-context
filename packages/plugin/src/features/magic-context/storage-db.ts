@@ -10,7 +10,7 @@ import {
     statSync,
     unlinkSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import {
     getLegacyOpenCodeMagicContextStorageDir,
@@ -19,16 +19,19 @@ import {
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
+    classifyProcessKind,
     discoverLivePiProcessIds,
+    inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
+    readProcessCommand,
 } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
-import type { FailClosedBlockingProcess } from "./fail-closed-block";
+import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -65,6 +68,8 @@ export interface MigrationOnOpenRefusal {
     persistedVersion: number;
     supportedVersion: number;
     serverPids: number[];
+    /** Process kinds may be omitted when older test fixtures provide only serverPids. */
+    blockingProcesses?: FailClosedBlockingProcess[];
     unreadableFile?: string;
     unreadableArm?: "parse" | "io";
 }
@@ -88,7 +93,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 76;
+export const LATEST_SUPPORTED_VERSION = 78;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -314,9 +319,16 @@ export function enforceSchemaFence(
 export type RpcDiscoveryUnreadableArm = "parse" | "io";
 
 export interface RpcServerDiscovery {
-    state: "absent" | "stale" | "live" | "unreadable";
+    state: "absent" | "stale" | "live" | "unreadable" | "inconclusive";
     serverPids: number[];
+    /** Per-PID labels captured while the discovery record was validated. */
+    serverProcesses?: FailClosedBlockingProcess[];
     staleFiles: string[];
+    /**
+     * PIDs for which the process-existence or process-identity check could not
+     * run. That failure does not prove that the process is actively using RPC.
+     */
+    inconclusivePids?: number[];
     unreadableFile?: string;
     unreadableArm?: RpcDiscoveryUnreadableArm;
 }
@@ -378,6 +390,48 @@ function invalidDiscoveryReason(raw: string): RpcDiscoveryJunkReason {
     // A legacy file containing only a port, with no server PID, is invalid and
     // cannot be accepted while deciding whether migration is safe.
     return "parse-invalid";
+}
+
+function classifyDiscoveryRecordKind(record: {
+    kind?: string;
+    harness?: string;
+}): FailClosedProcessKind | null {
+    for (const value of [record.kind, record.harness]) {
+        const normalized = value?.trim().toLowerCase();
+        if (!normalized) continue;
+        if (normalized === "process") return "process";
+        if (normalized === "opencode server" || normalized === "server") {
+            return "OpenCode server";
+        }
+        if (
+            normalized === "opencode instance" ||
+            normalized === "opencode instance (tui/cli)" ||
+            normalized === "opencode" ||
+            normalized === "tui" ||
+            normalized === "cli"
+        ) {
+            return "OpenCode instance (TUI/CLI)";
+        }
+        if (
+            normalized === "pi" ||
+            normalized === "pi harness" ||
+            normalized === "omp" ||
+            normalized === "oh-my-pi"
+        ) {
+            return "Pi";
+        }
+    }
+    return null;
+}
+
+function classifyRpcProcess(record: {
+    pid: number;
+    kind?: string;
+    harness?: string;
+}): FailClosedProcessKind {
+    return (
+        classifyDiscoveryRecordKind(record) ?? classifyProcessKind(readProcessCommand(record.pid))
+    );
 }
 
 function classifyJunkDiscovery(
@@ -446,7 +500,9 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     }
 
     const pids = new Set<number>();
+    const processByPid = new Map<number, FailClosedBlockingProcess>();
     const staleFiles: string[] = [];
+    const inconclusivePids = new Set<number>();
     for (const portFile of portFiles) {
         let raw: string;
         try {
@@ -464,8 +520,23 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             if (junk) return junk;
             continue;
         }
-        if (isPidAlive(record.pid) && isPidIdentityPlausible(record)) pids.add(record.pid);
-        else staleFiles.push(portFile);
+        const liveness = isPidAlive(record.pid);
+        const identity = liveness === "dead" ? "implausible" : isPidIdentityPlausible(record);
+        if (liveness === "alive" && identity === "plausible") {
+            pids.add(record.pid);
+            const detected = {
+                kind: classifyRpcProcess(record),
+                pid: record.pid,
+            } satisfies FailClosedBlockingProcess;
+            const previous = processByPid.get(record.pid);
+            if (!previous || (previous.kind === "process" && detected.kind !== "process")) {
+                processByPid.set(record.pid, detected);
+            }
+        } else if (liveness === "dead" || identity === "implausible") {
+            staleFiles.push(portFile);
+        } else {
+            inconclusivePids.add(record.pid);
+        }
     }
 
     // Remove stale evidence even when another record still proves that a server
@@ -481,19 +552,32 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
 
     const serverPids = [...pids].sort((a, b) => a - b);
     if (serverPids.length > 0) {
-        return { state: "live", serverPids, staleFiles };
+        return {
+            state: "live",
+            serverPids,
+            serverProcesses: serverPids.map(
+                (pid) => processByPid.get(pid) ?? { kind: "process" as const, pid },
+            ),
+            staleFiles,
+        };
+    }
+    const uncertainPids = [...inconclusivePids].sort((a, b) => a - b);
+    if (uncertainPids.length > 0) {
+        return {
+            state: "inconclusive",
+            serverPids: [],
+            staleFiles,
+            inconclusivePids: uncertainPids,
+        };
     }
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-/** Return the live harnesses that would block an on-open migration. */
+/** Return the live processes that would block an on-open migration. */
 export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
     const discovery = inspectRpcServerDiscovery(storageDir);
-    const openCode =
-        discovery.state === "live"
-            ? discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }))
-            : [];
-    const pi = discoverLivePiProcessIds().map((pid) => ({ harness: "Pi harness", pid }));
+    const openCode = discovery.state === "live" ? (discovery.serverProcesses ?? []) : [];
+    const pi = discoverLivePiProcessIds().map((pid) => ({ kind: "Pi" as const, pid }));
     return [...openCode, ...pi];
 }
 
@@ -502,6 +586,69 @@ export function getLiveMigrationBlockingProcesses(storageDir: string): FailClose
  * older build. OpenCode servers keep their plugin loaded, and a live Pi process
  * can spawn a child with its loaded extension after another process migrates.
  */
+export function formatInconclusiveOpenCodeMigrationWarning(
+    dbPath: string,
+    pids: readonly number[],
+): string {
+    return `[magic-context] storage warning: continuing migration for ${dbPath}; OpenCode server PID ${pids.join(", ")} was not confirmed because its liveness or identity check could not run. This commonly means an OS sandbox denied kill(0) or ps. No live OpenCode server was confirmed.`;
+}
+
+function logInconclusiveMigrationProbes(
+    dbPath: string,
+    discovery: RpcServerDiscovery,
+    piProbeState: "known" | "unreadable",
+): void {
+    const uncertainPids = discovery.inconclusivePids ?? [];
+    if (uncertainPids.length > 0) {
+        log(formatInconclusiveOpenCodeMigrationWarning(dbPath, uncertainPids));
+    }
+    if (piProbeState === "unreadable") {
+        log(
+            `[magic-context] storage warning: continuing migration for ${dbPath}; the Pi/OMP process-list probe could not run, which commonly means an OS sandbox denied ps. No live Pi harness was confirmed.`,
+        );
+    }
+}
+
+function isDefaultSharedDatabasePath(dbPath: string): boolean {
+    // Test-only storage overrides are isolated by construction and must not
+    // inherit a real user's global Pi-process fence.
+    if (
+        !process.env.XDG_DATA_HOME &&
+        (process.env.MAGIC_CONTEXT_TEST_DATA_DIR || process.env.NODE_ENV === "test")
+    ) {
+        return false;
+    }
+    return resolve(dbPath) === resolve(join(getMagicContextStorageDir(), "context.db"));
+}
+
+function migrationBlockingPiPids(
+    dbPath: string,
+    discovery: RpcServerDiscovery,
+    discoveredPiPids: readonly number[],
+): number[] {
+    if (isDefaultSharedDatabasePath(dbPath)) return [...discoveredPiPids];
+
+    // RPC discovery is rooted inside dbDir, so a matching PID is evidence that
+    // this process is attached to the target data directory rather than merely
+    // running elsewhere on the machine.
+    const sameDataDirPids = new Set(discovery.serverPids);
+    return discoveredPiPids.filter((pid) => sameDataDirPids.has(pid));
+}
+
+export function formatLiveProcessMigrationRefusal(
+    dbPath: string,
+    persistedVersion: number,
+    latestSupportedVersion: number,
+    serverPids: readonly number[],
+    piPids: readonly number[],
+): string {
+    const blockers = [
+        ...serverPids.map((pid) => `confirmed OpenCode server PID ${pid}`),
+        ...piPids.map((pid) => `confirmed Pi harness PID ${pid}`),
+    ];
+    return `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} still use the old plugin build. Restart the blocking harness, then retry this process.`;
+}
+
 function enforceMigrationOnOpenGuard(
     db: Database,
     dbPath: string,
@@ -514,9 +661,25 @@ function enforceMigrationOnOpenGuard(
         return true;
     }
     const discovery = inspectRpcServerDiscovery(dbDir);
-    const piPids = discoverLivePiProcessIds();
-    if ((discovery.state === "absent" || discovery.state === "stale") && piPids.length === 0) {
+    const piDiscovery = inspectLivePiProcesses();
+    const piPids = migrationBlockingPiPids(dbPath, discovery, piDiscovery.processIds);
+    const serverProcesses =
+        discovery.serverProcesses ??
+        (discovery.state === "live"
+            ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
+            : []);
+    const blockingProcesses = [
+        ...serverProcesses,
+        ...piPids.map((pid) => ({ kind: "Pi" as const, pid })),
+    ];
+    if (
+        (discovery.state === "absent" ||
+            discovery.state === "stale" ||
+            discovery.state === "inconclusive") &&
+        piPids.length === 0
+    ) {
         lastMigrationOnOpenRefusal = null;
+        logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery.state);
         return true;
     }
     const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
@@ -526,6 +689,7 @@ function enforceMigrationOnOpenGuard(
         persistedVersion,
         supportedVersion: latestSupportedVersion,
         serverPids: blockingPids,
+        blockingProcesses,
         ...(discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {}),
         ...(discovery.unreadableArm ? { unreadableArm: discovery.unreadableArm } : {}),
     };
@@ -540,12 +704,14 @@ function enforceMigrationOnOpenGuard(
             `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`,
         );
     } else {
-        const blockers = [
-            ...discovery.serverPids.map((pid) => `OpenCode server PID ${pid}`),
-            ...piPids.map((pid) => `Pi harness PID ${pid}`),
-        ];
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} may still use the old plugin build. Restart the blocking harness, then retry this process.`,
+            formatLiveProcessMigrationRefusal(
+                dbPath,
+                persistedVersion,
+                latestSupportedVersion,
+                discovery.serverPids,
+                piPids,
+            ),
         );
     }
     return false;
@@ -828,6 +994,7 @@ export function initializeDatabase(db: Database): void {
       last_observed_at INTEGER,
       answer_refreshed_at INTEGER,
       source_candidate_ids TEXT NOT NULL DEFAULT '[]',
+      source_candidate_provenance TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -1464,6 +1631,13 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "primer_candidates", "question_embedding", "BLOB");
     ensureColumn(db, "primer_candidates", "question_embedding_model_id", "TEXT");
     ensureColumn(db, "primers", "question_embedding_model_id", "TEXT");
+    ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
+    const hasUserMemoriesTable = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_memories'")
+        .get();
+    if (hasUserMemoriesTable) {
+        ensureColumn(db, "user_memories", "source_candidate_provenance", "TEXT");
+    }
     db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_primer_candidates_occurrence
         ON primer_candidates(project_path, harness, session_id, source_start_message_id, source_end_message_id);
@@ -1546,6 +1720,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // strip newly-aged calls mid-prefix on a defer pass (Anthropic cache bust).
     ensureColumn(db, "session_meta", "stale_reduce_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "processed_image_stripped_ids", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "memory_embeddings", "model_id", "TEXT");
@@ -1894,23 +2070,23 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // cannot go here because the table doesn't exist yet on a fresh DB.
 }
 
-const CHANNEL2_CLAIM_TTL_MS = 120_000;
+const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
 
 /**
  * Boot heal for a wedged Channel-2 ceiling-nudge lease.
  *
  * The delivery path CAS-claims `pending → claimed` before sending the synthetic
- * user message. A crash can strand that claim and burn the one-shot cap, but a
+ * user message. A crash can strand that claim and consume the cycle, but a
  * sibling process can also be legitimately mid-send against the shared DB. The
  * claimed_at lease timestamp is the liveness boundary: only old/legacy claims are
- * rewound to `pending`; fresh claims are left alone so boot recovery never steals
- * an in-flight delivery.
+ * reaped to the empty, re-armable state; fresh claims are left alone so boot
+ * recovery never steals an in-flight delivery.
  */
 function healWedgedChannel2Claims(db: Database): void {
     try {
         const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
         db.prepare(
-            "UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
+            "UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
         ).run(staleBefore);
     } catch {
         // Columns may be missing on a very fresh DB before ensureColumn/migration

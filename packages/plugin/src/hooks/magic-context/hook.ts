@@ -274,7 +274,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             notifyMagicContextDisabled(deps.client, reason);
             const migration = getMigrationOnOpenRefusal();
             const blockingProcesses =
-                migration?.serverPids.map((pid) => ({ harness: "OpenCode server", pid })) ?? [];
+                migration?.blockingProcesses ??
+                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
+                [];
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",
@@ -414,7 +416,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Channel 1 (ctx_reduce tool-output nudge) per-session metric baseline.
     // Written at the end of each transform pass (post-drop), read in
     // tool.execute.after. Only populated for primary sessions.
-    const channel1StateBySession = new Map<string, import("./ctx-reduce-nudge").Channel1State>();
+    const channel1StateBySession =
+        deps.liveSessionState?.channel1StateBySession ??
+        new Map<string, import("./ctx-reduce-nudge").Channel1State>();
     const channel2DirectiveTextBySession = new Map<string, string>();
 
     /**
@@ -481,6 +485,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // shared live state — and the next transform pass + RPC sidebar see them.
         liveSessionState: {
             liveModelBySession,
+            channel1StateBySession,
             variantBySession,
             agentBySession,
             historyRefreshSessions,
@@ -797,7 +802,26 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                         "max_sequence" in record && typeof record.max_sequence === "number"
                             ? record.max_sequence
                             : afterSequence;
-                    return { max_sequence: maxSequence, compartments };
+                    const compartmentCount =
+                        "compartment_count" in record &&
+                        typeof record.compartment_count === "number"
+                            ? record.compartment_count
+                            : undefined;
+                    const revertEpoch =
+                        "revert_epoch" in record && typeof record.revert_epoch === "number"
+                            ? record.revert_epoch
+                            : undefined;
+                    return {
+                        max_sequence: maxSequence,
+                        compartments,
+                        ...(compartmentCount !== undefined
+                            ? { compartment_count: compartmentCount }
+                            : {}),
+                        ...(revertEpoch !== undefined ? { revert_epoch: revertEpoch } : {}),
+                        ...("set_changed" in record && record.set_changed === true
+                            ? { set_changed: true }
+                            : {}),
+                    };
                 },
             };
             return client;
@@ -1082,15 +1106,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianTwoPass: deps.config.historian?.two_pass === true,
         liveModelBySession,
         sessionDirectoryBySession,
-        autoSearch: deps.config.memory?.auto_search?.enabled
-            ? {
-                  enabled: true,
-                  scoreThreshold: deps.config.memory?.auto_search.score_threshold,
-                  minPromptChars: deps.config.memory?.auto_search.min_prompt_chars,
-                  directory: deps.directory,
-                  ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-              }
-            : undefined,
+        // Keep the resolved controls available to both renderers. Rust mode must receive
+        // an explicit false here rather than falling back to the module default.
+        autoSearch: {
+            enabled: deps.config.memory?.auto_search?.enabled ?? true,
+            scoreThreshold: deps.config.memory?.auto_search?.score_threshold ?? 0.6,
+            minPromptChars: deps.config.memory?.auto_search?.min_prompt_chars ?? 20,
+            directory: deps.directory,
+            ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+        },
         // Age-tier caveman text compression is an opt-in primary-session pass.
         // Subagents are excluded in transform.ts because their context is curated
         // by the parent and they have no ctx_expand recovery path.
@@ -1106,6 +1130,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         maybeAutoEmbedSession,
         transformMode: deps.config.transform_mode,
         promptSurface: deps.config.prompt_surface,
+        promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,
         tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
         rustMemorySyncRequestedSessions,
@@ -1254,6 +1279,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         },
         getDreamerProgress: () => dreamerProgressByProject.get(projectPath) ?? null,
+        getTailHygiene: (sessionId) => channel1StateBySession.get(sessionId),
         getContextLimit: (sessionId) => {
             // Same DB fallback as getLiveModelKey — /ctx-status's "Resolved
             // context limit" and history-budget math depend on the live model.

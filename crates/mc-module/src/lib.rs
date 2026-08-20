@@ -38,9 +38,11 @@ pub mod memory_render;
 pub mod memory_tool;
 pub mod project_docs;
 pub mod prompt_surface;
+mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
+mod tail_hygiene;
 pub mod transform;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -48,7 +50,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -56,6 +58,8 @@ use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
 use chrono::{Local, TimeZone};
+use cortexkit_lease::LeaseError;
+use cortexkit_store::StoreError;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 #[cfg(test)]
 use mc_store::TagNumberRow;
@@ -142,6 +146,67 @@ pub struct SessionBinding {
     pub history_budget_tokens: f64,
 }
 
+fn apply_claude_code_config_controls(
+    request: &mut TransformRequest,
+    config: &McModuleConfig,
+    serializer_profile: Option<SerializerProfile>,
+) {
+    if serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic) {
+        return;
+    }
+    // Claude Code does not carry these controls in its transform request. Route config is
+    // daemon-owned and frozen at bind, so it is the only authority for this transport leg.
+    request.auto_search_enabled = config.auto_search.enabled;
+    request.auto_search_score_threshold = config.auto_search.score_threshold;
+    request.auto_search_min_prompt_chars = config.auto_search.min_prompt_chars;
+    request.caveman_enabled = config.caveman.enabled;
+    request.caveman_min_chars = config.caveman.min_size;
+    // Thalamus does not send a todowrite verdict and Claude Code has no native todowrite
+    // surface. The transform deliberately leaves None intact; synthesis treats missing
+    // authority as unavailable rather than manufacturing an unreachable tool call.
+    if config.prompt_surface_guidance_override.is_some() {
+        request.prompt_surface_guidance_override = config.prompt_surface_guidance_override.clone();
+    }
+}
+
+/// Normalize the OC host's already-rendered mural to the exact m0 input contract.
+fn host_mural_artifact(input: Option<&m0_compose::M0MuralInput>) -> Option<(String, String)> {
+    let input = input?;
+    if !input.enabled || !input.supports_vision {
+        return None;
+    }
+    let data_url = input
+        .data_url
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let content_hash = input
+        .content_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(data_url.as_bytes())));
+    Some((data_url.to_string(), content_hash))
+}
+
+/// Rehydrate the input accepted by the shared m0 composer from one project artifact.
+fn cc_mural_input(
+    store: &McStore,
+    project_path: &str,
+) -> Result<Option<m0_compose::M0MuralInput>, McStoreError> {
+    let Some(artifact) = store.load_project_mural_artifact(project_path)? else {
+        return Ok(None);
+    };
+    let Ok(data_url) = String::from_utf8(artifact.data_url) else {
+        return Ok(None);
+    };
+    Ok((!data_url.is_empty()).then_some(m0_compose::M0MuralInput {
+        enabled: true,
+        supports_vision: true,
+        data_url: Some(data_url),
+        content_hash: Some(artifact.content_hash),
+    }))
+}
+
 /// Why a transform request can't be served: the route isn't bound, or the request's
 /// session doesn't match the channel's bound session. Both fail LOUD — never default to
 /// a project (a default would be a cross-project read of another project's store).
@@ -160,6 +225,112 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
 const TRANSFORM_HEALTH_LANE: &str = "transform";
 const TRANSFORM_WEDGE_THRESHOLD_MS: u64 = 120_000;
+const STORE_OPEN_IDLE: u8 = 0;
+const STORE_OPENING: u8 = 1;
+const STORE_OPEN_WAITING: u8 = 2;
+const STORE_OPENED: u8 = 3;
+const STORE_LEASE_WAIT_WINDOW: Duration = Duration::from_secs(60);
+const STORE_LEASE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const STORE_LEASE_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct StoreOpenPolicy {
+    wait_window: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl Default for StoreOpenPolicy {
+    fn default() -> Self {
+        Self {
+            wait_window: STORE_LEASE_WAIT_WINDOW,
+            initial_backoff: STORE_LEASE_INITIAL_BACKOFF,
+            max_backoff: STORE_LEASE_MAX_BACKOFF,
+        }
+    }
+}
+
+struct StoreOpenCoordinator {
+    phase: AtomicU8,
+    wait_started_at_ms: AtomicU64,
+    cancelled: AtomicBool,
+    cancel: Notify,
+    active_waiters: AtomicU64,
+    waiter_completed: Notify,
+    waiter_starts: AtomicU64,
+    policy: Mutex<StoreOpenPolicy>,
+}
+
+impl StoreOpenCoordinator {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(STORE_OPEN_IDLE),
+            wait_started_at_ms: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            cancel: Notify::new(),
+            active_waiters: AtomicU64::new(0),
+            waiter_completed: Notify::new(),
+            waiter_starts: AtomicU64::new(0),
+            policy: Mutex::new(StoreOpenPolicy::default()),
+        }
+    }
+
+    fn waiting_report(&self, now_ms: u64) -> Option<HealthReport> {
+        if self.phase.load(Ordering::Acquire) != STORE_OPEN_WAITING {
+            return None;
+        }
+        let started_at_ms = self.wait_started_at_ms.load(Ordering::Relaxed);
+        let elapsed_ms = now_ms.saturating_sub(started_at_ms);
+        Some(HealthReport {
+            status: HealthStatus::Degraded,
+            detail: Some(format!(
+                "waiting on storage lease, held by prior incarnation, {:.2}s elapsed",
+                elapsed_ms as f64 / 1_000.0
+            )),
+            metrics: Some(json!({
+                "lane": TRANSFORM_HEALTH_LANE,
+                "storage_state": "waiting_for_lease",
+                "storage_lease_wait_elapsed_ms": elapsed_ms,
+            })),
+        })
+    }
+
+    fn finish_waiter(&self) {
+        self.active_waiters.fetch_sub(1, Ordering::AcqRel);
+        self.waiter_completed.notify_waiters();
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.cancel.notify_waiters();
+    }
+}
+
+struct StoreOpenWaiterGuard {
+    coordinator: Arc<StoreOpenCoordinator>,
+}
+
+impl Drop for StoreOpenWaiterGuard {
+    fn drop(&mut self) {
+        self.coordinator.finish_waiter();
+    }
+}
+
+fn jittered_store_open_delay(base: Duration, cap: Duration, attempt: usize) -> Duration {
+    const JITTER_PERCENT: [u128; 4] = [100, 108, 116, 104];
+    let nanos = base
+        .as_nanos()
+        .saturating_mul(JITTER_PERCENT[attempt % JITTER_PERCENT.len()])
+        / 100;
+    Duration::from_nanos(nanos.min(cap.as_nanos()).min(u64::MAX as u128) as u64)
+}
+
+fn store_open_error_is_live_lease(error: &McStoreError) -> bool {
+    matches!(
+        error,
+        McStoreError::Store(StoreError::Lease(LeaseError::Held { .. }))
+    )
+}
 
 /// The transform heartbeat is deliberately process-wide: the SDK health callback runs on
 /// the channel-0 control path and must be able to observe the data-plane lane without
@@ -396,7 +567,10 @@ pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
 const STORAGE_NAMESPACE: &str = "mc_cache";
 #[cfg(test)]
 const GUIDANCE_TEXT: &str = prompt_surface::GUIDANCE_FULL_PRIMARY;
-const CTX_REDUCE_ACKNOWLEDGEMENT: &str = "Queued for context compaction.";
+/// Matches the default OpenCode protected tag window. The Claude Code facade has no
+/// request-local transform config, so acknowledgement validation uses the durable tag
+/// ordering with the same default recency window as an omitted transform field.
+const DEFAULT_PROTECTED_TAGS: usize = 20;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
@@ -408,18 +582,12 @@ const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 /// TypeScript evaluates every nonempty eligible chunk after trigger checks. Rust keeps
 /// this minimum at zero so it does not impose an additional minimum-token requirement.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 0;
-/// Thalamus clamps the prompt argument to the same range before forwarding it.
-/// Changing either bound requires a coordinated module and Thalamus update so a
-/// retried prompt resolves to the same keep watermark on both sides.
-const WRAPUP_KEEP_MIN: usize = 5;
-const WRAPUP_KEEP_MAX: usize = 100;
 /// Maximum number of newly published compartments returned by one status page.
 const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
-const SESSION_UNRESOLVED_MESSAGE: &str =
-    "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
+const SESSION_UNRESOLVED_MESSAGE: &str = "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
 /// OpenCode's Rust-mode tool route binds the real harness session, unlike the Claude Code
 /// wrapper route whose binding is an instance-token namespace.
 const OPENCODE_HARNESS: &str = "opencode";
@@ -456,6 +624,11 @@ const STATE_IMPORT_MAX_PENDING: usize = 64;
 const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSFORM_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const BOUNDARY_TOKEN_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+// Sized from the ASTRO-scale fixture (4,600 messages / 15,000 blocks): that
+// FlatProjection retains ~156 MiB, so one such session plus a smaller neighbor
+// fit without the native-attach 192 MiB entry cap evicting the projection.
+const PROJECTION_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const PROJECTION_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 const ACTIVE_SNAPSHOT_LEASE_BUDGET_BYTES: usize = TRANSFORM_SNAPSHOT_BUDGET_BYTES;
 const MAX_ACTIVE_SNAPSHOT_LEASES: usize = 8;
 /// InFlight snapshot markers have no byte charge, so they need their own count bound:
@@ -922,14 +1095,21 @@ impl TransformPageCoordinator {
         }
     }
 
-    fn discard(&mut self, session_id: &str) {
+    /// Drop the live collection and report its staged page count. Completed and applying
+    /// requests are still cleared, but only a collecting request represents discarded pages.
+    fn discard(&mut self, session_id: &str) -> Option<usize> {
         let phase = self.sessions.get_mut(session_id).map(|session| {
             session.completed = None;
             std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
         });
+        let staged_pages = phase.as_ref().and_then(|phase| match phase {
+            TransformPagePhase::Collecting(pending) => Some(pending.pages.len()),
+            TransformPagePhase::Idle | TransformPagePhase::Applying { .. } => None,
+        });
         if let Some(phase) = phase {
             self.release_phase(&phase);
         }
+        staged_pages
     }
 
     fn set_phase(&mut self, session_id: &str, phase: TransformPagePhase) {
@@ -1648,6 +1828,147 @@ impl ModuleMemoryMutationWire {
     }
 }
 
+impl TransformRequest {
+    /// Prefer the request's host-resolved threshold. `None` specifically means an older host did
+    /// not send the field, so the caller's trusted config remains the compatibility fallback.
+    fn execute_threshold_or(&self, fallback: f64) -> f64 {
+        self.effective_execute_threshold.unwrap_or(fallback)
+    }
+
+    /// Estimated bytes retained by one ready snapshot, including its cache keys and `Arc`.
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes_with_charges(None, None)
+    }
+
+    fn retained_bytes_with_charges(
+        &self,
+        native_charge: Option<usize>,
+        message_charge: Option<usize>,
+    ) -> usize {
+        use crate::retained_size::{
+            btree_map_allocation_bytes, ck_wire_message_retained_bytes,
+            cloned_string_retained_bytes, value_heap_bytes, ARC_ALLOCATION_OVERHEAD_BYTES,
+        };
+        use std::mem::size_of;
+
+        let direct_strings = self
+            .kind
+            .capacity()
+            .saturating_add(self.serializer_profile.capacity())
+            .saturating_add(self.session_id.capacity())
+            .saturating_add(self.render_config.capacity())
+            .saturating_add(self.system_prompt_hash.capacity())
+            .saturating_add(self.upgrade_state.capacity())
+            .saturating_add(self.provider_id.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.model_key.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.cache_ttl.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                self.prompt_surface_model_key
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.prompt_surface_config_identity.capacity())
+            .saturating_add(
+                self.prompt_surface_guidance_override
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.mural.as_ref().map_or(0, |mural| {
+                mural
+                    .data_url
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                    .saturating_add(mural.content_hash.as_ref().map_or(0, String::capacity))
+            }))
+            .saturating_add(
+                self.full_array_fingerprint
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.provider_error.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.channel2_nudge_state.capacity())
+            .saturating_add(
+                self.channel2_delivered_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(
+                self.detected_context_limit_model_key
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.prior_conversation_key.capacity());
+        let prompt_surface = btree_map_allocation_bytes::<String, String>(
+            self.prompt_surface_tool_descriptions.len(),
+        )
+        .saturating_add(
+            self.prompt_surface_tool_descriptions
+                .iter()
+                .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        );
+        let native_messages = native_charge.unwrap_or_else(|| {
+            self.native_messages.as_ref().map_or(0, |messages| {
+                messages
+                    .capacity()
+                    .saturating_mul(size_of::<Value>())
+                    .saturating_add(messages.iter().map(value_heap_bytes).sum::<usize>())
+            })
+        });
+        let messages = message_charge.unwrap_or_else(|| {
+            self.messages
+                .capacity()
+                .saturating_mul(size_of::<ck_wire::CkIngressMessage>())
+                .saturating_add(
+                    self.messages
+                        .iter()
+                        .map(|message| {
+                            message.mid.capacity().saturating_add(
+                                ck_wire_message_retained_bytes(&message.ck)
+                                    .saturating_sub(size_of::<ck_wire::CkWireMessage>()),
+                            )
+                        })
+                        .sum::<usize>(),
+                )
+        });
+        let tail_delta = self.tail_delta.as_ref().map_or(0, value_heap_bytes);
+        let declared_trim = self.declared_trim.as_ref().map_or(0, |trim| {
+            trim.flat_boundary_id
+                .capacity()
+                .saturating_add(trim.boundary_bare_message_id.capacity())
+        });
+        let constituents = self
+            .constituents
+            .capacity()
+            .saturating_mul(size_of::<(String, String, u64)>())
+            .saturating_add(
+                self.constituents
+                    .iter()
+                    .map(|(conversation, edge, _)| {
+                        conversation.capacity().saturating_add(edge.capacity())
+                    })
+                    .sum::<usize>(),
+            );
+        let cache_metadata = size_of::<TransformSnapshot>()
+            // One hash-table bucket/control/slack allowance, plus the independently allocated
+            // map key and ready-LRU key. Both clones use length-sized string allocations.
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add(cloned_string_retained_bytes(&self.session_id).saturating_mul(2));
+
+        size_of::<Self>()
+            .saturating_add(direct_strings)
+            .saturating_add(prompt_surface)
+            .saturating_add(native_messages)
+            .saturating_add(messages)
+            .saturating_add(tail_delta)
+            .saturating_add(declared_trim)
+            .saturating_add(constituents)
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(cache_metadata)
+    }
+}
+
 enum TransformSnapshot {
     InFlight {
         generation: u64,
@@ -1890,8 +2211,11 @@ struct BoundaryTokenCacheEntry {
 
 #[derive(Debug, Clone, Default)]
 struct BoundaryTokenCacheSnapshot {
-    entries: HashMap<String, BoundaryTokenCacheEntry>,
-    formatted_tokens: HashMap<[u8; 32], usize>,
+    entries: Arc<HashMap<String, BoundaryTokenCacheEntry>>,
+    entry_updates: HashMap<String, BoundaryTokenCacheEntry>,
+    formatted_tokens: Arc<HashMap<[u8; 32], usize>>,
+    formatted_token_updates: HashMap<[u8; 32], usize>,
+    active_ids: Option<HashSet<String>>,
     hits: usize,
     misses: usize,
 }
@@ -1902,7 +2226,11 @@ impl BoundaryTokenCacheSnapshot {
         // so length alone cannot prove that a cached token count still describes these bytes.
         // The projection computes this digest once and retains it on the block, avoiding a second
         // full payload hash when the token cache entry is still valid.
-        if let Some(entry) = self.entries.get(block_id) {
+        if let Some(entry) = self
+            .entry_updates
+            .get(block_id)
+            .or_else(|| self.entries.get(block_id))
+        {
             if entry.byte_size == bytes.len() && entry.content_hash == *content_hash {
                 self.hits = self.hits.saturating_add(1);
                 return entry.token_count;
@@ -1910,7 +2238,7 @@ impl BoundaryTokenCacheSnapshot {
         }
         let token_count = mc_tokenizer::estimate_tokens(bytes);
         self.misses = self.misses.saturating_add(1);
-        self.entries.insert(
+        self.entry_updates.insert(
             block_id.to_string(),
             BoundaryTokenCacheEntry {
                 byte_size: bytes.len(),
@@ -1923,43 +2251,88 @@ impl BoundaryTokenCacheSnapshot {
 
     fn formatted_token_count(&mut self, bytes: &str) -> usize {
         let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
-        if let Some(token_count) = self.formatted_tokens.get(&content_hash) {
+        if let Some(token_count) = self
+            .formatted_token_updates
+            .get(&content_hash)
+            .or_else(|| self.formatted_tokens.get(&content_hash))
+        {
             return *token_count;
         }
         let token_count = mc_tokenizer::estimate_tokens(bytes);
-        self.formatted_tokens.insert(content_hash, token_count);
+        self.formatted_token_updates
+            .insert(content_hash, token_count);
         token_count
     }
 
     fn retain_projection(&mut self, projection: &crate::ck_wire::FlatProjection) {
-        let active_ids = projection
+        let active_count = projection
             .blocks
             .iter()
             .filter(|block| !block.synthetic)
-            .map(|block| block.id.as_str())
-            .collect::<HashSet<_>>();
-        self.entries
-            .retain(|block_id, _| active_ids.contains(block_id.as_str()));
+            .count();
+        let added_ids = self
+            .entry_updates
+            .keys()
+            .filter(|block_id| !self.entries.contains_key(block_id.as_str()))
+            .count();
+        if self.entries.len().saturating_add(added_ids) <= active_count {
+            return;
+        }
+        self.active_ids = Some(
+            projection
+                .blocks
+                .iter()
+                .filter(|block| !block.synthetic)
+                .map(|block| block.id.clone())
+                .collect(),
+        );
     }
 
+    #[cfg(test)]
     fn retained_bytes(&self) -> usize {
-        let source_bytes = self
-            .entries
-            .keys()
-            // Include a conservative per-entry allowance for the HashMap bucket and owned key.
-            .map(|block_id| block_id.len() + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64)
-            .sum::<usize>();
-        source_bytes
-            + self.formatted_tokens.len()
-                * (std::mem::size_of::<[u8; 32]>() + std::mem::size_of::<usize>() + 64)
+        boundary_token_maps_retained_bytes(
+            self.entries.iter().chain(self.entry_updates.iter()),
+            self.formatted_tokens.len() + self.formatted_token_updates.len(),
+        )
     }
+
+    fn materialize(
+        self,
+    ) -> (
+        HashMap<String, BoundaryTokenCacheEntry>,
+        HashMap<[u8; 32], usize>,
+    ) {
+        let mut entries =
+            Arc::try_unwrap(self.entries).unwrap_or_else(|entries| (*entries).clone());
+        entries.extend(self.entry_updates);
+        if let Some(active_ids) = self.active_ids {
+            entries.retain(|block_id, _| active_ids.contains(block_id));
+        }
+        let mut formatted_tokens = Arc::try_unwrap(self.formatted_tokens)
+            .unwrap_or_else(|formatted_tokens| (*formatted_tokens).clone());
+        formatted_tokens.extend(self.formatted_token_updates);
+        (entries, formatted_tokens)
+    }
+}
+
+fn boundary_token_maps_retained_bytes<'a>(
+    entries: impl Iterator<Item = (&'a String, &'a BoundaryTokenCacheEntry)>,
+    formatted_token_count: usize,
+) -> usize {
+    let source_bytes = entries
+        // Include a conservative per-entry allowance for the HashMap bucket and owned key.
+        .map(|(block_id, _)| block_id.len() + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64)
+        .sum::<usize>();
+    source_bytes
+        + formatted_token_count
+            * (std::mem::size_of::<[u8; 32]>() + std::mem::size_of::<usize>() + 64)
 }
 
 #[derive(Debug)]
 struct BoundaryTokenCacheSession {
     retained_bytes: usize,
-    entries: HashMap<String, BoundaryTokenCacheEntry>,
-    formatted_tokens: HashMap<[u8; 32], usize>,
+    entries: Arc<HashMap<String, BoundaryTokenCacheEntry>>,
+    formatted_tokens: Arc<HashMap<[u8; 32], usize>>,
 }
 
 #[derive(Debug)]
@@ -1991,7 +2364,12 @@ impl BoundaryTokenCache {
         let (entries, formatted_tokens) = self
             .sessions
             .get(session_id)
-            .map(|session| (session.entries.clone(), session.formatted_tokens.clone()))
+            .map(|session| {
+                (
+                    Arc::clone(&session.entries),
+                    Arc::clone(&session.formatted_tokens),
+                )
+            })
             .unwrap_or_default();
         if !entries.is_empty() || !formatted_tokens.is_empty() {
             self.lru.retain(|candidate| candidate != session_id);
@@ -2005,9 +2383,13 @@ impl BoundaryTokenCache {
     }
 
     fn replace(&mut self, session_id: &str, snapshot: BoundaryTokenCacheSnapshot) {
+        // Drop the session's Arc owners before materializing. On the ordinary single-flight path,
+        // Arc::try_unwrap then applies only the suffix updates instead of cloning every cached key.
         self.remove(session_id);
-        let retained_bytes = snapshot.retained_bytes();
-        if (snapshot.entries.is_empty() && snapshot.formatted_tokens.is_empty())
+        let (entries, formatted_tokens) = snapshot.materialize();
+        let retained_bytes =
+            boundary_token_maps_retained_bytes(entries.iter(), formatted_tokens.len());
+        if (entries.is_empty() && formatted_tokens.is_empty())
             || retained_bytes > self.max_retained_bytes
         {
             return;
@@ -2017,8 +2399,8 @@ impl BoundaryTokenCache {
             session_id.to_string(),
             BoundaryTokenCacheSession {
                 retained_bytes,
-                entries: snapshot.entries,
-                formatted_tokens: snapshot.formatted_tokens,
+                entries: Arc::new(entries),
+                formatted_tokens: Arc::new(formatted_tokens),
             },
         );
         self.lru.push_back(session_id.to_string());
@@ -2033,12 +2415,34 @@ impl BoundaryTokenCache {
     }
 }
 
-const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+// These cache budgets are sized for a representative workload of 4,600 messages and 15,000
+// blocks, whose native representation is roughly 49 MiB. After removal of sidecar trees, its
+// retained keys plus encoded and ingress chunks remain below 192 MiB, while the 256 MiB total
+// allows more than one large session. The ingress FlatProjection lives in its own cache so an oversized native
+// snapshot can drop sidecar trees without discarding the projection. Because these are charged
+// estimates, the total remains a hard upper bound so that one unusually large session cannot
+// cause unbounded cache growth.
+const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+// These three caches are independent by design: a serialized-output miss re-encodes canonical
+// CortexKit (CK) messages, while a projection or native-prefix miss either reconstructs from the
+// ready snapshot or asks
+// the adapter for a full request. No cache may interpret another cache's presence as authority.
+// Keep their aggregate process-retained ceiling explicit when any individual budget changes.
+const TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES: usize = 768 * 1024 * 1024;
+const _: () = assert!(
+    transform::SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES
+        + NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES
+        + PROJECTION_CACHE_BUDGET_BYTES
+        <= TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES
+);
 
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
     after: String,
     native_replace_from: usize,
+    native_prefix: Vec<Arc<Value>>,
+    native_prefix_retained_bytes: Vec<usize>,
     projection_cache: Option<ProjectionCacheInput>,
 }
 
@@ -2059,22 +2463,187 @@ struct NativeEncodedChunk {
     retained_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDeltaFallbackReason {
+    MissingCacheState,
+    FingerprintMismatch,
+    CacheContextMismatch,
+    InvalidFrontier,
+    NoReusableOutput,
+    MissingNativeContent,
+}
+
+impl NativeDeltaFallbackReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingCacheState => "missing_cache_state",
+            Self::FingerprintMismatch => "fingerprint_mismatch",
+            Self::CacheContextMismatch => "cache_context_mismatch",
+            Self::InvalidFrontier => "invalid_frontier",
+            Self::NoReusableOutput => "no_reusable_output",
+            Self::MissingNativeContent => "missing_native_content",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct NativeAttachmentCacheStats {
     reused_messages: usize,
     encoded_messages: usize,
+    request_native_retained_bytes: usize,
+    refused_store: usize,
+    degraded_store: usize,
+    evicted: usize,
+    delta_fallback_reason: Option<NativeDeltaFallbackReason>,
 }
 
 #[derive(Debug, Clone)]
 struct NativeAttachmentCacheSnapshot {
     context: NativeAttachmentContext,
     full_array_fingerprint: Option<String>,
+    // Message order and message ID (`mid`) pins identify a delta;
+    // `sidecar.messages` holds optional raw trees.
     sidecar: Arc<codec::DecodeSidecar>,
     message_keys: Vec<[u8; 32]>,
+    // Hashes let a retained prefix keep its cache keys after the corresponding raw tree is dropped.
     sidecar_hashes: HashMap<String, [u8; 32]>,
+    // Sizes exist only for raw trees still present in `sidecar.messages`.
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
-    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
+    // Transform-generated m0/m1 messages can shift every served-output position away from raw
+    // ingress. Preserve the acknowledged ingress because `native_replace_from` indexes that input.
+    ingress_chunks: Vec<Arc<Value>>,
+    // Pay each deep retained-size walk when a suffix first enters the cache. Warm passes reuse the
+    // prefix charges instead of traversing every retained provider tree again.
+    ingress_chunk_retained_bytes: Vec<usize>,
+}
+
+impl NativeAttachmentCacheSnapshot {
+    fn retained_bytes(&self, served_bytes: usize) -> usize {
+        use crate::retained_size::{
+            btree_map_allocation_bytes, cloned_string_retained_bytes, hash_map_allocation_bytes,
+            ARC_ALLOCATION_OVERHEAD_BYTES,
+        };
+        use std::mem::size_of;
+
+        let encoded_bytes = self
+            .chunks
+            .capacity()
+            .saturating_mul(size_of::<NativeEncodedChunk>())
+            .saturating_add(
+                self.chunks
+                    .iter()
+                    .map(|chunk| ARC_ALLOCATION_OVERHEAD_BYTES.saturating_add(chunk.retained_bytes))
+                    .sum::<usize>(),
+            );
+        let mut charged_values = self
+            .chunks
+            .iter()
+            .map(|chunk| Arc::as_ptr(&chunk.value))
+            .collect::<HashSet<_>>();
+        debug_assert_eq!(
+            self.ingress_chunks.len(),
+            self.ingress_chunk_retained_bytes.len()
+        );
+        let ingress_bytes = self
+            .ingress_chunks
+            .capacity()
+            .saturating_mul(size_of::<Arc<Value>>())
+            .saturating_add(
+                self.ingress_chunk_retained_bytes
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(
+                self.ingress_chunks
+                    .iter()
+                    .zip(&self.ingress_chunk_retained_bytes)
+                    .filter(|(value, _)| charged_values.insert(Arc::as_ptr(value)))
+                    .map(|(_, retained_bytes)| {
+                        ARC_ALLOCATION_OVERHEAD_BYTES.saturating_add(*retained_bytes)
+                    })
+                    .sum::<usize>(),
+            );
+        let sidecar_core_bytes = size_of::<codec::DecodeSidecar>()
+            .saturating_add(self.sidecar.harness.capacity())
+            .saturating_add(
+                self.sidecar
+                    .order
+                    .capacity()
+                    .saturating_mul(size_of::<String>()),
+            )
+            .saturating_add(self.sidecar.order.iter().map(String::capacity).sum())
+            .saturating_add(btree_map_allocation_bytes::<String, String>(
+                self.sidecar.mid_pins.len(),
+            ))
+            .saturating_add(
+                self.sidecar
+                    .mid_pins
+                    .iter()
+                    .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                    .sum(),
+            )
+            .saturating_add(hash_map_allocation_bytes(&self.sidecar_hashes))
+            .saturating_add(
+                self.sidecar_hashes
+                    .keys()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            );
+        let sidecar_bulk_bytes = btree_map_allocation_bytes::<
+            String,
+            Arc<codec::sidecar::HarnessMessageMeta>,
+        >(self.sidecar.messages.len())
+        .saturating_add(
+            self.sidecar
+                .messages
+                .keys()
+                .map(|key| key.capacity().saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES))
+                .sum(),
+        )
+        .saturating_add(hash_map_allocation_bytes(&self.sidecar_sizes))
+        .saturating_add(
+            self.sidecar_sizes
+                .keys()
+                .map(String::capacity)
+                .sum::<usize>(),
+        )
+        .saturating_add(self.sidecar_sizes.values().copied().sum::<usize>());
+        let cache_structure_bytes = self
+            .message_keys
+            .capacity()
+            .saturating_mul(size_of::<[u8; 32]>())
+            .saturating_add(self.context.session_id.capacity())
+            .saturating_add(self.context.serializer_profile.capacity())
+            .saturating_add(self.context.render_config.capacity())
+            .saturating_add(
+                self.full_array_fingerprint
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(size_of::<NativeAttachmentCacheSession>())
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add(
+                cloned_string_retained_bytes(&self.context.session_id).saturating_mul(2),
+            );
+        // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
+        // The ingress projection is owned and charged by ProjectionCache, never by this LRU.
+        encoded_bytes
+            .saturating_add(ingress_bytes)
+            .saturating_add(served_bytes.saturating_mul(2))
+            .saturating_add(sidecar_core_bytes)
+            .saturating_add(sidecar_bulk_bytes)
+            .saturating_add(cache_structure_bytes)
+    }
+
+    fn discard_optional_sidecar_trees(&mut self) -> bool {
+        let had_sidecar_trees = !self.sidecar.messages.is_empty() || !self.sidecar_sizes.is_empty();
+        if had_sidecar_trees {
+            Arc::make_mut(&mut self.sidecar).messages.clear();
+            self.sidecar_sizes.clear();
+        }
+        had_sidecar_trees
+    }
 }
 
 #[derive(Debug)]
@@ -2092,21 +2661,31 @@ struct NativeAttachmentCache {
     lru: VecDeque<String>,
     retained_bytes: usize,
     max_retained_bytes: usize,
+    max_entry_retained_bytes: usize,
 }
 
 impl Default for NativeAttachmentCache {
     fn default() -> Self {
-        Self::new(NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES)
+        Self::with_limits(
+            NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES,
+            NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES,
+        )
     }
 }
 
 impl NativeAttachmentCache {
+    #[cfg(test)]
     fn new(max_retained_bytes: usize) -> Self {
+        Self::with_limits(max_retained_bytes, max_retained_bytes)
+    }
+
+    fn with_limits(max_retained_bytes: usize, max_entry_retained_bytes: usize) -> Self {
         Self {
             sessions: HashMap::new(),
             lru: VecDeque::new(),
             retained_bytes: 0,
             max_retained_bytes,
+            max_entry_retained_bytes: max_entry_retained_bytes.min(max_retained_bytes),
         }
     }
 
@@ -2129,61 +2708,77 @@ impl NativeAttachmentCache {
         {
             self.remove(session_id);
         }
-        let snapshot = self
+        let session = self.sessions.remove(session_id)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        self.lru.retain(|candidate| candidate != session_id);
+        Some(session.snapshot)
+    }
+
+    fn delta_native_prefix(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+        after: &str,
+        prefix_messages: usize,
+    ) -> Option<(Vec<Arc<Value>>, Vec<usize>)> {
+        if self
             .sessions
             .get(session_id)
-            .map(|session| session.snapshot.clone());
-        if snapshot.is_some() {
-            self.lru.retain(|candidate| candidate != session_id);
-            self.lru.push_back(session_id.to_string());
+            .is_some_and(|session| session.revert_epoch != revert_epoch)
+        {
+            self.remove(session_id);
         }
-        snapshot
+        let prefix = self.sessions.get(session_id).and_then(|session| {
+            let snapshot = &session.snapshot;
+            (snapshot.full_array_fingerprint.as_deref() == Some(after)
+                && prefix_messages <= snapshot.ingress_chunks.len()
+                && prefix_messages <= snapshot.ingress_chunk_retained_bytes.len())
+            .then(|| {
+                (
+                    snapshot.ingress_chunks[..prefix_messages].to_vec(),
+                    snapshot.ingress_chunk_retained_bytes[..prefix_messages].to_vec(),
+                )
+            })
+        })?;
+        self.lru.retain(|candidate| candidate != session_id);
+        self.lru.push_back(session_id.to_string());
+        Some(prefix)
     }
 
     fn replace(
         &mut self,
         session_id: &str,
         revert_epoch: u64,
-        snapshot: NativeAttachmentCacheSnapshot,
-        stats: NativeAttachmentCacheStats,
+        mut snapshot: NativeAttachmentCacheSnapshot,
+        stats: &mut NativeAttachmentCacheStats,
         served_bytes: usize,
     ) {
-        self.remove(session_id);
-        let encoded_bytes = snapshot
-            .chunks
-            .iter()
-            .map(|chunk| chunk.retained_bytes)
-            .sum::<usize>();
-        let sidecar_structure_bytes = std::mem::size_of::<codec::DecodeSidecar>()
-            .saturating_add(snapshot.sidecar.order.iter().map(String::len).sum())
-            .saturating_add(snapshot.sidecar.messages.keys().map(String::len).sum())
-            .saturating_add(
-                snapshot
-                    .sidecar
-                    .mid_pins
-                    .iter()
-                    .map(|(key, value)| key.len().saturating_add(value.len()))
-                    .sum(),
+        let requested_bytes = snapshot.retained_bytes(served_bytes);
+        let mut retained_bytes = requested_bytes;
+        let mut dropped_sidecar_trees = false;
+
+        if retained_bytes > self.max_entry_retained_bytes {
+            dropped_sidecar_trees = snapshot.discard_optional_sidecar_trees();
+            retained_bytes = snapshot.retained_bytes(served_bytes);
+        }
+        if retained_bytes > self.max_entry_retained_bytes
+            || retained_bytes > self.max_retained_bytes
+        {
+            stats.refused_store = stats.refused_store.saturating_add(1);
+            eprintln!(
+                "native-attachment-cache refused_store session={session_id} byte_charge={retained_bytes} requested_byte_charge={requested_bytes} entry_cap={} total_budget={}",
+                self.max_entry_retained_bytes, self.max_retained_bytes,
             );
-        let sidecar_bytes = snapshot
-            .sidecar_sizes
-            .values()
-            .copied()
-            .sum::<usize>()
-            .saturating_add(sidecar_structure_bytes);
-        // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
-        // Native sidecar trees are charged on top of the size estimate computed during hashing.
-        let projection_bytes = snapshot
-            .projection
-            .as_deref()
-            .map_or(0, crate::ck_wire::FlatProjection::retained_bytes);
-        let retained_bytes = encoded_bytes
-            .saturating_add(served_bytes.saturating_mul(2))
-            .saturating_add(sidecar_bytes)
-            .saturating_add(projection_bytes);
-        if retained_bytes > self.max_retained_bytes {
             return;
         }
+        if dropped_sidecar_trees {
+            stats.degraded_store = stats.degraded_store.saturating_add(1);
+            eprintln!(
+                "native-attachment-cache degraded_store session={session_id} requested_byte_charge={requested_bytes} stored_byte_charge={retained_bytes} dropped_sidecar_trees={dropped_sidecar_trees}",
+            );
+        }
+
+        self.remove(session_id);
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
         self.sessions.insert(
             session_id.to_string(),
@@ -2191,7 +2786,7 @@ impl NativeAttachmentCache {
                 revert_epoch,
                 retained_bytes,
                 snapshot,
-                stats,
+                stats: *stats,
             },
         );
         self.lru.push_back(session_id.to_string());
@@ -2201,7 +2796,15 @@ impl NativeAttachmentCache {
             };
             if let Some(session) = self.sessions.remove(&oldest) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+                stats.evicted = stats.evicted.saturating_add(1);
+                eprintln!(
+                    "native-attachment-cache evicted session={oldest} byte_charge={} retained_bytes={} total_budget={}",
+                    session.retained_bytes, self.retained_bytes, self.max_retained_bytes,
+                );
             }
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.stats = *stats;
         }
     }
 
@@ -2214,10 +2817,165 @@ impl NativeAttachmentCache {
     }
 }
 
+/// Context fields that legitimately invalidate a cached ingress projection.
+///
+/// `transition_consumed` is intentionally absent: a transition found by the upcoming
+/// transform affects served native rendering but not the ingress CK projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionCacheContext {
+    session_id: String,
+    serializer_profile: String,
+    render_config: String,
+    profile_epoch: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionCacheSnapshot {
+    context: ProjectionCacheContext,
+    full_array_fingerprint: Option<String>,
+    projection: Arc<crate::ck_wire::FlatProjection>,
+    message_retained_bytes: Arc<Vec<usize>>,
+}
+
+impl ProjectionCacheSnapshot {
+    fn retained_bytes(&self, session_id: &str) -> usize {
+        use crate::retained_size::{cloned_string_retained_bytes, ARC_ALLOCATION_OVERHEAD_BYTES};
+        use std::mem::size_of;
+
+        self.projection
+            .retained_bytes()
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(
+                self.message_retained_bytes
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(self.context.session_id.capacity())
+            .saturating_add(self.context.serializer_profile.capacity())
+            .saturating_add(self.context.render_config.capacity())
+            .saturating_add(
+                self.full_array_fingerprint
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            // Include the session value's hash bucket plus its independently allocated map and
+            // LRU keys. A three-word allowance covers hash control/load slack.
+            .saturating_add(size_of::<ProjectionCacheSession>())
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add(cloned_string_retained_bytes(session_id).saturating_mul(2))
+    }
+}
+
+#[derive(Debug)]
+struct ProjectionCacheSession {
+    revert_epoch: u64,
+    retained_bytes: usize,
+    snapshot: ProjectionCacheSnapshot,
+}
+
+#[derive(Debug)]
+struct ProjectionCache {
+    sessions: HashMap<String, ProjectionCacheSession>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+    max_entry_retained_bytes: usize,
+}
+
+impl Default for ProjectionCache {
+    fn default() -> Self {
+        Self::with_limits(
+            PROJECTION_CACHE_BUDGET_BYTES,
+            PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
+        )
+    }
+}
+
+impl ProjectionCache {
+    #[cfg(test)]
+    fn new(max_retained_bytes: usize) -> Self {
+        Self::with_limits(max_retained_bytes, max_retained_bytes)
+    }
+
+    fn with_limits(max_retained_bytes: usize, max_entry_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+            max_entry_retained_bytes: max_entry_retained_bytes.min(max_retained_bytes),
+        }
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> Option<ProjectionCacheSnapshot> {
+        // TODO(memory-accounting): add an active-clone budget for this `Arc`, as identified by
+        // the module-memory audit. A running transform can retain it after LRU eviction, so the
+        // cache-only charge cannot bound that in-flight allocation.
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.revert_epoch != revert_epoch)
+        {
+            self.remove(session_id);
+        }
+        let snapshot = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.snapshot.clone());
+        if snapshot.is_some() {
+            self.lru.retain(|candidate| candidate != session_id);
+            self.lru.push_back(session_id.to_string());
+        }
+        snapshot
+    }
+
+    fn replace(&mut self, session_id: &str, revert_epoch: u64, snapshot: ProjectionCacheSnapshot) {
+        let retained_bytes = snapshot.retained_bytes(session_id);
+        if retained_bytes == 0
+            || retained_bytes > self.max_entry_retained_bytes
+            || retained_bytes > self.max_retained_bytes
+        {
+            return;
+        }
+        self.remove(session_id);
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            ProjectionCacheSession {
+                revert_epoch,
+                retained_bytes,
+                snapshot,
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if oldest == session_id {
+                self.lru.push_back(oldest);
+                break;
+            }
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
-    store: OnceLock<Arc<McStore>>,
+    store: Arc<OnceLock<Arc<McStore>>>,
+    store_open: Arc<StoreOpenCoordinator>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
     session_resolver: Arc<dyn SessionResolver>,
     config: Mutex<ConfigCache>,
@@ -2230,6 +2988,7 @@ pub struct McHandler {
     transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
     serialized_outputs: Mutex<SerializedOutputCache>,
     native_attachments: Mutex<NativeAttachmentCache>,
+    projections: Mutex<ProjectionCache>,
     boundary_tokens: Mutex<BoundaryTokenCache>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
@@ -2277,6 +3036,8 @@ pub struct McHandler {
     transform_session_roots: Mutex<HashMap<String, HashSet<PathBuf>>>,
     state_sync_seeds: Mutex<StateSyncSeedCoordinator>,
     transform_pages: Mutex<TransformPageCoordinator>,
+    #[cfg(test)]
+    transform_page_discard_logs: Mutex<Vec<String>>,
     state_imports: Mutex<StateImportCoordinator>,
     /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
     /// only registered ids may bypass transform after route validation.
@@ -2404,6 +3165,10 @@ struct HistorianPrepareContext<'a> {
 #[derive(Default)]
 struct HistorianTriggerTimings {
     elapsed_ms: f64,
+    boundary_build_ms: f64,
+    trigger_eval_ms: f64,
+    cache_store_ms: f64,
+    token_cache_hits: usize,
     tokenized_blocks: usize,
 }
 
@@ -2646,7 +3411,8 @@ impl McHandler {
             None => Arc::new(MissingSessionResolver),
         };
         McHandler {
-            store: OnceLock::new(),
+            store: Arc::new(OnceLock::new()),
+            store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory,
             session_resolver,
             config: Mutex::new(ConfigCache::default()),
@@ -2661,6 +3427,7 @@ impl McHandler {
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
             native_attachments: Mutex::new(NativeAttachmentCache::default()),
+            projections: Mutex::new(ProjectionCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -2692,10 +3459,174 @@ impl McHandler {
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
+            #[cfg(test)]
+            transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
         }
+    }
+
+    fn begin_store_open(&self, descriptor: StorageDescriptor) {
+        if self.store.get().is_some()
+            || self
+                .store_open
+                .phase
+                .compare_exchange(
+                    STORE_OPEN_IDLE,
+                    STORE_OPENING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return;
+        }
+
+        self.store_open
+            .active_waiters
+            .fetch_add(1, Ordering::AcqRel);
+        self.store_open
+            .waiter_starts
+            .fetch_add(1, Ordering::Relaxed);
+        let store = Arc::clone(&self.store);
+        let coordinator = Arc::clone(&self.store_open);
+        tokio::spawn(async move {
+            let _guard = StoreOpenWaiterGuard {
+                coordinator: Arc::clone(&coordinator),
+            };
+            Self::run_store_open(store, coordinator, descriptor).await;
+        });
+    }
+
+    async fn run_store_open(
+        store_slot: Arc<OnceLock<Arc<McStore>>>,
+        coordinator: Arc<StoreOpenCoordinator>,
+        descriptor: StorageDescriptor,
+    ) {
+        let policy = *coordinator.policy.lock().expect("store open policy mutex");
+        let mut last_lease_error = match Self::open_store_once(&descriptor).await {
+            Ok(opened) => {
+                if coordinator.cancelled.load(Ordering::Acquire) {
+                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    return;
+                }
+                let _ = store_slot.set(Arc::new(opened));
+                coordinator.phase.store(STORE_OPENED, Ordering::Release);
+                return;
+            }
+            Err(error) if store_open_error_is_live_lease(&error) => error,
+            Err(error) => {
+                eprintln!("mc-module: store open failed: {error}");
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+        };
+
+        let started = Instant::now();
+        coordinator
+            .wait_started_at_ms
+            .store(now_ms().max(0) as u64, Ordering::Relaxed);
+        coordinator
+            .phase
+            .store(STORE_OPEN_WAITING, Ordering::Release);
+        eprintln!(
+            "mc-module: storage lease held; waiting up to {}s for predecessor exit",
+            STORE_LEASE_WAIT_WINDOW.as_secs()
+        );
+
+        let mut backoff = policy.initial_backoff;
+        let mut attempt = 0usize;
+        loop {
+            let elapsed = started.elapsed();
+            if coordinator.cancelled.load(Ordering::Acquire) {
+                eprintln!(
+                    "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
+                    elapsed.as_secs_f64()
+                );
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+            if elapsed >= policy.wait_window {
+                eprintln!(
+                    "mc-module: storage lease wait expired after {:.2}s; store open failed: {last_lease_error}",
+                    elapsed.as_secs_f64()
+                );
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+
+            let delay = jittered_store_open_delay(backoff, policy.max_backoff, attempt)
+                .min(policy.wait_window.saturating_sub(elapsed));
+            tokio::select! {
+                _ = coordinator.cancel.notified() => {
+                    eprintln!(
+                        "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    return;
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            if coordinator.cancelled.load(Ordering::Acquire) {
+                eprintln!(
+                    "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
+                    started.elapsed().as_secs_f64()
+                );
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+            if started.elapsed() >= policy.wait_window {
+                continue;
+            }
+
+            match Self::open_store_once(&descriptor).await {
+                Ok(opened) => {
+                    if coordinator.cancelled.load(Ordering::Acquire) {
+                        coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                        return;
+                    }
+                    let _ = store_slot.set(Arc::new(opened));
+                    coordinator.phase.store(STORE_OPENED, Ordering::Release);
+                    eprintln!(
+                        "mc-module: storage lease released; store opened after {:.2}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                    return;
+                }
+                Err(error) if store_open_error_is_live_lease(&error) => {
+                    last_lease_error = error;
+                    backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "mc-module: storage lease wait ended after {:.2}s; store open failed: {error}",
+                        started.elapsed().as_secs_f64()
+                    );
+                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn open_store_once(descriptor: &StorageDescriptor) -> Result<McStore, McStoreError> {
+        let descriptor = descriptor.clone();
+        match tokio::task::spawn_blocking(move || McStore::open(&descriptor)).await {
+            Ok(result) => result,
+            Err(error) => panic!("store open worker failed: {error}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_store_open_policy_for_test(&self, policy: StoreOpenPolicy) {
+        *self
+            .store_open
+            .policy
+            .lock()
+            .expect("store open policy mutex") = policy;
     }
 
     #[cfg(test)]
@@ -2707,14 +3638,18 @@ impl McHandler {
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 model_chain: vec!["test/model".to_string()],
                 execute_threshold_percentage: 65.0,
+                compaction_enabled: true,
                 memory_enabled: true,
+                auto_search: crate::config::AutoSearchConfig::default(),
+                caveman: crate::config::CavemanConfig::default(),
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 historian_context_limit_tokens: 128_000,
-                memory_budget_tokens: 8_000.0,
+                memory_budget_tokens: 4_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
                 temporal_awareness: true,
+                prompt_surface_guidance_override: None,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
             },
@@ -2740,7 +3675,8 @@ impl McHandler {
         session_resolver: Arc<dyn SessionResolver>,
     ) -> Self {
         McHandler {
-            store: OnceLock::new(),
+            store: Arc::new(OnceLock::new()),
+            store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory: factory,
             session_resolver,
             config: Mutex::new(ConfigCache::default()),
@@ -2754,6 +3690,7 @@ impl McHandler {
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
             native_attachments: Mutex::new(NativeAttachmentCache::default()),
+            projections: Mutex::new(ProjectionCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -2776,6 +3713,8 @@ impl McHandler {
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
+            #[cfg(test)]
+            transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
@@ -2809,11 +3748,7 @@ impl McHandler {
                 .lock()
                 .expect("state sync seed mutex")
                 .evict(&session_id);
-            self.transform_pages
-                .lock()
-                .expect("transform page mutex")
-                .discard(&session_id);
-            self.refresh_oldest_queued_at_ms();
+            self.discard_transform_pages_for_route(&session_id, "route_replaced");
             self.state_imports
                 .lock()
                 .expect("state import mutex")
@@ -2899,6 +3834,30 @@ impl McHandler {
             .store(oldest, Ordering::Relaxed);
     }
 
+    fn log_transform_page_discard(&self, session_id: &str, staged_pages: usize, trigger: &str) {
+        let line = format!(
+            "transform_page_collection_discarded session={session_id} staged_pages={staged_pages} trigger={trigger}"
+        );
+        eprintln!("mc-module: {line}");
+        #[cfg(test)]
+        self.transform_page_discard_logs
+            .lock()
+            .expect("transform page discard logs mutex")
+            .push(line);
+    }
+
+    fn discard_transform_pages_for_route(&self, session_id: &str, trigger: &str) {
+        let staged_pages = self
+            .transform_pages
+            .lock()
+            .expect("transform page mutex")
+            .discard(session_id);
+        if let Some(staged_pages) = staged_pages {
+            self.log_transform_page_discard(session_id, staged_pages, trigger);
+        }
+        self.refresh_oldest_queued_at_ms();
+    }
+
     fn discard_transform_pages(&self, session_id: &str) {
         self.transform_pages
             .lock()
@@ -2907,10 +3866,9 @@ impl McHandler {
         self.refresh_oldest_queued_at_ms();
     }
 
-    /// Reconstruct a full ingress snapshot from the last successful request plus a validated
-    /// caller tail. The returned native frontier is used only for this request and is never stored
-    /// as authoritative cache state. Native attachment and prefix projection each verify the same
-    /// cache entry and `after` identity before reusing it.
+    /// Reconstruct a full ingress snapshot from bounded projection/native cores plus a validated
+    /// caller tail. Small entries may fall back to their full transform snapshot, but a
+    /// giant request does not need to retain provider sidecar trees to keep delta transport alive.
     fn expand_transform_tail_delta(
         &self,
         parsed: &mut TransformRequest,
@@ -2926,19 +3884,10 @@ impl McHandler {
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())?;
         parsed.full_array_fingerprint.as_ref()?;
-        let request = self
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex")
-            .ready_delta_request(&parsed.session_id)?;
-        if request.full_array_fingerprint.as_deref() != Some(after.as_str())
-            || replace_from > request.messages.len()
-        {
-            return None;
-        }
+
         // A store-side rewrite can advance the epoch without updating this process's request
-        // snapshot. Load the persisted epoch first, then inspect the shared native/projection
-        // cache, so stale request state cannot select an outdated entry.
+        // snapshot. Load the persisted epoch first, then inspect the bounded projection and native
+        // cores so stale process state cannot select an outdated entry.
         let current_revert_epoch = self
             .store
             .get()?
@@ -2946,37 +3895,171 @@ impl McHandler {
             .ok()?
             .meta
             .revert_epoch;
-        let projection_cache = self
-            .native_attachments
+        let projection_cache = self.lookup_projection_cache(
+            parsed,
+            current_revert_epoch,
+            &after,
+            replace_from,
+            ProjectionCacheKeyMode::Normal,
+        );
+        let fallback_request = self
+            .transform_snapshots
             .lock()
-            .expect("native attachment cache mutex")
-            .snapshot(&parsed.session_id, current_revert_epoch)
-            .and_then(|snapshot| {
-                validated_projection_cache_input(
-                    parsed,
-                    &snapshot,
+            .expect("transform snapshots mutex")
+            .ready_delta_request(&parsed.session_id)
+            .filter(|request| request.full_array_fingerprint.as_deref() == Some(after.as_str()));
+
+        let mut messages = projection_cache
+            .as_ref()
+            .and_then(|cache| cache.projection.reattach_messages_prefix(replace_from))
+            .or_else(|| {
+                let request = fallback_request.as_ref()?;
+                (replace_from <= request.messages.len())
+                    .then(|| request.messages[..replace_from].to_vec())
+            })?;
+        let mut current_messages = std::mem::take(&mut parsed.messages);
+        messages.append(&mut current_messages);
+
+        let (native_prefix, native_prefix_retained_bytes) = if native_replace_from == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            self.native_attachments
+                .lock()
+                .expect("native attachment cache mutex")
+                .delta_native_prefix(
+                    &parsed.session_id,
+                    current_revert_epoch,
                     &after,
-                    replace_from,
-                    ProjectionCacheKeyMode::Normal,
+                    native_replace_from,
                 )
-            });
+                .or_else(|| {
+                    let request = fallback_request.as_ref()?;
+                    let previous_native = request.native_messages.as_ref()?;
+                    (native_replace_from <= previous_native.len()).then(|| {
+                        let prefix = previous_native[..native_replace_from]
+                            .iter()
+                            .cloned()
+                            .map(Arc::new)
+                            .collect::<Vec<_>>();
+                        let retained_bytes = previous_native[..native_replace_from]
+                            .iter()
+                            .map(native_value_retained_bytes)
+                            .collect();
+                        (prefix, retained_bytes)
+                    })
+                })?
+        };
+        let mut native_messages = native_prefix
+            .iter()
+            .map(|message| message.as_ref().clone())
+            .collect::<Vec<_>>();
         let mut current_native = parsed.native_messages.take()?;
-        let previous_native = request.native_messages.as_ref()?;
-        if native_replace_from > previous_native.len() {
-            return None;
-        }
-        let mut messages = request.messages[..replace_from].to_vec();
-        messages.append(&mut parsed.messages);
-        let mut native_messages = previous_native[..native_replace_from].to_vec();
         native_messages.append(&mut current_native);
+
         parsed.messages = messages;
         parsed.native_messages = Some(native_messages);
         parsed.tail_delta = None;
         Some(NativeDeltaFrontier {
             after,
             native_replace_from,
+            native_prefix,
+            native_prefix_retained_bytes,
             projection_cache,
         })
+    }
+
+    fn lookup_projection_cache(
+        &self,
+        request: &TransformRequest,
+        revert_epoch: u64,
+        after: &str,
+        replace_from: usize,
+        mode: ProjectionCacheKeyMode,
+    ) -> Option<ProjectionCacheInput> {
+        self.projections
+            .lock()
+            .expect("projection cache mutex")
+            .snapshot(&request.session_id, revert_epoch)
+            .and_then(|snapshot| {
+                validated_projection_cache_input(request, &snapshot, after, replace_from, mode)
+            })
+    }
+
+    fn lookup_full_projection_cache(
+        &self,
+        request: &TransformRequest,
+    ) -> Option<ProjectionCacheInput> {
+        let after = request.full_array_fingerprint.as_deref()?;
+        let revert_epoch = self
+            .store
+            .get()?
+            .load(&request.session_id)
+            .ok()?
+            .meta
+            .revert_epoch;
+        self.lookup_projection_cache(
+            request,
+            revert_epoch,
+            after,
+            request.messages.len(),
+            ProjectionCacheKeyMode::Normal,
+        )
+    }
+
+    /// The most recent full transform request retains raw CK parts until its bounded
+    /// snapshot is evicted. ctx_expand uses it only for a same-session recovery view;
+    /// persisted historian transcripts remain the durable fallback for the default view.
+    fn cached_expand_messages(&self, session_id: &str) -> Option<Vec<ck_wire::CkIngressMessage>> {
+        self.transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_delta_request(session_id)
+            .map(|request| request.messages.clone())
+    }
+
+    fn store_projection_cache(
+        &self,
+        request: &TransformRequest,
+        revert_epoch: u64,
+        projection: Arc<crate::ck_wire::FlatProjection>,
+        prior: Option<&ProjectionCacheInput>,
+    ) -> usize {
+        let reusable_prefix = prior
+            .filter(|cache| {
+                cache.replace_from <= request.messages.len()
+                    && cache.replace_from <= cache.message_retained_bytes.len()
+            })
+            .map_or(0, |cache| cache.replace_from);
+        let mut message_retained_bytes = prior
+            .filter(|_| reusable_prefix > 0)
+            .map(|cache| cache.message_retained_bytes[..reusable_prefix].to_vec())
+            .unwrap_or_default();
+        message_retained_bytes.reserve(request.messages.len().saturating_sub(reusable_prefix));
+        message_retained_bytes.extend(request.messages[reusable_prefix..].iter().map(|message| {
+            message.mid.capacity().saturating_add(
+                crate::retained_size::ck_wire_message_retained_bytes(&message.ck)
+                    .saturating_sub(std::mem::size_of::<ck_wire::CkWireMessage>()),
+            )
+        }));
+        let request_message_charge = request
+            .messages
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ck_wire::CkIngressMessage>())
+            .saturating_add(message_retained_bytes.iter().copied().sum::<usize>());
+        self.projections
+            .lock()
+            .expect("projection cache mutex")
+            .replace(
+                &request.session_id,
+                revert_epoch,
+                ProjectionCacheSnapshot {
+                    context: projection_cache_context(request),
+                    full_array_fingerprint: request.full_array_fingerprint.clone(),
+                    projection,
+                    message_retained_bytes: Arc::new(message_retained_bytes),
+                },
+            );
+        request_message_charge
     }
 
     fn transform_page_in_progress(&self, session_id: &str) -> bool {
@@ -3023,10 +4106,7 @@ impl McHandler {
                 .lock()
                 .expect("state sync seed mutex")
                 .evict(&session);
-            self.transform_pages
-                .lock()
-                .expect("transform page mutex")
-                .discard(&session);
+            self.discard_transform_pages_for_route(&session, "route_teardown");
             self.state_imports
                 .lock()
                 .expect("state import mutex")
@@ -3042,6 +4122,10 @@ impl McHandler {
             self.native_attachments
                 .lock()
                 .expect("native attachment cache mutex")
+                .remove(&session);
+            self.projections
+                .lock()
+                .expect("projection cache mutex")
                 .remove(&session);
             self.boundary_tokens
                 .lock()
@@ -3449,6 +4533,18 @@ impl McHandler {
                         .collect::<Vec<_>>(),
                     Err(_) => Vec::new(),
                 };
+                let raw_chunk_messages = serde_json::to_string(
+                    &parsed
+                        .messages
+                        .iter()
+                        .filter(|message| {
+                            !message.ck.meta.synthetic
+                                && message.ordinal >= chunk.chunk.start_index
+                                && message.ordinal <= chunk.chunk.end_index
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|_| "[]".to_string());
                 let boundary_dates = historian_chunk::native_boundary_dates(&parsed.messages);
                 let fingerprint_items: Vec<_> =
                     chunk.snapshot.iter().map(|item| item.as_item()).collect();
@@ -3463,12 +4559,12 @@ impl McHandler {
                         )?;
                         match action {
                             historian::RestartAction::Done => {
-                                return Ok(historian::HistorianReattachOutcome::Done)
+                                return Ok(historian::HistorianReattachOutcome::Done);
                             }
                             historian::RestartAction::AbandonedAndRefireEligible { firing_seq } => {
                                 return Ok(historian::HistorianReattachOutcome::RefireEligible {
                                     firing_seq,
-                                })
+                                });
                             }
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
@@ -3482,6 +4578,7 @@ impl McHandler {
                                 observed_chunk_fingerprint: &observed,
                                 validation_chunk: &chunk.chunk,
                                 chunk_transcript: &chunk.text,
+                                raw_chunk_messages: &raw_chunk_messages,
                                 boundary_dates: &boundary_dates,
                                 prior_compartments: &prior_compartments,
                                 validate_options: historian_validate::ValidateOptions {
@@ -3556,7 +4653,7 @@ impl McHandler {
                     state: "unknown".to_string(),
                     progress: None,
                     last_failure: None,
-                })
+                });
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
@@ -3605,11 +4702,19 @@ impl McHandler {
                 last_failure,
             });
         }
+        let boundary_build_started_at = Instant::now();
         let CachedBoundaryMessages {
             messages: boundary_messages,
+            token_cache_hits,
             tokenized_blocks,
             mut token_cache_snapshot,
         } = boundary_messages(parsed, projection, &self.boundary_tokens);
+        trigger_timer.timings.boundary_build_ms +=
+            boundary_build_started_at.elapsed().as_secs_f64() * 1_000.0;
+        trigger_timer.timings.token_cache_hits = trigger_timer
+            .timings
+            .token_cache_hits
+            .saturating_add(token_cache_hits);
         trigger_timer.timings.tokenized_blocks = trigger_timer
             .timings
             .tokenized_blocks
@@ -3635,7 +4740,8 @@ impl McHandler {
             }
             Ok(_) | Err(_) => None,
         };
-        let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
+        let (context_limit, input_tokens, usage_percentage) =
+            usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
         let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
@@ -3649,6 +4755,7 @@ impl McHandler {
             input_tokens,
             context_limit,
         );
+        let trigger_eval_started_at = Instant::now();
         let trigger = {
             let mut formatted_token_estimator =
                 |bytes: &str| token_cache_snapshot.formatted_token_count(bytes);
@@ -3657,7 +4764,10 @@ impl McHandler {
                 &TriggerContext {
                     boundary: BoundaryContext {
                         context_limit,
-                        execute_threshold_percentage: cfg.execute_threshold_percentage,
+                        // Historian preparation reloads module config independently, but a host-
+                        // resolved request threshold is still authoritative for this pass.
+                        execute_threshold_percentage: parsed
+                            .execute_threshold_or(cfg.execute_threshold_percentage),
                         usage_percentage,
                         usage_input_tokens: input_tokens,
                         last_compartment_end_ordinal,
@@ -3675,10 +4785,15 @@ impl McHandler {
                 &mut formatted_token_estimator,
             )
         };
+        trigger_timer.timings.trigger_eval_ms +=
+            trigger_eval_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let cache_store_started_at = Instant::now();
         self.boundary_tokens
             .lock()
             .expect("boundary token cache mutex")
             .replace(&parsed.session_id, token_cache_snapshot);
+        trigger_timer.timings.cache_store_ms +=
+            cache_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         let progress = trigger
             .progress
             .as_ref()
@@ -3898,7 +5013,7 @@ impl McHandler {
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(error) => {
-                return PreparedWrapupAction::Failed(format!("state load failed: {error}"))
+                return PreparedWrapupAction::Failed(format!("state load failed: {error}"));
             }
         };
         if loaded.meta.pending_rewrite.is_some() {
@@ -3970,14 +5085,14 @@ impl McHandler {
                 firing
             }
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
-                return PreparedWrapupAction::Nothing(format!("{reason:?}"))
+                return PreparedWrapupAction::Nothing(format!("{reason:?}"));
             }
             Err(error) => return PreparedWrapupAction::Failed(format!("assembly failed: {error}")),
         };
         let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
             LiveHistorianSessionClaim::Acquired(guard) => guard,
             LiveHistorianSessionClaim::Busy(completion) => {
-                return PreparedWrapupAction::Busy(completion)
+                return PreparedWrapupAction::Busy(completion);
             }
         };
         PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
@@ -4454,7 +5569,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "bad_request".to_string(),
                     message,
-                }
+                };
             }
         };
         let Some(raw_drop) = request.get("drop").and_then(Value::as_str) else {
@@ -4475,7 +5590,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "bad_request".to_string(),
                     message: format!("invalid drop range syntax: {error}"),
-                }
+                };
             }
         };
         let _binding = match self.resolve_binding(channel, session_id) {
@@ -4484,14 +5599,14 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: "agent_drops.append on a channel with no session binding".to_string(),
-                }
+                };
             }
             Err(BindingError::SessionMismatch) => {
                 return HandlerOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
-                }
+                };
             }
         };
         let store = match self.store.get() {
@@ -4504,26 +5619,41 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let by_number = tags
             .iter()
             .map(|row| (row.tag_number, &row.block_id))
             .collect::<HashMap<_, _>>();
-        let mut drop_ids = numbers
+        let requested_numbers = numbers;
+        let unknown_numbers = requested_numbers
+            .iter()
+            .copied()
+            .filter(|number| !by_number.contains_key(&(*number as i64)))
+            .collect::<Vec<_>>();
+        let mut drop_ids = requested_numbers
             .into_iter()
             .filter_map(|number| by_number.get(&(number as i64)).map(|id| (*id).clone()))
             .collect::<Vec<_>>();
         drop_ids.sort();
         drop_ids.dedup();
+        if drop_ids.is_empty() {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!(
+                    "ctx_reduce drop request has no valid tags: {} not found",
+                    format_plain_tag_numbers(&unknown_numbers)
+                ),
+            };
+        }
 
         match store.append_pending_agent_drops_with_command(
             session_id,
             Some(&command_id),
             &drop_ids,
             now_ms(),
-            drop_ids.is_empty(),
+            false,
         ) {
             Ok(outcome) if outcome.duplicate => {
                 respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
@@ -4572,14 +5702,14 @@ impl McHandler {
                 return Err(HandlerOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: format!("{operation} on a channel with no session binding"),
-                })
+                });
             }
             Err(BindingError::SessionMismatch) => {
                 return Err(HandlerOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
-                })
+                });
             }
         };
         Ok((session_id.to_string(), binding))
@@ -4662,14 +5792,14 @@ impl McHandler {
                 return respond(json!({
                     "ok": true,
                     "disposition": row.disposition,
-                }))
+                }));
             }
             Ok(None) => {}
             Err(error) => {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         }
         let _guard = match self.try_claim_recomp_session(&session_id) {
@@ -4678,7 +5808,7 @@ impl McHandler {
                 return respond(json!({
                     "ok": true,
                     "disposition": "already_in_progress",
-                }))
+                }));
             }
         };
 
@@ -4688,7 +5818,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let has_compartments = match store.has_compartments(&session_id) {
@@ -4697,7 +5827,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let never_minted = !has_compartments && loaded.core.boundary_id.trim().is_empty();
@@ -4734,7 +5864,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         self.serialized_outputs
@@ -4769,10 +5899,11 @@ impl McHandler {
     }
 
     fn handle_session_delete_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let (session_id, binding) = match self.management_binding(channel, request, "session.delete") {
-            Ok(scope) => scope,
-            Err(outcome) => return outcome,
-        };
+        let (session_id, binding) =
+            match self.management_binding(channel, request, "session.delete") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
         let store = match self.store.get() {
             Some(store) => store,
             None => return store_unavailable_error(),
@@ -4836,7 +5967,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         #[cfg(test)]
@@ -4860,7 +5991,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
             wrapup_latch = sample_wrapup_latch();
@@ -4940,7 +6071,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let pending_m1_delta = loaded.meta.initialized
@@ -4949,6 +6080,18 @@ impl McHandler {
                 .is_some_and(|signal| signal.revision != loaded.meta.m1_revision);
         let pending_m1_age_ms = pending_m1_delta
             .then(|| now_ms().saturating_sub(loaded.meta.m1_pending_since_ms.unwrap_or(now_ms())));
+        let tail_hygiene = loaded.meta.tail_hygiene_baseline.as_ref().map(|baseline| {
+            let (u, t) = crate::tail_hygiene::effective_tail_hygiene(baseline);
+            json!({
+                "u": u,
+                "t": t,
+                "severity": (u as f64 / t.max(1) as f64).clamp(0.0, 1.0),
+                "evaluable": baseline.evaluable && !baseline.generation_invalidated,
+                "generation_invalidated": baseline.generation_invalidated,
+                "baseline_generation": baseline.baseline_generation,
+                "computed_at_ms": baseline.computed_at_ms,
+            })
+        });
         let summary = sanitize_status_text(
             &format!(
                 "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, pending m1 delta {}, last historian: {historian}, {publish_health}, surface {surface}",
@@ -5017,6 +6160,7 @@ impl McHandler {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
                 "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
             },
+            "tail_hygiene": tail_hygiene,
         });
         if let Some(page) = compartment_page {
             let compartments = page
@@ -5122,13 +6266,13 @@ impl McHandler {
                     return Self::retryable_wrapup_response(
                         RetryableWrapupReason::SnapshotStale,
                         "wrapup state changed before terminal result recording",
-                    )
+                    );
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
             let ledger_summary = if disposition == "failed" {
@@ -5161,13 +6305,13 @@ impl McHandler {
                     return Self::retryable_wrapup_response(
                         RetryableWrapupReason::SnapshotStale,
                         "wrapup state changed before terminal result recording",
-                    )
+                    );
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "store_commit_failed".to_string(),
                         message: format!("could not record terminal wrapup result: {error}"),
-                    }
+                    };
                 }
             }
         } else {
@@ -5251,7 +6395,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         if let Some(command_id) = command_id {
@@ -5267,23 +6411,25 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             }
         }
         let keep = match request.get("keep") {
             None => 20,
-            // Any signed integer clamps into [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX]; a negative
-            // keep is a clamp input, not an error, matching the boundary-side contract.
+            // The requested keep watermark is honored as given: it counts raw messages of
+            // every role, matching the TypeScript orchestrator, which accepts any positive
+            // integer and applies only a floor of 1 (the boundary resolver enforces that
+            // floor). A negative or zero keep therefore floors to 1 rather than erroring,
+            // and no upper clamp exists — a caller asking to keep more than the live tail
+            // simply gets a nothing-to-compact outcome.
             Some(value) => match value.as_i64() {
-                Some(value) => usize::try_from(value.max(0))
-                    .unwrap_or(usize::MAX)
-                    .clamp(WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX),
+                Some(value) => usize::try_from(value.max(0)).unwrap_or(usize::MAX),
                 None => {
                     return HandlerOutcome::Error {
                         code: "bad_request".to_string(),
                         message: "session.wrapup keep must be an integer".to_string(),
-                    }
+                    };
                 }
             },
         };
@@ -5299,7 +6445,7 @@ impl McHandler {
                     "disposition": "already_in_progress",
                     "rounds": rounds,
                     "summary": format!("wrapup already in progress, {rounds} rounds done"),
-                }))
+                }));
             }
         };
 
@@ -5309,7 +6455,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let entry_now = now_ms();
@@ -5336,13 +6482,13 @@ impl McHandler {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotUnavailable,
                     "too many concurrent wrapups",
-                )
+                );
             }
             TransformSnapshotLookup::Missing | TransformSnapshotLookup::InFlight => {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotUnavailable,
                     "wrapup unavailable until a full session transform has been observed",
-                )
+                );
             }
         };
         let parsed = Arc::clone(&ready.request);
@@ -5352,7 +6498,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         if ready.revert_epoch != initial_snapshot.revert_epoch {
@@ -5367,7 +6513,7 @@ impl McHandler {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotUnavailable,
                     format!("wrapup boundary assembly failed: {error}"),
-                )
+                );
             }
         };
         let boundary_messages =
@@ -5382,7 +6528,21 @@ impl McHandler {
             .iter()
             .map(|compartment| compartment.end_message as u64)
             .max();
-        let plan = boundary::resolve_wrapup_boundary(&boundary_messages, initial_end, keep);
+        // The wrapup boundary snaps against the session's real geometry, resolved with
+        // the same usage -> soft-geometry -> fallback order and host-threshold preference
+        // as the historian trigger, so the user-boundary snap window matches the
+        // TypeScript wrapup resolver instead of a synthetic constant.
+        let wrapup_cfg = self.effective_config(&binding.project_root);
+        let (wrapup_context_limit, _, _) =
+            usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
+        let wrapup_threshold = parsed.execute_threshold_or(wrapup_cfg.execute_threshold_percentage);
+        let plan = boundary::resolve_wrapup_boundary(
+            &boundary_messages,
+            initial_end,
+            keep,
+            wrapup_context_limit,
+            wrapup_threshold,
+        );
         let target = plan.target_protected_start_ordinal;
         match self.wrapup_snapshot_is_current(
             &store,
@@ -5395,13 +6555,13 @@ impl McHandler {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotStale,
                     "wrapup unavailable until a full session transform has been observed",
-                )
+                );
             }
             Err(error) => {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         }
         if plan.raw_messages_above_last_compartment <= keep
@@ -5433,7 +6593,10 @@ impl McHandler {
         // This observation is local to the current runner loop execution. A runner that is
         // still starting gets one bounded chance before a repeated route absence becomes terminal.
         let mut unknown_module_observed_at = None;
-        while rounds < historian::MAX_WRAPUP_ROUNDS {
+        // No round-count cap: the drain loops until the keep watermark is reached or a
+        // stop condition trips. The request budget is the ceiling — every round re-checks
+        // the deadline before driving, matching the TypeScript drain-until-target loop.
+        loop {
             if Self::remaining_wrapup_budget(deadline).is_none() {
                 failure = Some((
                     RetryableWrapupReason::BudgetExhausted,
@@ -5640,7 +6803,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let final_end = final_compartments
@@ -5657,7 +6820,15 @@ impl McHandler {
         let compartments_created = final_compartments
             .len()
             .saturating_sub(initial_compartments.len());
-        let remaining = wrapup_has_remaining_messages(&parsed.messages, final_end, target);
+        // The drain loop only exits without a failure after the no-remaining-messages
+        // check, and compartments never shrink, so a failure-free exit has reached the
+        // keep watermark. Assert the invariant instead of carrying a round-cap fallback;
+        // failure exits legitimately stop short of the watermark.
+        debug_assert!(
+            failure.is_some()
+                || terminal_failure.is_some()
+                || !wrapup_has_remaining_messages(&parsed.messages, final_end, target)
+        );
         if let Some((reason, detail)) = terminal_failure {
             return self.terminal_wrapup_response(
                 &store,
@@ -5676,15 +6847,6 @@ impl McHandler {
                     include_rounds_without_command: true,
                 },
             );
-        }
-        if failure.is_none() && remaining {
-            failure = Some((
-                RetryableWrapupReason::SnapshotUnavailable,
-                format!(
-                    "stopped at the {}-round cap before the keep watermark",
-                    historian::MAX_WRAPUP_ROUNDS
-                ),
-            ));
         }
         let effect = "takes effect on your next message";
         match failure {
@@ -5793,7 +6955,7 @@ impl McHandler {
                             return HandlerOutcome::Error {
                                 code: "authority_checksum_failed".to_string(),
                                 message: error.to_string(),
-                            }
+                            };
                         }
                     };
                 store.authority_verify_prepare(
@@ -5832,7 +6994,7 @@ impl McHandler {
             _ => {
                 return invalid_params_error(
                     "authority.prepare phase must be begin, complete, ack, or abort",
-                )
+                );
             }
         };
         match result {
@@ -6083,7 +7245,7 @@ impl McHandler {
             _ => {
                 return Err(invalid_params_error(
                     "prompt_surface preset must be \"full\" or \"light\"",
-                ))
+                ));
             }
         };
         let model_key = request
@@ -6102,7 +7264,7 @@ impl McHandler {
             _ => {
                 return Err(invalid_params_error(
                     "prompt_surface config identity must be a string",
-                ))
+                ));
             }
         };
         let descriptions = request
@@ -6117,9 +7279,8 @@ impl McHandler {
             };
             for (tool_id, description) in object {
                 if !prompt_surface::is_known_tool_id(tool_id) {
-                    return Err(invalid_params_error(format!(
-                        "prompt_surface tool_descriptions contains unknown tool {tool_id:?}"
-                    )));
+                    prompt_surface::warn_ignored_unknown_tool_description(tool_id);
+                    continue;
                 }
                 let Some(description) = description.as_str() else {
                     return Err(invalid_params_error(format!(
@@ -6134,10 +7295,24 @@ impl McHandler {
                 tool_descriptions.insert(tool_id.clone(), description.to_string());
             }
         }
+        let guidance_override = match request
+            .get("guidance_override")
+            .or_else(|| request.get("prompt_surface_guidance_override"))
+        {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(_)) => None,
+            _ => {
+                return Err(invalid_params_error(
+                    "prompt_surface guidance_override must be a string",
+                ));
+            }
+        };
         Ok(PromptSurfaceSelection {
             model_key,
             config_identity,
             preset,
+            guidance_override,
             tool_descriptions,
         })
     }
@@ -6150,23 +7325,29 @@ impl McHandler {
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return invalid_params_error("manifest.get requires session_id");
         };
-        if let Err(error) = self.resolve_binding(channel, session_id) {
-            return match error {
-                BindingError::Unbound => HandlerOutcome::Error {
-                    code: "route_unbound".to_string(),
-                    message: "manifest.get on a channel with no session binding".to_string(),
-                },
-                BindingError::SessionMismatch => HandlerOutcome::Error {
-                    code: "session_mismatch".to_string(),
-                    message: "request session_id does not match the channel's bound session"
-                        .to_string(),
-                },
-            };
-        }
-        let requested = match self.prompt_surface_selection_from_value(request) {
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return match error {
+                    BindingError::Unbound => HandlerOutcome::Error {
+                        code: "route_unbound".to_string(),
+                        message: "manifest.get on a channel with no session binding".to_string(),
+                    },
+                    BindingError::SessionMismatch => HandlerOutcome::Error {
+                        code: "session_mismatch".to_string(),
+                        message: "request session_id does not match the channel's bound session"
+                            .to_string(),
+                    },
+                };
+            }
+        };
+        let mut requested = match self.prompt_surface_selection_from_value(request) {
             Ok(selection) => selection,
             Err(error) => return error,
         };
+        if requested.guidance_override.is_none() {
+            requested.guidance_override = binding.config.prompt_surface_guidance_override;
+        }
         let selection = self.freeze_prompt_surface_selection(session_id, requested);
         let tools = prompt_surface::session_tools(&selection);
         respond(json!({
@@ -6196,19 +7377,22 @@ impl McHandler {
                 message: "guidance.get requires session_id".to_string(),
             };
         };
-        if let Err(error) = self.resolve_binding(channel, session_id) {
-            return match error {
-                BindingError::Unbound => HandlerOutcome::Error {
-                    code: "route_unbound".to_string(),
-                    message: "guidance.get on a channel with no session binding".to_string(),
-                },
-                BindingError::SessionMismatch => HandlerOutcome::Error {
-                    code: "session_mismatch".to_string(),
-                    message: "request session_id does not match the channel's bound session"
-                        .to_string(),
-                },
-            };
-        }
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return match error {
+                    BindingError::Unbound => HandlerOutcome::Error {
+                        code: "route_unbound".to_string(),
+                        message: "guidance.get on a channel with no session binding".to_string(),
+                    },
+                    BindingError::SessionMismatch => HandlerOutcome::Error {
+                        code: "session_mismatch".to_string(),
+                        message: "request session_id does not match the channel's bound session"
+                            .to_string(),
+                    },
+                };
+            }
+        };
 
         let tool_present = match request.get("tool_present") {
             None => false,
@@ -6218,7 +7402,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "bad_request".to_string(),
                         message: "guidance.get tool_present must be a boolean".to_string(),
-                    }
+                    };
                 }
             },
         };
@@ -6229,10 +7413,13 @@ impl McHandler {
                 None => return unknown_serializer_profile_error(),
             },
         };
-        let requested_selection = match self.prompt_surface_selection_from_value(request) {
+        let mut requested_selection = match self.prompt_surface_selection_from_value(request) {
             Ok(selection) => selection,
             Err(error) => return error,
         };
+        if requested_selection.guidance_override.is_none() {
+            requested_selection.guidance_override = binding.config.prompt_surface_guidance_override;
+        }
         let selection = self.freeze_prompt_surface_selection(session_id, requested_selection);
         let active = cc_u1_active(profile, tool_present);
         let expected_variant = if active { "full" } else { "no_reduce" };
@@ -6252,7 +7439,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let variant = if active {
@@ -6261,7 +7448,10 @@ impl McHandler {
             prompt_surface::GuidanceVariant::NoReduce
         };
         let asset = prompt_surface::guidance_asset(selection.preset, variant);
-        let base_text = asset.bytes;
+        let base_text = selection
+            .guidance_override
+            .as_deref()
+            .unwrap_or(asset.bytes);
         let language_text = request
             .get("language")
             .and_then(Value::as_str)
@@ -6335,6 +7525,126 @@ impl McHandler {
             .unwrap_or_else(|| self.guidance_date_line()))
     }
 
+    fn memory_holder_metrics(&self) -> Value {
+        let (snapshot_bytes, snapshot_count, in_flight_count, lease_bytes, lease_count) = {
+            let snapshots = self
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let ready_count = snapshots
+                .entries
+                .values()
+                .filter(|entry| matches!(entry, TransformSnapshot::Ready { .. }))
+                .count();
+            let in_flight_count = snapshots.entries.len().saturating_sub(ready_count);
+            let leases = snapshots
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            (
+                snapshots.ready_bytes,
+                ready_count,
+                in_flight_count,
+                leases.bytes,
+                leases.count,
+            )
+        };
+        let (projection_bytes, projection_count) = {
+            let cache = self.projections.lock().expect("projection cache mutex");
+            (cache.retained_bytes, cache.sessions.len())
+        };
+        let (native_bytes, native_count) = {
+            let cache = self
+                .native_attachments
+                .lock()
+                .expect("native attachment cache mutex");
+            (cache.retained_bytes, cache.sessions.len())
+        };
+        let (serialized_bytes, serialized_count) = self
+            .serialized_outputs
+            .lock()
+            .expect("serialized output cache mutex")
+            .metrics();
+        let (tag_baseline_bytes, tag_baseline_count) = transform::tag_baseline_cache_metrics();
+        let (boundary_bytes, boundary_count) = {
+            let cache = self
+                .boundary_tokens
+                .lock()
+                .expect("boundary token cache mutex");
+            (cache.retained_bytes, cache.sessions.len())
+        };
+        let (
+            page_bytes,
+            page_count,
+            completed_response_bytes,
+            completed_response_count,
+            collector_active,
+            oldest_queued_at_ms,
+        ) = {
+            let pages = self.transform_pages.lock().expect("transform page mutex");
+            let completed = pages
+                .sessions
+                .values()
+                .filter_map(|session| session.completed.as_ref())
+                .collect::<Vec<_>>();
+            (
+                pages.total_staged_bytes,
+                pages.pending_transform_count,
+                completed
+                    .iter()
+                    .map(|completed| completed.result.len())
+                    .sum::<usize>(),
+                completed.len(),
+                pages
+                    .sessions
+                    .values()
+                    .any(|session| matches!(&session.phase, TransformPagePhase::Collecting(_))),
+                pages.oldest_queued_at_ms(),
+            )
+        };
+
+        // Every byte/count field uses zero when that accounting domain is empty. `false` means no
+        // page collector is in Collecting. `oldest_queued_at_ms` uses `null` for no collector, while
+        // a numeric zero would mean the Unix epoch rather than absence.
+        json!({
+            "snapshots": {
+                "charged_bytes": snapshot_bytes,
+                "entry_count": snapshot_count,
+                "in_flight_entry_count": in_flight_count,
+                "active_lease_charged_bytes": lease_bytes,
+                "active_lease_entry_count": lease_count,
+            },
+            "projections": {
+                "charged_bytes": projection_bytes,
+                "entry_count": projection_count,
+            },
+            "native_attach": {
+                "charged_bytes": native_bytes,
+                "entry_count": native_count,
+            },
+            "serialized_output": {
+                "charged_bytes": serialized_bytes,
+                "entry_count": serialized_count,
+            },
+            "tag_baseline": {
+                "charged_bytes": tag_baseline_bytes,
+                "entry_count": tag_baseline_count,
+            },
+            "boundary_token": {
+                "charged_bytes": boundary_bytes,
+                "entry_count": boundary_count,
+            },
+            "page_coordinator": {
+                "charged_bytes": page_bytes,
+                "entry_count": page_count,
+                "completed_response_bytes": completed_response_bytes,
+                "completed_response_count": completed_response_count,
+                "collector_active": collector_active,
+                "oldest_queued_at_ms": oldest_queued_at_ms,
+            },
+        })
+    }
+
     fn handle_status_value(&self, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -6355,6 +7665,7 @@ impl McHandler {
                         "state_sync_deltas": true,
                     },
                     "storage_versions": storage_versions_block(&store),
+                    "memory_holders": self.memory_holder_metrics(),
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -6368,7 +7679,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let pass_trace = match store.load_pass_trace(session_id) {
@@ -6377,7 +7688,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let side_channel_status = match store.historian_side_channel_status(session_id) {
@@ -6386,7 +7697,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let mut historian = json!(&loaded.meta.historian);
@@ -6456,10 +7767,11 @@ impl McHandler {
         channel: u16,
         request: Value,
         from_page_apply: bool,
-        inbound_bytes: Option<usize>,
+        _inbound_bytes: Option<usize>,
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let handler_started_at = Instant::now();
+        let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
         let request_observed_to_handler = request
             .get(REQUEST_OBSERVED_KEY)
@@ -6473,7 +7785,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "bad_request".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile);
@@ -6494,39 +7806,35 @@ impl McHandler {
             // The established historian namespace remains accepted for compatibility with
             // existing producer sessions. Dreamer IDs instead require registration and route
             // validation before they may bypass the transform.
+            if parsed.tail_delta.is_some() {
+                return need_full_sync_response(&parsed);
+            }
             ticket.accept();
-            let mut response = transform::TransformResponse::passthrough(
-                parsed.messages.iter().map(|m| m.ck.clone()).collect(),
-                parsed.full_array_fingerprint.clone(),
-            );
-            attach_native_messages(&mut response, &parsed, 0, None);
-            return respond(serde_json::to_value(response).unwrap_or(Value::Null));
+            return passthrough_transform_response(&parsed);
         }
         if self.dreamer_run_registered(&parsed.session_id) {
             // Registration is the authority for a dreamer exemption. Validate the route
             // before trusting it so a stale or cross-project channel cannot bypass transform.
             match self.resolve_binding(channel, &parsed.session_id) {
                 Ok(_) => {
+                    if parsed.tail_delta.is_some() {
+                        return need_full_sync_response(&parsed);
+                    }
                     ticket.accept();
-                    let mut response = transform::TransformResponse::passthrough(
-                        parsed.messages.iter().map(|m| m.ck.clone()).collect(),
-                        parsed.full_array_fingerprint.clone(),
-                    );
-                    attach_native_messages(&mut response, &parsed, 0, None);
-                    return respond(serde_json::to_value(response).unwrap_or(Value::Null));
+                    return passthrough_transform_response(&parsed);
                 }
                 Err(BindingError::Unbound) => {
                     return HandlerOutcome::Error {
                         code: "route_unbound".to_string(),
                         message: "registered dreamer session has no bound route".to_string(),
-                    }
+                    };
                 }
                 Err(BindingError::SessionMismatch) => {
                     return HandlerOutcome::Error {
                         code: "session_mismatch".to_string(),
                         message: "registered dreamer session does not match the bound route"
                             .to_string(),
-                    }
+                    };
                 }
             }
         }
@@ -6536,7 +7844,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_unavailable".to_string(),
                     message: "store not opened (no HELLO_ACK storage seam)".to_string(),
-                }
+                };
             }
         };
         let binding = match self.resolve_binding(channel, &parsed.session_id) {
@@ -6545,22 +7853,28 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: "transform on a channel with no session binding".to_string(),
-                }
+                };
             }
             Err(BindingError::SessionMismatch) => {
                 return HandlerOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
-                }
+                };
             }
         };
+        apply_claude_code_config_controls(&mut parsed, &binding.config, serializer_profile);
+        parsed
+            .prompt_surface_tool_descriptions
+            .retain(|tool_id, _| {
+                if prompt_surface::is_known_tool_id(tool_id) {
+                    true
+                } else {
+                    prompt_surface::warn_ignored_unknown_tool_description(tool_id);
+                    false
+                }
+            });
         for (tool_id, description) in &parsed.prompt_surface_tool_descriptions {
-            if !prompt_surface::is_known_tool_id(tool_id) {
-                return invalid_params_error(format!(
-                    "prompt_surface tool_descriptions contains unknown tool {tool_id:?}"
-                ));
-            }
             if description.trim().is_empty() {
                 return invalid_params_error(format!(
                     "prompt_surface tool_descriptions.{tool_id} must not be empty"
@@ -6574,6 +7888,7 @@ impl McHandler {
                 .or_else(|| parsed.model_key.clone()),
             config_identity: parsed.prompt_surface_config_identity.clone(),
             preset: parsed.prompt_surface_preset,
+            guidance_override: parsed.prompt_surface_guidance_override.clone(),
             tool_descriptions: parsed.prompt_surface_tool_descriptions.clone(),
         };
         let frozen_prompt_surface =
@@ -6581,6 +7896,7 @@ impl McHandler {
         parsed.prompt_surface_preset = frozen_prompt_surface.preset;
         parsed.prompt_surface_model_key = frozen_prompt_surface.model_key;
         parsed.prompt_surface_config_identity = frozen_prompt_surface.config_identity;
+        parsed.prompt_surface_guidance_override = frozen_prompt_surface.guidance_override;
         parsed.prompt_surface_tool_descriptions = frozen_prompt_surface.tool_descriptions;
 
         let lineage_root = canonical_root(&binding.project_root);
@@ -6595,14 +7911,16 @@ impl McHandler {
             .or_default()
             .insert(lineage_root);
         let native_delta_frontier = if parsed.tail_delta.is_some() {
-            let Some(frontier) = self.expand_transform_tail_delta(&mut parsed) else {
-                return need_full_sync_response(parsed.full_array_fingerprint.clone());
+            let delta_expand_started_at = Instant::now();
+            let expanded = self.expand_transform_tail_delta(&mut parsed);
+            delta_expand_ms = delta_expand_started_at.elapsed().as_secs_f64() * 1_000.0;
+            let Some(frontier) = expanded else {
+                return need_full_sync_response(&parsed);
             };
             Some(frontier)
         } else {
             None
         };
-        let parsed = Arc::new(parsed);
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
@@ -6629,7 +7947,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let note_project_path =
@@ -6640,21 +7958,67 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_project_resolution_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         let pass_now = now_ms();
+        match serializer_profile {
+            Some(SerializerProfile::OpencodeAiSdk) => {
+                if let Some((data_url, content_hash)) = host_mural_artifact(parsed.mural.as_ref()) {
+                    if let Err(error) = store.upsert_project_mural_artifact(
+                        &project_path,
+                        data_url.as_bytes(),
+                        &content_hash,
+                        pass_now,
+                    ) {
+                        return HandlerOutcome::Error {
+                            code: "mural_artifact_store_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                }
+            }
+            Some(SerializerProfile::ClaudeCodeAnthropic) => {
+                match cc_mural_input(&store, &project_path) {
+                    Ok(mural) => {
+                        // The mural renderer is host-side by design. CC inherits the last OC artifact
+                        // for this project and never renders or trusts a request-supplied mural itself.
+                        // A CC-only project has no artifact, so it correctly composes without a mural.
+                        parsed.mural = mural;
+                    }
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: "mural_artifact_store_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+        let parsed = Arc::new(parsed);
+        let projection_cache_lookup_started_at = Instant::now();
+        let projection_cache_input = native_delta_frontier
+            .as_ref()
+            .and_then(|frontier| frontier.projection_cache.clone())
+            .or_else(|| self.lookup_full_projection_cache(&parsed));
+        let projection_cache_lookup_ms =
+            projection_cache_lookup_started_at.elapsed().as_secs_f64() * 1_000.0;
         // A previous publish may have committed while one independent side channel failed.
         // Retry on normal traffic rather than creating another background timer.
+        let side_channel_drain_started_at = Instant::now();
         let _ = store.drain_historian_side_channels(
             &parsed.session_id,
             pass_now,
             HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND,
         );
+        let side_channel_drain_ms = side_channel_drain_started_at.elapsed().as_secs_f64() * 1_000.0;
         // This trace is intentionally outside the fenced cache-state commit: a rejected
         // pass must still leave a durable breadcrumb, and a trace failure must never
         // change the transform result.
+        let trace_received_started_at = Instant::now();
         let _ = store.trace_pass_received(&parsed.session_id, pass_now);
+        let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
         let run_transform = || {
             let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
                 || {
@@ -6686,7 +8050,13 @@ impl McHandler {
                 memory_budget_tokens: binding.config.memory_budget_tokens,
                 user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
                 now_ms: pass_now,
-                execute_threshold_percentage: binding.config.execute_threshold_percentage,
+                // The host resolves per-model/token thresholds against this pass's usable window.
+                // Bind-time scalar config is only the old-host compatibility fallback.
+                execute_threshold_percentage: parsed
+                    .execute_threshold_or(binding.config.execute_threshold_percentage),
+                // Route-bound configuration selects either the full pipeline or the
+                // additive-only memory/docs transform for every consumer profile.
+                compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
                 // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
                 // request's model while retaining whether the walk actually matched an entry.
@@ -6711,9 +8081,7 @@ impl McHandler {
                 &parsed,
                 &producer_ctx,
                 &self.serialized_outputs,
-                native_delta_frontier
-                    .as_ref()
-                    .and_then(|frontier| frontier.projection_cache.as_ref()),
+                projection_cache_input.as_ref(),
             )
         };
         let reject_transform = |e: crate::transform::TransformError| {
@@ -6896,6 +8264,17 @@ impl McHandler {
         let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
         let projection = Arc::new(result.projection);
+        let projection_cache_store_started_at = Instant::now();
+        let request_message_charge = self.store_projection_cache(
+            &parsed,
+            revert_epoch,
+            Arc::clone(&projection),
+            native_delta_frontier
+                .as_ref()
+                .and_then(|frontier| frontier.projection_cache.as_ref()),
+        );
+        let projection_cache_store_ms =
+            projection_cache_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -6904,6 +8283,7 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
+        let native_attach_started_at = Instant::now();
         let native_cache_stats = if parsed.serve_native {
             attach_native_messages_incremental(
                 &mut response,
@@ -6916,22 +8296,41 @@ impl McHandler {
                 native_delta_frontier.as_ref(),
                 revert_epoch,
                 &self.native_attachments,
-                Some(Arc::clone(&projection)),
                 NativeCacheKeyMode::Normal,
             )
         } else {
             NativeAttachmentCacheStats::default()
         };
+        finalize_native_messages_response(
+            &mut response,
+            &parsed,
+            reasoning_watermark,
+            &tag_numbers,
+            mutation_exempt_mid.as_deref(),
+            lineage_anchor_mid.as_deref(),
+            transition_consumed,
+            native_delta_frontier.as_ref(),
+            native_cache_stats,
+        );
+        let native_attach_ms = native_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let trace_complete_started_at = Instant::now();
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
+        let trace_complete_ms = trace_complete_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let response_observation_started_at = Instant::now();
         self.record_response_observation(&parsed.session_id, now_ms());
-        // The decoded request retains the same payload represented by its inbound JSON body, so
-        // charging the body's byte length conservatively bounds the parsed tree without a second
-        // O(B) serialization. Paged transforms pass the sum of their staged page bytes; the
-        // transport supplies the exact body length for unpaged transforms.
-        //
-        // Value-only test/replay callers cannot recover the original wire length. They use the
-        // transform frame cap as a conservative fallback; the transport path never takes it.
-        let retained_bytes = inbound_bytes.unwrap_or(MAX_TRANSFORM_FRAME_BYTES);
+        let response_observation_ms =
+            response_observation_started_at.elapsed().as_secs_f64() * 1_000.0;
+        // Tail deltas have already been expanded at this point. Charge the retained request tree,
+        // not the much smaller inbound suffix, so the ready LRU and active-lease budget describe
+        // the same object their `Arc`s keep alive.
+        let retained_size_started_at = Instant::now();
+        let retained_bytes = parsed.retained_bytes_with_charges(
+            (native_cache_stats.request_native_retained_bytes > 0)
+                .then_some(native_cache_stats.request_native_retained_bytes),
+            Some(request_message_charge),
+        );
+        let retained_size_ms = retained_size_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let snapshot_store_started_at = Instant::now();
         self.transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
@@ -6942,16 +8341,34 @@ impl McHandler {
                 revert_epoch,
                 retained_bytes,
             );
+        let snapshot_store_ms = snapshot_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         if let Some(timings) = response.timings.as_mut() {
             timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
             timings.request_observed_to_handler = request_observed_to_handler;
+            timings.delta_expand = delta_expand_ms;
+            timings.side_channel_drain = side_channel_drain_ms;
+            timings.trace_received = trace_received_ms;
+            timings.projection_cache_lookup = projection_cache_lookup_ms;
+            timings.projection_cache_store = projection_cache_store_ms;
+            timings.native_attach = native_attach_ms;
+            timings.trace_complete = trace_complete_ms;
+            timings.response_observation = response_observation_ms;
+            timings.retained_size = retained_size_ms;
+            timings.snapshot_store = snapshot_store_ms;
             timings.trigger_ms = trigger_timings.elapsed_ms;
+            timings.trigger_boundary_build = trigger_timings.boundary_build_ms;
+            timings.trigger_eval = trigger_timings.trigger_eval_ms;
+            timings.trigger_cache_store = trigger_timings.cache_store_ms;
+            timings.trigger_token_cache_hits = trigger_timings.token_cache_hits;
             timings.trigger_tokenized_blocks = trigger_timings.tokenized_blocks;
             timings.native_cache_reused_messages = native_cache_stats.reused_messages;
             timings.native_cache_encoded_messages = native_cache_stats.encoded_messages;
+            timings.native_cache_refused_store = native_cache_stats.refused_store;
+            timings.native_cache_degraded_store = native_cache_stats.degraded_store;
+            timings.native_cache_evicted = native_cache_stats.evicted;
             timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
-        respond_transform(&parsed.session_id, response)
+        respond_transform(&parsed, response)
     }
 
     fn state_sync_seed_now(&self) -> Instant {
@@ -7433,7 +8850,9 @@ impl McHandler {
                 let outcome = self.apply_state_sync_wire(&binding, &store, assembled);
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
-                    HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
+                    HandlerOutcome::Error { .. }
+                    | HandlerOutcome::ErrorWithDetail { .. }
+                    | HandlerOutcome::Streamed => None,
                 };
                 let mut seeds = self.state_sync_seeds.lock().expect("state sync seed mutex");
                 let phase = {
@@ -7545,7 +8964,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
             if historian_phase != HistorianPhase::Idle {
@@ -7563,7 +8982,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let store_project_path = authority_project.as_deref().unwrap_or(&root_path);
@@ -7924,7 +9343,9 @@ impl McHandler {
                     .await;
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
-                    HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
+                    HandlerOutcome::Error { .. }
+                    | HandlerOutcome::ErrorWithDetail { .. }
+                    | HandlerOutcome::Streamed => None,
                 };
                 let mut transforms = self.transform_pages.lock().expect("transform page mutex");
                 let phase = {
@@ -8025,7 +9446,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_lookup_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         }) else {
             return HandlerOutcome::Error {
@@ -8040,7 +9461,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             })
         else {
@@ -8056,13 +9477,13 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_not_module".to_string(),
                         message: "memories authority row is missing".to_string(),
-                    }
+                    };
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         if authority.state != "MODULE" {
@@ -8233,13 +9654,13 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_not_module".to_string(),
                         message: "classification requires MODULE memories authority".to_string(),
-                    }
+                    };
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         if authority_project != memory_project {
@@ -8391,7 +9812,7 @@ impl McHandler {
                 Some(Value::Null) | None => None,
                 Some(Value::String(cue)) => Some(cue.to_string()),
                 Some(_) => {
-                    return invalid_params_error("mural cue row cue must be a string or null")
+                    return invalid_params_error("mural cue row cue must be a string or null");
                 }
             };
             updates.push(mc_store::MuralCueUpdate {
@@ -8749,13 +10170,13 @@ impl McHandler {
                     return Err(HandlerOutcome::Error {
                         code: "session_resolve_timeout".to_string(),
                         message: "session.resolve timed out after 2s".to_string(),
-                    })
+                    });
                 }
                 Err(error) => {
                     return Err(HandlerOutcome::Error {
                         code: "session_resolve_failed".to_string(),
                         message: error.to_string(),
-                    })
+                    });
                 }
             }
         };
@@ -8796,7 +10217,7 @@ impl McHandler {
                     return Err(HandlerOutcome::Error {
                         code: "authority_project_resolution_failed".to_string(),
                         message: error.to_string(),
-                    })
+                    });
                 }
             },
             None => route_project_root.clone(),
@@ -8809,13 +10230,108 @@ impl McHandler {
         })
     }
 
-    async fn handle_ctx_reduce_facade(&self, _channel: u16, request: &Value) -> HandlerOutcome {
-        // Parse the optional reduced-call envelope a model may repeat from context, even though
-        // this endpoint only acknowledges the request; the response observer performs delivery.
-        let _ = facade_arguments(request, &["drop"]);
-        // The MCP-facing route is acknowledgement-only. Destructive delivery is owned by
-        // the response observer, so this path must return before identity or storage work.
-        mcp_text_result(CTX_REDUCE_ACKNOWLEDGEMENT.to_string(), false)
+    async fn handle_ctx_reduce_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["drop"]) else {
+            return invalid_params_error("ctx_reduce arguments must be an object");
+        };
+        let Some(raw_drop) = non_empty_string_arg(&args, "drop") else {
+            return tool_error_result("Error: 'drop' must be provided.".to_string());
+        };
+        let requested = match parse_tag_range_string(raw_drop) {
+            Ok(requested) => requested,
+            // The parser is the delivery-side canonicalizer. Surface its exact rejection so
+            // acknowledgement and asynchronous delivery cannot disagree about range syntax.
+            Err(error) => {
+                return tool_error_result(format!("Error: Invalid range syntax. {error}"));
+            }
+        };
+        let facade_scope = match self
+            .resolve_facade_scope(channel, Some(&args), "memories", false)
+            .await
+        {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let session_id = facade_scope.conversation_key.as_str();
+        let tags = match store.load_tags_for_session(session_id) {
+            Ok(tags) => tags,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let pending = match store.load_pending_agent_drops(session_id) {
+            Ok(pending) => pending,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let by_number = tags
+            .iter()
+            .map(|tag| (tag.tag_number as u64, tag))
+            .collect::<HashMap<_, _>>();
+        let pending_ids = pending
+            .iter()
+            .map(|drop| drop.target_id.as_str())
+            .collect::<HashSet<_>>();
+        let unknown = requested
+            .iter()
+            .copied()
+            .filter(|number| !by_number.contains_key(number))
+            .collect::<Vec<_>>();
+        let already_queued = requested
+            .iter()
+            .copied()
+            .filter(|number| {
+                by_number
+                    .get(number)
+                    .is_some_and(|tag| pending_ids.contains(tag.block_id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let queueable = requested
+            .iter()
+            .copied()
+            .filter(|number| {
+                by_number
+                    .get(number)
+                    .is_some_and(|tag| !pending_ids.contains(tag.block_id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if queueable.is_empty() {
+            let reason = ctx_reduce_ack_details(&unknown, &already_queued);
+            return tool_error_result(format!(
+                "Refused: no valid tags to queue. {}",
+                if reason.is_empty() {
+                    "No requested tags are available for delivery.".to_string()
+                } else {
+                    reason
+                }
+            ));
+        }
+
+        let protected_start = tags
+            .len()
+            .checked_sub(DEFAULT_PROTECTED_TAGS)
+            .and_then(|index| tags.get(index))
+            .map(|tag| tag.tag_number as u64)
+            .unwrap_or(0);
+        let (deferred, immediate): (Vec<_>, Vec<_>) = queueable
+            .iter()
+            .copied()
+            .partition(|number| protected_start != 0 && *number >= protected_start);
+        let mut details = Vec::new();
+        if !immediate.is_empty() {
+            details.push(format!("drop {}", format_tag_numbers(&immediate)));
+        }
+        if !deferred.is_empty() {
+            details.push(format!("deferred drop {}", format_tag_numbers(&deferred)));
+        }
+        let validation_detail = ctx_reduce_ack_details(&unknown, &already_queued);
+        if !validation_detail.is_empty() {
+            details.push(validation_detail);
+        }
+        // This acknowledgement validates the durable tag state but deliberately does not
+        // mutate it. The response observer owns asynchronous delivery on this facade.
+        mcp_text_result(format!("Queued: {}.", details.join("; ")), false)
     }
 
     async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -9150,9 +10666,28 @@ impl McHandler {
             None => return store_unavailable_error(),
         };
         let session_id = facade_scope.conversation_key.as_str();
-        if let Some(message) = i64_arg(args, "message").filter(|value| *value > 0) {
+        if let Some(message) = i64_arg(args, "message").filter(|value| *value >= 0) {
+            if let Some(raw_message) =
+                self.cached_expand_messages(session_id)
+                    .and_then(|messages| {
+                        messages.into_iter().find(|candidate| {
+                            i64::try_from(candidate.ordinal).ok() == Some(message)
+                        })
+                    })
+            {
+                return mcp_text_result(render_cached_message_expand(&raw_message), false);
+            }
             return match store.load_chunk_transcript_for_message(session_id, message) {
-                Ok(Some(row)) => mcp_text_result(render_message_expand(row, message), false),
+                Ok(Some(row)) => {
+                    if let Some(raw_message) = durable_expand_messages(std::slice::from_ref(&row))
+                        .into_iter()
+                        .find(|candidate| i64::try_from(candidate.ordinal).ok() == Some(message))
+                    {
+                        mcp_text_result(render_cached_message_expand(&raw_message), false)
+                    } else {
+                        mcp_text_result(render_message_expand(row, message), false)
+                    }
+                }
                 Ok(None) => mcp_text_result(
                     format!(
                         "Message {message} is no longer recoverable from persisted chunk transcripts. The span was evicted or was compacted before transcript capture."
@@ -9164,17 +10699,17 @@ impl McHandler {
         }
         let Some(start) = i64_arg(args, "start") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
         let Some(end) = i64_arg(args, "end") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
-        if start < 1 || end < start {
+        if start < 0 || end < start {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         }
         let last_compacted_ordinal = match store.last_compacted_ordinal(session_id) {
@@ -9210,6 +10745,19 @@ impl McHandler {
             Ok(transcripts) => transcripts,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
+        if args.get("verbose").and_then(Value::as_bool) == Some(true) {
+            let durable_messages = durable_expand_messages(&transcripts);
+            let rendered = self
+                .cached_expand_messages(session_id)
+                .or_else(|| (!durable_messages.is_empty()).then_some(durable_messages))
+                .map(|messages| render_verbose_range_expand(&messages, start, bounded_end))
+                .filter(|result| !result.text.is_empty())
+                .map(|result| render_verbose_expand_result(start, bounded_end, result))
+                .unwrap_or_else(|| {
+                    render_verbose_transcript_range_expand(start, bounded_end, &transcripts)
+                });
+            return mcp_text_result(rendered, false);
+        }
         mcp_text_result(
             render_range_expand(start, bounded_end, &compartments, &transcripts),
             false,
@@ -9680,6 +11228,12 @@ impl McHandler {
     }
 }
 
+impl Drop for McHandler {
+    fn drop(&mut self) {
+        self.store_open.cancel();
+    }
+}
+
 impl Default for McHandler {
     fn default() -> Self {
         Self::new()
@@ -9689,33 +11243,20 @@ impl Default for McHandler {
 #[async_trait]
 impl ModuleHandler for McHandler {
     /// The storage seam: HELLO_ACK carries the resolved descriptor (or none in
-    /// standalone dev). Open the store ONCE here — never at construction, because the
-    /// path isn't known until the ACK lands.
-    ///
-    /// Guard the OPEN itself, not just the `set`: `McStore::open` acquires the
-    /// single-writer lease, so on a reconnect ack (if serve re-fires this) an
-    /// unconditional open briefly takes a second lease on a process that already
-    /// holds one. `on_hello_ack` is called serially by serve, so the get/open/set
-    /// is race-free without a lock.
+    /// standalone dev). Start the store open ONCE here — never at construction, because
+    /// the path isn't known until the ACK lands. Opening runs off the request lane so a
+    /// predecessor's live single-writer lease cannot block transform dispatch.
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
-        if self.store.get().is_some() {
-            return;
-        }
-        let descriptor = resolve_descriptor(ack.storage.as_ref());
-        match McStore::open(&descriptor) {
-            Ok(store) => {
-                let _ = self.store.set(Arc::new(store));
-            }
-            Err(e) => {
-                eprintln!("mc-module: store open failed: {e}");
-            }
-        }
+        self.begin_store_open(resolve_descriptor(ack.storage.as_ref()));
     }
 
-    /// Return the transform lane's atomics-only liveness snapshot. The SDK invokes this on
-    /// its separate channel-0 health task; no store read or handler lock is allowed here.
+    /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
+    /// channel-0 health task, so neither the store nor a handler lock is touched here.
     async fn health(&self) -> HealthReport {
-        DISPATCH_HEALTH.report(now_ms().max(0) as u64)
+        let now = now_ms().max(0) as u64;
+        self.store_open
+            .waiting_report(now)
+            .unwrap_or_else(|| DISPATCH_HEALTH.report(now))
     }
 
     /// Record the route's {project_root, session} so the transform path can resolve the
@@ -10017,15 +11558,24 @@ fn native_attachment_context(
     }
 }
 
-/// Select the ingress projection using the same immutable cache snapshot that supplies native
-/// attachments.
+fn projection_cache_context(request: &TransformRequest) -> ProjectionCacheContext {
+    let profile = SerializerProfile::parse(&request.serializer_profile);
+    ProjectionCacheContext {
+        session_id: request.session_id.clone(),
+        serializer_profile: request.serializer_profile.clone(),
+        render_config: request.render_config.clone(),
+        profile_epoch: profile.map(profile_render_epoch).unwrap_or_default(),
+    }
+}
+
+/// Select a cached ingress projection when the request's fingerprint and rendering context match.
 ///
-/// Include the cached transition salt when comparing cache inputs because a transition found by
-/// the upcoming transform affects served rendering but not the ingress CK projection. Reuse a
-/// cached prefix only when the request's profile and rendering fields also match.
+/// Transition salt is not part of this key: a transition found by the upcoming transform affects
+/// served native rendering but not the ingress CK projection. Reuse a cached prefix only when the
+/// request's profile and rendering fields also match.
 fn validated_projection_cache_input(
     request: &TransformRequest,
-    snapshot: &NativeAttachmentCacheSnapshot,
+    snapshot: &ProjectionCacheSnapshot,
     after: &str,
     replace_from: usize,
     mode: ProjectionCacheKeyMode,
@@ -10033,11 +11583,10 @@ fn validated_projection_cache_input(
     if snapshot.full_array_fingerprint.as_deref() != Some(after) {
         return None;
     }
-    let current_context = native_attachment_context(request, snapshot.context.transition_consumed);
-    if current_context != snapshot.context {
+    if projection_cache_context(request) != snapshot.context {
         return None;
     }
-    let projection = Arc::clone(snapshot.projection.as_ref()?);
+    let projection = Arc::clone(&snapshot.projection);
     #[cfg(test)]
     let prefix = if mode == ProjectionCacheKeyMode::CorruptFrontierForTest {
         replace_from.saturating_add(1)
@@ -10052,6 +11601,8 @@ fn validated_projection_cache_input(
     (prefix <= projection.message_count()).then_some(ProjectionCacheInput {
         projection,
         replace_from: prefix,
+        prior_fingerprint: after.to_string(),
+        message_retained_bytes: Arc::clone(&snapshot.message_retained_bytes),
     })
 }
 
@@ -10138,22 +11689,7 @@ fn native_message_key(
 }
 
 fn native_value_retained_bytes(value: &Value) -> usize {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of::<Value>(),
-        Value::String(text) => std::mem::size_of::<Value>().saturating_add(text.len()),
-        Value::Array(values) => std::mem::size_of::<Value>().saturating_add(
-            values
-                .iter()
-                .map(native_value_retained_bytes)
-                .sum::<usize>(),
-        ),
-        Value::Object(object) => std::mem::size_of::<Value>().saturating_add(
-            object
-                .iter()
-                .map(|(key, value)| key.len().saturating_add(native_value_retained_bytes(value)))
-                .sum::<usize>(),
-        ),
-    }
+    crate::retained_size::value_retained_bytes(value)
 }
 
 fn native_reasoning_should_clear(
@@ -10224,6 +11760,52 @@ fn encode_full_native_messages(
     native_messages
 }
 
+fn native_ingress_chunks(
+    request: &TransformRequest,
+    encoded_chunks: &[NativeEncodedChunk],
+    frontier: Option<&NativeDeltaFrontier>,
+) -> (Vec<Arc<Value>>, Vec<usize>) {
+    let native_messages = request.native_messages.as_deref().unwrap_or_default();
+    let reusable_prefix = frontier
+        .filter(|frontier| {
+            frontier.native_prefix.len() == frontier.native_replace_from
+                && frontier.native_prefix_retained_bytes.len() == frontier.native_replace_from
+                && frontier.native_replace_from <= native_messages.len()
+        })
+        .map_or(0, |frontier| frontier.native_replace_from);
+    let mut ingress_chunks = frontier
+        .filter(|_| reusable_prefix > 0)
+        .map(|frontier| frontier.native_prefix.clone())
+        .unwrap_or_default();
+    let mut ingress_chunk_retained_bytes = frontier
+        .filter(|_| reusable_prefix > 0)
+        .map(|frontier| frontier.native_prefix_retained_bytes.clone())
+        .unwrap_or_default();
+    ingress_chunks.reserve(native_messages.len().saturating_sub(reusable_prefix));
+    ingress_chunk_retained_bytes.reserve(native_messages.len().saturating_sub(reusable_prefix));
+    let output_chunks_by_start = encoded_chunks
+        .iter()
+        .filter(|chunk| chunk.end_index == chunk.start_index.saturating_add(1))
+        .map(|chunk| (chunk.start_index, chunk))
+        .collect::<HashMap<_, _>>();
+    for (index, message) in native_messages.iter().enumerate().skip(reusable_prefix) {
+        let shared_output = output_chunks_by_start
+            .get(&index)
+            .filter(|chunk| chunk.value.as_ref() == message);
+        let (value, retained_bytes) = shared_output.map_or_else(
+            || {
+                let value = Arc::new(message.clone());
+                let retained_bytes = native_value_retained_bytes(&value);
+                (value, retained_bytes)
+            },
+            |chunk| (Arc::clone(&chunk.value), chunk.retained_bytes),
+        );
+        ingress_chunks.push(value);
+        ingress_chunk_retained_bytes.push(retained_bytes);
+    }
+    (ingress_chunks, ingress_chunk_retained_bytes)
+}
+
 static NATIVE_ATTACHMENT_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
 
 fn native_attachment_differential_enabled() -> bool {
@@ -10245,14 +11827,13 @@ fn attach_native_messages_incremental(
     native_delta_frontier: Option<&NativeDeltaFrontier>,
     revert_epoch: u64,
     cache: &Mutex<NativeAttachmentCache>,
-    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
     mode: NativeCacheKeyMode,
 ) -> NativeAttachmentCacheStats {
     if !request.serve_native {
         return NativeAttachmentCacheStats::default();
     }
 
-    let cached = cache
+    let mut cached = cache
         .lock()
         .expect("native attachment cache mutex")
         .snapshot(&request.session_id, revert_epoch);
@@ -10268,6 +11849,25 @@ fn attach_native_messages_incremental(
         .map(|(index, mid)| (mid.as_str(), index))
         .collect::<HashMap<_, _>>();
     let context = native_attachment_context(request, transition_consumed);
+    let delta_fallback_reason = native_delta_frontier.and_then(|frontier| {
+        let Some(snapshot) = cached.as_ref() else {
+            return Some(NativeDeltaFallbackReason::MissingCacheState);
+        };
+        if snapshot.full_array_fingerprint.as_deref() != Some(frontier.after.as_str()) {
+            return Some(NativeDeltaFallbackReason::FingerprintMismatch);
+        }
+        if snapshot.context != context {
+            return Some(NativeDeltaFallbackReason::CacheContextMismatch);
+        }
+        let native_len = request.native_messages.as_deref().map_or(0, <[Value]>::len);
+        if frontier.native_replace_from > native_len
+            || frontier.native_prefix.len() != frontier.native_replace_from
+            || frontier.native_prefix_retained_bytes.len() != frontier.native_replace_from
+        {
+            return Some(NativeDeltaFallbackReason::InvalidFrontier);
+        }
+        None
+    });
     let mutation_exempt_mids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
@@ -10279,35 +11879,50 @@ fn attach_native_messages_incremental(
         .max_by_key(|message| message.ordinal)
         .map(|message| message.mid.as_str());
 
-    let mut sidecar_hashes = HashMap::new();
-    let mut sidecar_sizes = HashMap::new();
+    let mut sidecar_hashes = cached
+        .as_mut()
+        .map(|snapshot| std::mem::take(&mut snapshot.sidecar_hashes))
+        .unwrap_or_default();
+    let mut sidecar_sizes = cached
+        .as_mut()
+        .map(|snapshot| std::mem::take(&mut snapshot.sidecar_sizes))
+        .unwrap_or_default();
     let mut message_keys = Vec::with_capacity(response.messages().len());
     for (position, served) in response.messages().iter().enumerate() {
         let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
-        let sidecar_hash = meta.map(|meta| {
-            let slot = meta.mid.clone();
-            let trusted = sidecar_positions
-                .get(meta.mid.as_str())
-                .is_some_and(|index| *index < trusted_prefix);
-            let (hash, retained_bytes) = if trusted {
-                cached
-                    .as_ref()
-                    .and_then(|snapshot| {
-                        Some((
-                            *snapshot.sidecar_hashes.get(&slot)?,
-                            *snapshot.sidecar_sizes.get(&slot)?,
-                        ))
-                    })
-                    .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
+        let slot = meta.map(|meta| meta.mid.as_str()).or_else(|| {
+            if served.meta.synthetic {
+                None
             } else {
-                native_sidecar_hash_and_size(meta)
-            };
-            sidecar_hashes.insert(slot.clone(), hash);
-            sidecar_sizes.insert(slot, retained_bytes);
-            hash
+                served
+                    .meta
+                    .harness_id
+                    .as_deref()
+                    .filter(|mid| sidecar_positions.contains_key(*mid))
+                    .or_else(|| sidecar.order.get(position).map(String::as_str))
+            }
         });
-        let meta_mid = meta.map(|meta| meta.mid.as_str());
-        let mutation_exempt = meta_mid.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
+        let sidecar_hash = slot.and_then(|slot| {
+            let trusted = sidecar_positions
+                .get(slot)
+                .is_some_and(|index| *index < trusted_prefix);
+            let cached_hash = trusted.then(|| sidecar_hashes.get(slot).copied()).flatten();
+            let cached_size = trusted.then(|| sidecar_sizes.get(slot).copied()).flatten();
+            let computed = (cached_hash.is_none() || cached_size.is_none())
+                .then(|| meta.map(native_sidecar_hash_and_size))
+                .flatten();
+            let hash = cached_hash.or_else(|| computed.map(|(hash, _)| hash))?;
+            if cached_size.is_none() {
+                if let Some(retained_bytes) = computed.map(|(_, retained_bytes)| retained_bytes) {
+                    sidecar_sizes.insert(slot.to_string(), retained_bytes);
+                }
+            }
+            if cached_hash.is_none() {
+                sidecar_hashes.insert(slot.to_string(), hash);
+            }
+            Some(hash)
+        });
+        let mutation_exempt = slot.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
         let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
             served,
             request,
@@ -10329,25 +11944,12 @@ fn attach_native_messages_incremental(
         if sidecar_sizes.contains_key(slot) {
             continue;
         }
-        let trusted = sidecar_positions
-            .get(slot.as_str())
-            .is_some_and(|index| *index < trusted_prefix);
-        let (hash, retained_bytes) = if trusted {
-            cached
-                .as_ref()
-                .and_then(|snapshot| {
-                    Some((
-                        *snapshot.sidecar_hashes.get(slot)?,
-                        *snapshot.sidecar_sizes.get(slot)?,
-                    ))
-                })
-                .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
-        } else {
-            native_sidecar_hash_and_size(meta)
-        };
+        let (hash, retained_bytes) = native_sidecar_hash_and_size(meta);
         sidecar_hashes.insert(slot.clone(), hash);
         sidecar_sizes.insert(slot.clone(), retained_bytes);
     }
+    sidecar_hashes.retain(|slot, _| sidecar_positions.contains_key(slot.as_str()));
+    sidecar_sizes.retain(|slot, _| sidecar_positions.contains_key(slot.as_str()));
 
     let cache_compatible = cached
         .as_ref()
@@ -10444,6 +12046,8 @@ fn attach_native_messages_incremental(
         .iter()
         .map(|chunk| Arc::clone(&chunk.value))
         .collect::<Vec<_>>();
+    let (ingress_chunks, ingress_chunk_retained_bytes) =
+        native_ingress_chunks(request, &chunks, native_delta_frontier);
 
     if native_attachment_differential_enabled() {
         let full = encode_full_native_messages(
@@ -10464,9 +12068,21 @@ fn attach_native_messages_incremental(
         );
     }
 
-    let stats = NativeAttachmentCacheStats {
+    let request_native_retained_bytes = request.native_messages.as_ref().map_or(0, |messages| {
+        messages
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(ingress_chunk_retained_bytes.iter().copied().sum::<usize>())
+    });
+    let mut stats = NativeAttachmentCacheStats {
         reused_messages: suffix_start,
         encoded_messages: message_keys.len().saturating_sub(suffix_start),
+        request_native_retained_bytes,
+        delta_fallback_reason: delta_fallback_reason.or_else(|| {
+            (native_delta_frontier.is_some() && suffix_start == 0)
+                .then_some(NativeDeltaFallbackReason::NoReusableOutput)
+        }),
+        ..Default::default()
     };
     let served_bytes = response
         .messages()
@@ -10487,13 +12103,90 @@ fn attach_native_messages_incremental(
                 sidecar_hashes,
                 sidecar_sizes,
                 chunks,
-                projection,
+                ingress_chunks,
+                ingress_chunk_retained_bytes,
             },
-            stats,
+            &mut stats,
             served_bytes,
         );
     response.native_messages = Some(native_messages);
     stats
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_native_messages_response(
+    response: &mut transform::TransformResponse,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+    transition_consumed: bool,
+    native_delta_frontier: Option<&NativeDeltaFrontier>,
+    native_cache_stats: NativeAttachmentCacheStats,
+) {
+    if !request.serve_native {
+        return;
+    }
+
+    let mut fallback_reason = native_cache_stats.delta_fallback_reason;
+    if let Some(frontier) = native_delta_frontier {
+        if fallback_reason.is_none() && native_cache_stats.reused_messages > 0 {
+            match response.native_messages.take() {
+                Some(mut native_messages)
+                    if native_cache_stats.reused_messages <= native_messages.len() =>
+                {
+                    let messages = native_messages.split_off(native_cache_stats.reused_messages);
+                    response.native_messages_delta = Some(transform::NativeMessagesDelta {
+                        after: frontier.after.clone(),
+                        replace_from: native_cache_stats.reused_messages,
+                        messages,
+                    });
+                }
+                Some(native_messages) => {
+                    response.native_messages = Some(native_messages);
+                    fallback_reason = Some(NativeDeltaFallbackReason::InvalidFrontier);
+                }
+                None => {
+                    fallback_reason = Some(NativeDeltaFallbackReason::MissingNativeContent);
+                }
+            }
+        }
+    } else {
+        // Callers without a frontier cannot reconstruct a suffix, even if an unexpected
+        // pre-existing delta reached this seam. Preserve backward compatibility with a full serve.
+        response.native_messages_delta = None;
+    }
+
+    if response.native_messages.is_none() && response.native_messages_delta.is_none() {
+        fallback_reason.get_or_insert(NativeDeltaFallbackReason::MissingNativeContent);
+        response.native_messages = Some(
+            encode_full_native_messages(
+                response.messages(),
+                request,
+                reasoning_watermark,
+                tag_numbers,
+                mutation_exempt_mid,
+                lineage_anchor_mid,
+                transition_consumed,
+            )
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+        );
+    }
+
+    if let Some(reason) = fallback_reason {
+        eprintln!(
+            "native-delta fallback session={} native_delta_fallback_reason={}",
+            request.session_id,
+            reason.as_str(),
+        );
+    }
+    debug_assert!(
+        response.native_messages.is_some() || response.native_messages_delta.is_some(),
+        "successful serve_native response must carry full or delta native content"
+    );
 }
 
 fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
@@ -10503,12 +12196,23 @@ fn state_import_validation_error(error: StateImportValidationError) -> HandlerOu
     }
 }
 
-fn need_full_sync_response(full_array_fingerprint: Option<String>) -> HandlerOutcome {
-    respond(
-        serde_json::to_value(transform::TransformResponse::need_full_sync(
-            full_array_fingerprint,
-        ))
-        .unwrap_or(Value::Null),
+fn passthrough_transform_response(request: &TransformRequest) -> HandlerOutcome {
+    let mut response = transform::TransformResponse::passthrough(
+        request
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect(),
+        request.full_array_fingerprint.clone(),
+    );
+    attach_native_messages(&mut response, request, 0, None);
+    respond_transform(request, response)
+}
+
+fn need_full_sync_response(request: &TransformRequest) -> HandlerOutcome {
+    respond_transform(
+        request,
+        transform::TransformResponse::need_full_sync(request.full_array_fingerprint.clone()),
     )
 }
 
@@ -10566,6 +12270,7 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
 enum DriveFault {
     FingerprintSkew,
     OmitCkMessages,
+    Channel2Arm,
 }
 
 /// Map the raw MC_DRIVE_FAULT value to a fault arm. Pure (no env access) so the
@@ -10577,6 +12282,7 @@ fn parse_drive_fault(raw: Option<&str>) -> Option<DriveFault> {
     match raw {
         Some("fingerprint_skew") => Some(DriveFault::FingerprintSkew),
         Some("omit_ck_messages") => Some(DriveFault::OmitCkMessages),
+        Some("channel2_arm") => Some(DriveFault::Channel2Arm),
         _ => None,
     }
 }
@@ -10615,9 +12321,7 @@ fn drive_fault() -> Option<DriveFault> {
         // Initialize the remaining fault count alongside the arm selection.
         // This runs exactly once per process (OnceLock), so DRIVE_FAULT_REMAINING
         // is set before any respond_transform call can read it.
-        let count = parse_drive_fault_count(
-            std::env::var("MC_DRIVE_FAULT_COUNT").ok().as_deref(),
-        );
+        let count = parse_drive_fault_count(std::env::var("MC_DRIVE_FAULT_COUNT").ok().as_deref());
         DRIVE_FAULT_REMAINING.store(count, std::sync::atomic::Ordering::Relaxed);
         fault
     })
@@ -10650,11 +12354,29 @@ fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFa
                 "mc-module: WARN MC_DRIVE_FAULT=omit_ck_messages active — response deliberately corrupted for drive"
             );
         }
+        DriveFault::Channel2Arm => {
+            // Force a channel-2 directive onto the response regardless of pressure so
+            // the DELIVERY contract (same-pass append → echo → delivered-mark →
+            // frozen re-serve on a refused pass) can be driven end-to-end without
+            // faking a large reclaimable tail. The pressure math upstream is covered
+            // by unit tests; a drive container cannot honestly reach the condition
+            // (its harness compacts real tail bytes away faster than a drive
+            // accumulates them), so earning the directive there would require a
+            // conversation shape no real session has.
+            response.channel2_directive = Some(transform::Channel2Directive {
+                text: "Context pressure is high. Review older tool outputs and reduce what you no longer need.".to_string(),
+                directive_id: "drive-fault-channel2".to_string(),
+                armed_at_ms: 0,
+            });
+            eprintln!(
+                "mc-module: WARN MC_DRIVE_FAULT=channel2_arm active — directive force-armed for drive"
+            );
+        }
     }
 }
 
 fn respond_transform(
-    session_id: &str,
+    request: &TransformRequest,
     mut response: transform::TransformResponse,
 ) -> HandlerOutcome {
     // drive-fault: corrupt the response before it is serialized (see the SAFETY note
@@ -10673,13 +12395,30 @@ fn respond_transform(
         // If the count was already 0, checked_sub returns None and we skip — no underflow.
         // If the count was > 0, the previous value is returned as Ok(prev) and we fire.
         use std::sync::atomic::Ordering;
-        match DRIVE_FAULT_REMAINING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            n.checked_sub(1)
-        }) {
+        match DRIVE_FAULT_REMAINING
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+        {
             Ok(prev) if prev > 0 => apply_drive_fault(&mut response, fault),
             _ => {} // exhausted — response passes through cleanly
         }
     }
+    if response.status == transform::TransformStatus::Ok && request.tail_delta.is_some() {
+        return HandlerOutcome::Error {
+            code: "transform_delta_unexpanded".to_string(),
+            message: "successful transform response retained an unexpanded tail_delta".to_string(),
+        };
+    }
+    if response.status == transform::TransformStatus::Ok
+        && request.serve_native
+        && response.native_messages.is_none()
+        && response.native_messages_delta.is_none()
+    {
+        return HandlerOutcome::Error {
+            code: "transform_native_response_omitted".to_string(),
+            message: "successful serve_native response omitted native content".to_string(),
+        };
+    }
+    let session_id = &request.session_id;
     let response_encode_started_at = Instant::now();
     let pass_timings = response.timings.clone();
     let messages = response.ck_messages.take();
@@ -10689,7 +12428,7 @@ fn respond_transform(
             return HandlerOutcome::Error {
                 code: "encode_failed".to_string(),
                 message: error.to_string(),
-            }
+            };
         }
     };
     if messages.is_some() {
@@ -10704,15 +12443,19 @@ fn respond_transform(
             return HandlerOutcome::Error {
                 code: "encode_failed".to_string(),
                 message: error.to_string(),
-            }
+            };
         }
     };
+    let response_meta_encode_ms = response_encode_started_at.elapsed().as_secs_f64() * 1_000.0;
     let Some(messages) = messages else {
         let outcome = HandlerOutcome::Response(encoded);
         emit_pass_timing(
             session_id,
             pass_timings.as_ref(),
             response_encode_started_at,
+            response_meta_encode_ms,
+            0.0,
+            0.0,
         );
         return outcome;
     };
@@ -10728,10 +12471,14 @@ fn respond_transform(
         };
     };
     let null_start = start + PLACEHOLDER.len() - 4;
+    let response_size_account_started_at = Instant::now();
     let retained_bytes = messages
         .iter()
         .map(|message| message.canonical_bytes().len())
         .sum::<usize>();
+    let response_size_account_ms =
+        response_size_account_started_at.elapsed().as_secs_f64() * 1_000.0;
+    let response_splice_started_at = Instant::now();
     let mut output =
         Vec::with_capacity(encoded.len() + retained_bytes + messages.len().saturating_sub(1) + 2);
     output.extend_from_slice(&encoded[..null_start]);
@@ -10744,11 +12491,15 @@ fn respond_transform(
     }
     output.push(b']');
     output.extend_from_slice(&encoded[null_start + 4..]);
+    let response_splice_ms = response_splice_started_at.elapsed().as_secs_f64() * 1_000.0;
     let outcome = HandlerOutcome::Response(output);
     emit_pass_timing(
         session_id,
         pass_timings.as_ref(),
         response_encode_started_at,
+        response_meta_encode_ms,
+        response_size_account_ms,
+        response_splice_ms,
     );
     outcome
 }
@@ -10757,13 +12508,20 @@ fn emit_pass_timing(
     session_id: &str,
     timings: Option<&transform::TransformTimings>,
     response_encode_started_at: Instant,
+    response_meta_encode_ms: f64,
+    response_size_account_ms: f64,
+    response_splice_ms: f64,
 ) {
     if let Some(timings) = timings {
+        let mut timings = timings.clone();
+        timings.response_meta_encode = response_meta_encode_ms;
+        timings.response_size_account = response_size_account_ms;
+        timings.response_splice = response_splice_ms;
         eprintln!(
             "{}",
             transform::format_pass_timing_line(
                 session_id,
-                timings,
+                &timings,
                 response_encode_started_at.elapsed().as_secs_f64() * 1_000.0,
             )
         );
@@ -11371,6 +13129,93 @@ fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
     truncate_expand_output(lines.join("\n"))
 }
 
+/// Recover one raw CK message in the same bounded-snapshot window used by verbose
+/// ctx_expand. The durable transcript fallback above remains available when the snapshot
+/// is gone, but it intentionally cannot recover raw tool input or output bytes.
+fn render_cached_message_expand(message: &ck_wire::CkIngressMessage) -> String {
+    let role = match message.ck.role.as_str() {
+        "assistant" => "A (assistant)",
+        "user" => "U (user)",
+        role => role,
+    };
+    let parts = message
+        .ck
+        .content
+        .iter()
+        .filter_map(render_cached_expand_part)
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        format!("[{}] {role} — full recovery:", message.ordinal),
+        String::new(),
+    ];
+    if parts.is_empty() {
+        lines.push(
+            "  (no recoverable content — message had only structural/reasoning parts)".to_string(),
+        );
+    } else {
+        lines.extend(parts);
+    }
+    lines.join("\n")
+}
+
+fn render_cached_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
+    match &part.kind {
+        ck_wire::CkKind::Text { text } if !text.trim().is_empty() => {
+            Some(format!("  [text]\n{text}"))
+        }
+        ck_wire::CkKind::ToolCall {
+            id, name, input, ..
+        } => Some(format!("  [tool: {name} #{id}]\n  input: {input}")),
+        ck_wire::CkKind::ToolResult {
+            id,
+            tool_name,
+            output,
+            ..
+        } => Some(format!(
+            "  [tool: {tool_name} #{id}]\n  output:\n{}",
+            expand_tool_output_text(output)
+        )),
+        ck_wire::CkKind::Media(_) => Some("  [media]".to_string()),
+        ck_wire::CkKind::Text { .. }
+        | ck_wire::CkKind::Reasoning { .. }
+        | ck_wire::CkKind::RedactedReasoning { .. }
+        | ck_wire::CkKind::Opaque(_) => None,
+    }
+}
+
+fn ctx_reduce_ack_details(unknown: &[u64], already_queued: &[u64]) -> String {
+    let mut details = Vec::new();
+    if !unknown.is_empty() {
+        details.push(format!(
+            "tags {} not found",
+            format_plain_tag_numbers(unknown)
+        ));
+    }
+    if !already_queued.is_empty() {
+        details.push(format!(
+            "tags {} already queued",
+            format_plain_tag_numbers(already_queued)
+        ));
+    }
+    details.join("; ")
+}
+
+fn format_plain_tag_numbers(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_tag_numbers(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(|number| format!("§{number}§"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_range_expand(
     start: i64,
     end: i64,
@@ -11386,6 +13231,11 @@ fn render_range_expand(
         return format!(
             "No compacted compartments found in range {start}-{end}. The range may be live tail, outside this session's history, or compacted before transcript capture."
         );
+    }
+
+    let durable_messages = durable_expand_messages(transcripts);
+    if !durable_messages.is_empty() {
+        return render_durable_range_expand(start, end, &durable_messages);
     }
 
     let mut output = format!("Messages {start}-{end} from persisted historian chunk transcripts:");
@@ -11405,14 +13255,397 @@ fn render_range_expand(
             .iter()
             .find(|row| row.compartment_seq == compartment.sequence)
             .and_then(|row| row.transcript.as_deref())
+            .map(|transcript| slice_expand_transcript(transcript, start, end))
+            .filter(|transcript| !transcript.is_empty())
             .unwrap_or(
-                "[no longer recoverable: this compartment transcript was evicted or was not recorded]",
+                "[no longer recoverable: this compartment transcript was evicted, was not recorded, or only covered ordinals outside the requested range]".to_string(),
             );
-        if !append_expand_piece(&mut output, transcript) {
+        if !append_expand_piece(&mut output, &transcript) {
             break;
         }
     }
     truncate_expand_output(output)
+}
+
+/// Decode original messages copied into every durable transcript row. A historian publish can
+/// produce several compartments, so ordinal de-duplication restores one chronological message
+/// sequence for range, verbose, and full-message recovery.
+fn durable_expand_messages(
+    transcripts: &[StoredChunkTranscript],
+) -> Vec<ck_wire::CkIngressMessage> {
+    let mut messages = BTreeMap::new();
+    for transcript in transcripts {
+        let Some(raw_messages) = transcript.raw_messages_json.as_deref() else {
+            continue;
+        };
+        let Ok(raw_messages) = serde_json::from_str::<Vec<ck_wire::CkIngressMessage>>(raw_messages)
+        else {
+            continue;
+        };
+        for message in raw_messages {
+            let Ok(ordinal) = i64::try_from(message.ordinal) else {
+                continue;
+            };
+            if ordinal >= transcript.start_ordinal && ordinal <= transcript.end_ordinal {
+                messages.entry(message.ordinal).or_insert(message);
+            }
+        }
+    }
+    messages.into_values().collect()
+}
+
+fn render_durable_range_expand(
+    start: i64,
+    end: i64,
+    messages: &[ck_wire::CkIngressMessage],
+) -> String {
+    let messages = messages
+        .iter()
+        .filter(|message| {
+            let ordinal = i64::try_from(message.ordinal).unwrap_or(i64::MAX);
+            ordinal >= start && ordinal <= end
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = messages.first() else {
+        return format!(
+            "No messages found in range {start}-{end}. The range may be outside this session's persisted historian transcripts."
+        );
+    };
+    let last = messages.last().expect("nonempty checked above");
+    let mut output = format!(
+        "Messages {}-{} from persisted raw message history:",
+        first.ordinal, last.ordinal
+    );
+    for message in messages {
+        if !append_expand_piece(&mut output, "\n\n")
+            || !append_expand_piece(&mut output, &render_durable_range_message(message))
+        {
+            break;
+        }
+    }
+    truncate_expand_output(output)
+}
+
+fn render_durable_range_message(message: &ck_wire::CkIngressMessage) -> String {
+    let role = match message.ck.role.as_str() {
+        "assistant" => "A",
+        "user" => "U",
+        role => role,
+    };
+    let parts = message
+        .ck
+        .content
+        .iter()
+        .filter_map(render_durable_range_part)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        format!("[{}] {role}:", message.ordinal)
+    } else {
+        format!("[{}] {role}: {}", message.ordinal, parts.join(" / "))
+    }
+}
+
+fn render_durable_range_part(part: &ck_wire::CkWireBlock) -> Option<String> {
+    match &part.kind {
+        ck_wire::CkKind::Text { text } => {
+            (!text.trim().is_empty()).then(|| text.trim().to_string())
+        }
+        ck_wire::CkKind::ToolCall { name, input, .. } => {
+            let argument = verbose_expand_key_argument(input);
+            Some(if argument.is_empty() {
+                format!("TC: {name}")
+            } else {
+                format!("TC: {name}({argument})")
+            })
+        }
+        ck_wire::CkKind::ToolResult {
+            tool_name, output, ..
+        } => Some(format!(
+            "TR: {tool_name} → output ~{} tok",
+            mc_tokenizer::estimate_tokens(&expand_tool_output_text(output))
+        )),
+        ck_wire::CkKind::Media(_) => Some("[media]".to_string()),
+        ck_wire::CkKind::Reasoning { .. }
+        | ck_wire::CkKind::RedactedReasoning { .. }
+        | ck_wire::CkKind::Opaque(_) => None,
+    }
+}
+
+fn slice_expand_transcript(transcript: &str, start: i64, end: i64) -> String {
+    transcript
+        .lines()
+        .filter_map(|line| {
+            let (span, _) = line.strip_prefix('[')?.split_once("] ")?;
+            let (span_start, span_end) = parse_expand_ordinal_span(span)?;
+            let clipped_start = span_start.max(start);
+            let clipped_end = span_end.min(end);
+            (clipped_start <= clipped_end).then(|| {
+                if clipped_start == span_start && clipped_end == span_end {
+                    line.to_string()
+                } else if clipped_start == clipped_end {
+                    format!(
+                        "[{clipped_start}] [historian transcript coalesced across ordinals {span_start}-{span_end}; exact raw payload unavailable]"
+                    )
+                } else {
+                    format!(
+                        "[{clipped_start}-{clipped_end}] [historian transcript coalesced across ordinals {span_start}-{span_end}; exact raw payload unavailable]"
+                    )
+                }
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const CTX_EXPAND_VERBOSE_TOKEN_BUDGET: usize = 15_000;
+const CTX_EXPAND_VERBOSE_TEXT_PREVIEW_CHARS: usize = 200;
+const CTX_EXPAND_VERBOSE_REASONING_PREVIEW_CHARS: usize = 120;
+const CTX_EXPAND_VERBOSE_ARGUMENT_PREVIEW_CHARS: usize = 60;
+
+struct VerboseRangeExpand {
+    text: String,
+    last_ordinal: i64,
+    truncated: bool,
+}
+
+/// Render each raw CK message separately, retaining only bounded previews. The in-process
+/// snapshot and durable historian payload carry the same pre-reduction parts, including tool
+/// outputs; the default range view remains condensed while verbose exposes those previews.
+fn render_verbose_range_expand(
+    messages: &[ck_wire::CkIngressMessage],
+    start: i64,
+    end: i64,
+) -> VerboseRangeExpand {
+    render_verbose_range_expand_with_budget(messages, start, end, CTX_EXPAND_VERBOSE_TOKEN_BUDGET)
+}
+
+fn render_verbose_range_expand_with_budget(
+    messages: &[ck_wire::CkIngressMessage],
+    start: i64,
+    end: i64,
+    token_budget: usize,
+) -> VerboseRangeExpand {
+    let mut output = Vec::new();
+    let mut used_tokens = 0;
+    let mut last_ordinal = start.saturating_sub(1);
+    let mut truncated = false;
+    for message in messages.iter().filter(|message| {
+        let ordinal = i64::try_from(message.ordinal).unwrap_or(i64::MAX);
+        ordinal >= start && ordinal <= end
+    }) {
+        let block = render_verbose_expand_message(message);
+        let block_tokens = mc_tokenizer::estimate_tokens(&block);
+        if used_tokens + block_tokens > token_budget && !output.is_empty() {
+            truncated = true;
+            break;
+        }
+        used_tokens += block_tokens;
+        last_ordinal = i64::try_from(message.ordinal).unwrap_or(i64::MAX);
+        output.push(block);
+    }
+    VerboseRangeExpand {
+        text: output.join("\n\n"),
+        last_ordinal,
+        truncated,
+    }
+}
+
+fn render_verbose_expand_result(start: i64, end: i64, result: VerboseRangeExpand) -> String {
+    let mut output = format!(
+        "Messages {start}-{} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):\n\n{}",
+        result.last_ordinal, result.text
+    );
+    if result.truncated {
+        output.push_str(&format!(
+            "\n\nTruncated at message {} (budget: ~{CTX_EXPAND_VERBOSE_TOKEN_BUDGET} tokens). Call again with start={} end={end} verbose=true for more.",
+            result.last_ordinal,
+            result.last_ordinal.saturating_add(1),
+        ));
+    }
+    output
+}
+
+fn render_verbose_expand_message(message: &ck_wire::CkIngressMessage) -> String {
+    let role = match message.ck.role.as_str() {
+        "assistant" => "A (assistant)",
+        "user" => "U (user)",
+        role => role,
+    };
+    let previews = message
+        .ck
+        .content
+        .iter()
+        .filter_map(render_verbose_expand_part)
+        .collect::<Vec<_>>();
+    if previews.is_empty() {
+        format!("[{}] {role}", message.ordinal)
+    } else {
+        format!("[{}] {role}\n{}", message.ordinal, previews.join("\n"))
+    }
+}
+
+fn render_verbose_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
+    match &part.kind {
+        ck_wire::CkKind::Text { text } => {
+            let preview = truncate_expand_preview(text, CTX_EXPAND_VERBOSE_TEXT_PREVIEW_CHARS);
+            (!preview.is_empty()).then(|| format!("    • {preview}"))
+        }
+        ck_wire::CkKind::ToolCall { name, input, .. } => {
+            let argument = verbose_expand_key_argument(input);
+            let head = if argument.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}({argument})")
+            };
+            Some(format!("    • tool {head}"))
+        }
+        ck_wire::CkKind::ToolResult {
+            tool_name, output, ..
+        } => Some(format!(
+            "    • tool {tool_name} → output ~{} tok",
+            mc_tokenizer::estimate_tokens(&expand_tool_output_text(output))
+        )),
+        ck_wire::CkKind::Reasoning { text, .. } => Some(format!(
+            "    • [reasoning] {}",
+            truncate_expand_preview(text, CTX_EXPAND_VERBOSE_REASONING_PREVIEW_CHARS)
+        )),
+        ck_wire::CkKind::Media(_) => Some("    • [media]".to_string()),
+        ck_wire::CkKind::RedactedReasoning { .. } => Some("    • [redacted_reasoning]".to_string()),
+        ck_wire::CkKind::Opaque(opaque) => Some(format!("    • [{}]", opaque.kind)),
+    }
+}
+
+fn verbose_expand_key_argument(input: &Value) -> String {
+    let Some(input) = input.as_object() else {
+        return String::new();
+    };
+    for key in [
+        "filePath",
+        "path",
+        "pattern",
+        "query",
+        "symbol",
+        "module",
+        "action",
+        "description",
+    ] {
+        if let Some(value) = input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            return truncate_expand_preview(value, CTX_EXPAND_VERBOSE_ARGUMENT_PREVIEW_CHARS);
+        }
+    }
+    String::new()
+}
+
+fn expand_tool_output_text(output: &ck_wire::CkToolOutput) -> String {
+    match &output.kind {
+        ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
+            text.clone()
+        }
+        ck_wire::CkOutputKind::Json { value } | ck_wire::CkOutputKind::ErrorJson { value } => {
+            value.to_string()
+        }
+        ck_wire::CkOutputKind::ExecutionDenied { reason } => reason.clone().unwrap_or_default(),
+        ck_wire::CkOutputKind::Content { blocks }
+        | ck_wire::CkOutputKind::ErrorContent { blocks } => {
+            serde_json::to_string(blocks).unwrap_or_default()
+        }
+    }
+}
+
+/// The durable fallback predates raw CK snapshot retention. It cannot reconstruct every
+/// part or tool-output size, but it keeps historical transcript recovery available after
+/// a module restart or cache eviction.
+fn render_verbose_transcript_range_expand(
+    start: i64,
+    end: i64,
+    transcripts: &[StoredChunkTranscript],
+) -> String {
+    let mut entries = Vec::new();
+    for transcript in transcripts {
+        let Some(transcript) = transcript.transcript.as_deref() else {
+            continue;
+        };
+        for line in transcript.lines() {
+            let Some((span, role_and_content)) = line
+                .strip_prefix('[')
+                .and_then(|line| line.split_once("] "))
+            else {
+                continue;
+            };
+            let Some((role, content)) = role_and_content.split_once(": ") else {
+                continue;
+            };
+            let Some((span_start, span_end)) = parse_expand_ordinal_span(span) else {
+                continue;
+            };
+            for ordinal in span_start.max(start)..=span_end.min(end) {
+                entries.push((ordinal, role, content, span_start, span_end));
+            }
+        }
+    }
+    entries.sort_by_key(|(ordinal, ..)| *ordinal);
+    entries.dedup_by_key(|(ordinal, ..)| *ordinal);
+    if entries.is_empty() {
+        return format!(
+            "No messages found in range {start}-{end}. The range may be outside this session's persisted historian transcripts."
+        );
+    }
+
+    let last_ordinal = entries
+        .last()
+        .map(|(ordinal, ..)| *ordinal)
+        .unwrap_or(start);
+    let mut output = format!(
+        "Messages {start}-{last_ordinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):"
+    );
+    for (ordinal, role, content, span_start, span_end) in entries {
+        let label = match role {
+            "U" => "U (user)",
+            "A" => "A (assistant)",
+            _ => role,
+        };
+        let mut preview = truncate_expand_preview(content, CTX_EXPAND_VERBOSE_TEXT_PREVIEW_CHARS);
+        if span_start != span_end {
+            preview = format!("[historian span {span_start}-{span_end}] {preview}");
+        }
+        let part = if let Some(tool) = preview.strip_prefix("TC: ") {
+            format!("    • tool {tool}")
+        } else {
+            format!("    • {preview}")
+        };
+        if !append_expand_piece(&mut output, "\n\n")
+            || !append_expand_line(&mut output, &format!("[{ordinal}] {label}"))
+            || !append_expand_piece(&mut output, &part)
+        {
+            break;
+        }
+    }
+    truncate_expand_output(output)
+}
+
+fn parse_expand_ordinal_span(span: &str) -> Option<(i64, i64)> {
+    let (start, end) = match span.split_once('-') {
+        Some((start, end)) => (start.parse().ok()?, end.parse().ok()?),
+        None => {
+            let ordinal = span.parse().ok()?;
+            (ordinal, ordinal)
+        }
+    };
+    (start >= 0 && end >= start).then_some((start, end))
+}
+
+/// Mirrors TypeScript's `trim().slice(0, max)` preview rule in UTF-16 units.
+fn truncate_expand_preview(value: &str, max_units: usize) -> String {
+    let value = value.trim();
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    if units.len() <= max_units {
+        return value.to_string();
+    }
+    format!("{}…", String::from_utf16_lossy(&units[..max_units]))
 }
 
 fn render_notes(
@@ -12036,6 +14269,7 @@ fn boundary_messages(
 
 struct CachedBoundaryMessages {
     messages: Vec<BoundaryMsg>,
+    token_cache_hits: usize,
     tokenized_blocks: usize,
     token_cache_snapshot: BoundaryTokenCacheSnapshot,
 }
@@ -12094,9 +14328,11 @@ fn cached_boundary_messages(
         })
         .collect();
     cache_snapshot.retain_projection(projection);
+    let token_cache_hits = cache_snapshot.hits;
     let tokenized_blocks = cache_snapshot.misses;
     CachedBoundaryMessages {
         messages,
+        token_cache_hits,
         tokenized_blocks,
         token_cache_snapshot: cache_snapshot,
     }
@@ -12119,13 +14355,26 @@ fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
     }
 }
 
-fn usage_numbers(usage: Option<&mc_store::ModuleUsage>) -> (f64, f64, f64) {
+fn usage_numbers(
+    usage: Option<&mc_store::ModuleUsage>,
+    geometry: Option<&crate::transform::TransformGeometry>,
+) -> (f64, f64, f64) {
     let input = usage
         .map(|u| u.current_total_input_tokens as f64)
         .unwrap_or(0.0);
+    // Fallback order mirrors transform.rs effective_context_limit_tokens — the
+    // historian trigger and the scheduler bands must resolve the same
+    // denominator from the same inputs (a first-pass request carries geometry
+    // but no usage, and two independent 200k fallbacks here and in
+    // transform.rs diverged the two paths on exactly that pass).
     let limit = usage
         .map(|u| u.context_limit_tokens as f64)
         .filter(|limit| *limit >= MIN_PLAUSIBLE_CONTEXT_LIMIT as f64)
+        .or_else(|| {
+            geometry
+                .map(|geometry| geometry.usable_soft as f64)
+                .filter(|soft| *soft >= MIN_PLAUSIBLE_CONTEXT_LIMIT as f64)
+        })
         .unwrap_or(200_000.0);
     let pct = if limit > 0.0 {
         input / limit * 100.0
@@ -12293,7 +14542,7 @@ fn ctx_search_description() -> String {
 }
 
 fn ctx_expand_description() -> String {
-    "Recover persisted historian chunk transcripts for compacted conversation ranges. This Claude Code leg serves the chunk-builder U:/A:/TC: view, not full raw message recovery.".to_string()
+    "Recover compacted conversation ranges. The default view serves persisted historian chunk transcripts; verbose=true separately previews each cached raw message part, including tool-output sizes, so an ordinal can be recovered in full while that bounded snapshot is available.".to_string()
 }
 
 fn ctx_note_description() -> String {
@@ -12380,9 +14629,10 @@ fn ctx_expand_schema() -> Value {
         "type": "object",
         "additionalProperties": true,
         "properties": {
-            "start": { "type": "integer", "minimum": 1, "description": "First message ordinal to expand." },
-            "end": { "type": "integer", "minimum": 1, "description": "Last message ordinal to expand, inclusive." },
-            "message": { "type": "integer", "minimum": 1, "description": "Recover the single persisted chunk transcript covering this message ordinal." },
+            "start": { "type": "integer", "minimum": 0, "description": "First message ordinal to expand." },
+            "end": { "type": "integer", "minimum": 0, "description": "Last message ordinal to expand, inclusive." },
+            "verbose": { "type": "boolean", "description": "With start/end: list each message separately with its ordinal [N] and per-part preview, including each tool call's output size, so one message can be recovered by ordinal." },
+            "message": { "type": "integer", "minimum": 0, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
         }
     })
 }
@@ -12422,7 +14672,6 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         consumes: vec![ConsumerRole::ServiceClient {
             of: vec!["thalamus".to_string()],
         }],
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
@@ -12468,7 +14717,7 @@ mod tests {
             final_wire_input_tokens: 0,
             final_wire_trusted: false,
         };
-        let (limit, _, pct) = usage_numbers(Some(&tiny));
+        let (limit, _, pct) = usage_numbers(Some(&tiny), None);
         assert_eq!(limit, 200_000.0);
         assert!((pct - 25.0).abs() < 0.01, "pct={pct}");
 
@@ -12478,7 +14727,7 @@ mod tests {
             final_wire_input_tokens: 0,
             final_wire_trusted: false,
         };
-        let (limit, _, pct) = usage_numbers(Some(&ok));
+        let (limit, _, pct) = usage_numbers(Some(&ok), None);
         assert_eq!(limit, 167_000.0);
         assert!((pct - 79.64).abs() < 0.1, "pct={pct}");
 
@@ -12488,9 +14737,45 @@ mod tests {
             final_wire_input_tokens: 0,
             final_wire_trusted: false,
         };
-        let (limit, _, pct) = usage_numbers(Some(&one_m));
+        let (limit, _, pct) = usage_numbers(Some(&one_m), None);
         assert_eq!(limit, 1_000_000.0);
         assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
+    }
+
+    #[test]
+    fn usage_numbers_first_pass_prefers_geometry_soft_over_the_constant() {
+        // First pass: geometry present, usage absent. The historian trigger
+        // must resolve the same denominator the scheduler bands resolve
+        // (transform.rs effective_context_limit_tokens) — a second private
+        // 200k fallback here made the two paths diverge on exactly this pass,
+        // observed live as identical trigger bars across a 167k/30k override
+        // pair (Thalamus consumption drive, arm 3).
+        let geometry = crate::transform::TransformGeometry {
+            usable_soft: 167_000,
+            usable_hard: 200_000,
+            derivation: "drive".to_string(),
+        };
+        let (limit, _, _) = usage_numbers(None, Some(&geometry));
+        assert_eq!(limit, 167_000.0);
+
+        // Usage present still wins over geometry.
+        let present = ModuleUsage {
+            current_total_input_tokens: 1,
+            context_limit_tokens: 150_000,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
+        };
+        let (limit, _, _) = usage_numbers(Some(&present), Some(&geometry));
+        assert_eq!(limit, 150_000.0);
+
+        // Implausible geometry soft falls through to the constant.
+        let implausible = crate::transform::TransformGeometry {
+            usable_soft: 12,
+            usable_hard: 200_000,
+            derivation: String::new(),
+        };
+        let (limit, _, _) = usage_numbers(None, Some(&implausible));
+        assert_eq!(limit, 200_000.0);
     }
 
     fn trigger_ingress_fixture(
@@ -12651,7 +14936,10 @@ mod tests {
         let formatted_tokens = warm.formatted_token_count(formatted);
         assert_eq!(formatted_tokens, mc_tokenizer::estimate_tokens(formatted));
         assert_eq!(warm.formatted_token_count(formatted), formatted_tokens);
-        assert_eq!(warm.formatted_tokens.len(), 1);
+        assert_eq!(
+            warm.formatted_tokens.len() + warm.formatted_token_updates.len(),
+            1
+        );
 
         let mut bounded = BoundaryTokenCache::new(one_session_bytes);
         let mut first = bounded.snapshot("first");
@@ -12739,6 +15027,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn historian_trigger_cache_engages_at_astro_message_count() {
+        const MESSAGE_COUNT: usize = 4_667;
+        let cold_request =
+            transform_request(trigger_ingress_fixture(MESSAGE_COUNT, 24), 140_000, 200_000);
+        let cold_projection = crate::ck_wire::project_messages(&cold_request.messages).unwrap();
+        let token_cache = Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES));
+        let cold_started_at = Instant::now();
+        let cold = boundary_messages(&cold_request, &cold_projection, &token_cache);
+        let cold_ms = cold_started_at.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(cold.tokenized_blocks, MESSAGE_COUNT);
+        token_cache
+            .lock()
+            .unwrap()
+            .replace(&cold_request.session_id, cold.token_cache_snapshot);
+
+        let warm_started_at = Instant::now();
+        let warm = boundary_messages(&cold_request, &cold_projection, &token_cache);
+        let warm_ms = warm_started_at.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            warm.tokenized_blocks, 0,
+            "steady ASTRO-scale pass must reuse the session-keyed trigger cache"
+        );
+        eprintln!(
+            "trigger-cache-astro n={MESSAGE_COUNT} blocks={} cold_ms={cold_ms:.1} warm_ms={warm_ms:.1} warm_tokenized={}",
+            cold_projection.blocks.len(),
+            warm.tokenized_blocks,
+        );
     }
 
     #[test]
@@ -13012,6 +15330,153 @@ mod tests {
         }
     }
 
+    fn short_store_open_policy(wait_window: Duration) -> StoreOpenPolicy {
+        StoreOpenPolicy {
+            wait_window,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(20),
+        }
+    }
+
+    async fn wait_for_store_open_phase(handler: &McHandler, phase: u8) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handler.store_open.phase.load(Ordering::Acquire) != phase {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("store open phase should advance");
+    }
+
+    async fn wait_for_store_open(handler: &McHandler) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handler.store.get().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("store should open after the predecessor releases its lease");
+    }
+
+    #[tokio::test]
+    async fn lease_held_then_freed_opens_store_and_discriminates_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(before.0, "store_unavailable");
+        assert_eq!(before.1, "store not opened (no HELLO_ACK storage seam)");
+
+        drop(predecessor);
+        wait_for_store_open(&handler).await;
+        let after = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(after.0, "route_unbound");
+    }
+
+    #[tokio::test]
+    async fn lease_held_past_window_preserves_terminal_store_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        wait_for_store_open_phase(&handler, STORE_OPEN_IDLE).await;
+        let after = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn double_store_open_during_lease_wait_has_one_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+
+        handler.begin_store_open(descriptor.clone());
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        handler.begin_store_open(descriptor);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert_eq!(handler.store_open.waiter_starts.load(Ordering::Relaxed), 1);
+        assert_eq!(handler.store_open.active_waiters.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_store_lease_wait_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(5)));
+        let coordinator = Arc::clone(&handler.store_open);
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        drop(handler);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while coordinator.active_waiters.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("store lease waiter should stop on handler shutdown");
+    }
+
+    #[tokio::test]
+    async fn lease_wait_health_detail_advances_elapsed_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let first = <McHandler as ModuleHandler>::health(&handler).await;
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let second = <McHandler as ModuleHandler>::health(&handler).await;
+
+        assert_eq!(first.status, HealthStatus::Degraded);
+        assert_eq!(second.status, HealthStatus::Degraded);
+        let first_detail = first.detail.unwrap();
+        let second_detail = second.detail.unwrap();
+        assert!(first_detail.starts_with("waiting on storage lease, held by prior incarnation, "));
+        assert!(second_detail.ends_with("s elapsed"));
+        assert_ne!(first_detail, second_detail);
+        assert!(
+            second.metrics.unwrap()["storage_lease_wait_elapsed_ms"].as_u64()
+                > first.metrics.unwrap()["storage_lease_wait_elapsed_ms"].as_u64()
+        );
+    }
+
+    #[test]
+    fn store_lease_wait_defaults_to_sixty_seconds() {
+        assert_eq!(
+            StoreOpenPolicy::default().wait_window,
+            Duration::from_secs(60)
+        );
+    }
+
     #[test]
     fn manifest_declares_module_id_and_storage() {
         let m = manifest("magic-context");
@@ -13027,7 +15492,10 @@ mod tests {
             panic!("magic-context must expose a tool provider role");
         };
         assert_eq!(
-            tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "transform",
                 "ctx_reduce",
@@ -13787,19 +16255,138 @@ mod tests {
         (handler, store, dir, project)
     }
 
+    #[test]
+    fn claude_code_config_controls_fill_request_without_changing_default_request_bytes() {
+        let value = json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "claude-code-anthropic",
+            "session_id": "config-controls",
+            "render_config": "cfg",
+            "messages": []
+        });
+        let mut default_request: TransformRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(default_request.channel2_delivered_id.is_none());
+        let before = serde_json::to_vec(&default_request).unwrap();
+        assert!(
+            serde_json::from_slice::<Value>(&before)
+                .unwrap()
+                .get("channel2_delivered_id")
+                .is_none(),
+            "an absent delivery echo must remain absent on the compatibility wire"
+        );
+        apply_claude_code_config_controls(
+            &mut default_request,
+            &McModuleConfig::default(),
+            Some(SerializerProfile::ClaudeCodeAnthropic),
+        );
+        assert_eq!(serde_json::to_vec(&default_request).unwrap(), before);
+
+        let mut echoed_value = value.clone();
+        echoed_value["channel2_delivered_id"] = json!("directive-1");
+        let echoed_request: TransformRequest = serde_json::from_value(echoed_value).unwrap();
+        assert_eq!(
+            echoed_request.channel2_delivered_id.as_deref(),
+            Some("directive-1")
+        );
+
+        let mut configured = McModuleConfig::default();
+        configured.auto_search.enabled = false;
+        configured.auto_search.score_threshold = 0.8;
+        configured.auto_search.min_prompt_chars = 42;
+        configured.caveman.enabled = true;
+        configured.caveman.min_size = 900;
+        configured.prompt_surface_guidance_override =
+            Some("## Magic Context\n\nTrusted route guidance.".to_string());
+        apply_claude_code_config_controls(
+            &mut default_request,
+            &configured,
+            Some(SerializerProfile::ClaudeCodeAnthropic),
+        );
+        assert!(!default_request.auto_search_enabled);
+        assert_eq!(default_request.auto_search_score_threshold, 0.8);
+        assert_eq!(default_request.auto_search_min_prompt_chars, 42);
+        assert!(default_request.caveman_enabled);
+        assert_eq!(default_request.caveman_min_chars, 900);
+        assert_eq!(
+            default_request.prompt_surface_guidance_override.as_deref(),
+            Some("## Magic Context\n\nTrusted route guidance.")
+        );
+
+        let mut open_code_request: TransformRequest = serde_json::from_value(value).unwrap();
+        open_code_request.serializer_profile = "opencode-aisdk".to_string();
+        let unchanged = open_code_request.clone();
+        apply_claude_code_config_controls(
+            &mut open_code_request,
+            &configured,
+            Some(SerializerProfile::OpencodeAiSdk),
+        );
+        assert_eq!(
+            serde_json::to_vec(&open_code_request).unwrap(),
+            serde_json::to_vec(&unchanged).unwrap()
+        );
+    }
+
+    #[test]
+    fn wire_execute_threshold_overrides_config_and_absence_preserves_fallback_both_directions() {
+        fn decision(wire_threshold: Option<f64>, config_threshold: f64) -> scheduler::BaseDecision {
+            let mut request = json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "owned-llmrunner",
+                "session_id": "threshold-wire",
+                "render_config": "cfg",
+                "messages": []
+            });
+            if let Some(threshold) = wire_threshold {
+                request["effective_execute_threshold"] = json!(threshold);
+            }
+            let parsed: TransformRequest = serde_json::from_value(request).unwrap();
+            scheduler::should_execute(
+                &scheduler::SchedulerConfig {
+                    execute_threshold_percentage: scheduler::ExecuteThresholdConfig::Percentage(
+                        parsed.execute_threshold_or(config_threshold),
+                    ),
+                    execute_threshold_tokens: None,
+                },
+                &scheduler::SessionMeta {
+                    last_response_time_ms: 100,
+                    cache_ttl: "5m".to_string(),
+                },
+                &scheduler::ContextUsage {
+                    percentage: 60.0,
+                    input_tokens: 60_000.0,
+                    hard_wall_percentage: None,
+                },
+                100,
+                None,
+                Some(100_000.0),
+            )
+        }
+
+        assert_eq!(decision(Some(50.0), 70.0), scheduler::BaseDecision::Execute);
+        assert_eq!(decision(None, 70.0), scheduler::BaseDecision::Defer);
+        assert_eq!(decision(Some(70.0), 50.0), scheduler::BaseDecision::Defer);
+        assert_eq!(decision(None, 50.0), scheduler::BaseDecision::Execute);
+    }
+
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             model_chain: vec!["test/model".to_string()],
             execute_threshold_percentage: 65.0,
+            compaction_enabled: true,
             memory_enabled: true,
+            auto_search: crate::config::AutoSearchConfig::default(),
+            caveman: crate::config::CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: 128_000,
-            memory_budget_tokens: 8_000.0,
+            memory_budget_tokens: 4_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            prompt_surface_guidance_override: None,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
         }
@@ -14180,6 +16767,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cc_inherits_oc_project_mural_on_a_natural_hard_without_defer_first_apply() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "cc-mural"));
+        let messages = vec![ck("tail", 1, "raw")];
+        let mural_a = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,YQ==",
+            "content_hash": "mural-a",
+        });
+        let mural_b = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,Yg==",
+            "content_hash": "mural-b",
+        });
+
+        let mut oc_request = request(messages.clone());
+        oc_request["serializer_profile"] = json!("opencode-aisdk");
+        oc_request["mural"] = mural_a;
+        let oc_first = call_transform_request_on_channel(&handler, 7, oc_request.clone()).await;
+        assert_eq!(oc_first["action"], "HARD", "{oc_first}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(project.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "mural-a"
+        );
+
+        let mut cc_request = request(messages);
+        cc_request["serializer_profile"] = json!("claude-code-anthropic");
+        cc_request["session_id"] = json!("cc-mural");
+        let cc_first = call_transform_request_on_channel(&handler, 8, cc_request.clone()).await;
+        assert_eq!(cc_first["action"], "HARD", "{cc_first}");
+        assert_eq!(
+            serde_json::to_vec(&oc_first["ck_messages"][0]).unwrap(),
+            serde_json::to_vec(&cc_first["ck_messages"][0]).unwrap(),
+            "the same project artifact must compose the same frozen m0 bytes for OC and CC"
+        );
+
+        oc_request["mural"] = mural_b;
+        let oc_deferred = call_transform_request_on_channel(&handler, 7, oc_request).await;
+        assert_eq!(oc_deferred["action"], "SOFT+", "{oc_deferred}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(project.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "mural-b"
+        );
+
+        let cc_deferred = call_transform_request_on_channel(&handler, 8, cc_request.clone()).await;
+        assert_eq!(cc_deferred["action"], "SOFT+", "{cc_deferred}");
+        assert_eq!(
+            serde_json::to_vec(&cc_deferred["ck_messages"]).unwrap(),
+            serde_json::to_vec(&cc_first["ck_messages"]).unwrap(),
+            "a newly inherited artifact must wait for CC's next natural HARD"
+        );
+
+        cc_request["render_config"] = json!("cfg1");
+        let cc_refolded = call_transform_request_on_channel(&handler, 8, cc_request).await;
+        assert_eq!(cc_refolded["action"], "HARD", "{cc_refolded}");
+        assert_eq!(
+            cc_refolded["ck_messages"][0]["content"][1]["kind"]["source"]["url"],
+            "data:image/png;base64,Yg=="
+        );
+        assert!(
+            store
+                .load("cc-mural")
+                .unwrap()
+                .meta
+                .last_render_config
+                .contains("mural-b"),
+            "the inherited content identity must ride the HARD render fold"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn claude_code_response_resolves_per_pass_model_cache_ttl_from_module_config() {
         let mut config = default_test_config();
         config.model_chain.clear();
@@ -14226,12 +16895,128 @@ mod tests {
         );
         let expected =
             serde_json::to_vec(&serde_json::to_value(response.clone()).unwrap()).unwrap();
-        let HandlerOutcome::Response(actual) =
-            respond_transform("serialized-output-cache", response)
-        else {
+        let request = transform_request(vec![ck("wire-byte-cache", 1, "hello")], 1, 100);
+        let HandlerOutcome::Response(actual) = respond_transform(&request, response) else {
             panic!("cached transform response failed to encode");
         };
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_status_memory_metrics_match_budget_accounting_and_falsy_semantics() {
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let response = call_transform_request(
+            &handler,
+            request(vec![ck("metrics", 1, "holder metrics fixture")]),
+        )
+        .await;
+        assert_eq!(response["status"], "ok");
+        let lease = {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            match snapshots.get("ses") {
+                TransformSnapshotLookup::Ready(lease) => lease,
+                _ => panic!("expected a ready snapshot lease"),
+            }
+        };
+        {
+            let mut pages = handler
+                .transform_pages
+                .lock()
+                .expect("transform page mutex");
+            let staged = pages
+                .stage(
+                    "collecting-session",
+                    "transform-1".to_string(),
+                    1,
+                    0,
+                    2,
+                    "digest-0".to_string(),
+                    json!({"messages": []}),
+                    123,
+                    false,
+                    456,
+                )
+                .unwrap();
+            assert!(matches!(staged, TransformPageStageAction::Ack(1)));
+            pages
+                .sessions
+                .entry("completed-session".to_string())
+                .or_default()
+                .completed = Some(CompletedTransformPage {
+                transform_id: "completed".to_string(),
+                generation: 1,
+                final_digest: "digest-final".to_string(),
+                result: vec![0; 17],
+            });
+        }
+
+        let outcome = handler.handle_status_value(&json!({"method": "status"}));
+        let HandlerOutcome::Response(bytes) = outcome else {
+            panic!("module status did not respond: {outcome:?}");
+        };
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        let metrics = &status["memory_holders"];
+        let snapshot_charge = {
+            let snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            assert_eq!(metrics["snapshots"]["charged_bytes"], snapshots.ready_bytes);
+            assert_eq!(metrics["snapshots"]["entry_count"], 1);
+            assert_eq!(metrics["snapshots"]["in_flight_entry_count"], 0);
+            let TransformSnapshot::Ready { retained_bytes, .. } =
+                snapshots.entries.get("ses").unwrap()
+            else {
+                panic!("expected ready snapshot");
+            };
+            *retained_bytes
+        };
+        assert_eq!(
+            metrics["snapshots"]["active_lease_charged_bytes"],
+            snapshot_charge
+        );
+        assert_eq!(metrics["snapshots"]["active_lease_entry_count"], 1);
+        assert_eq!(
+            metrics["projections"]["charged_bytes"],
+            handler
+                .projections
+                .lock()
+                .expect("projection cache mutex")
+                .retained_bytes
+        );
+        assert_eq!(
+            metrics["serialized_output"]["charged_bytes"],
+            handler
+                .serialized_outputs
+                .lock()
+                .expect("serialized output cache mutex")
+                .metrics()
+                .0
+        );
+        assert_eq!(metrics["native_attach"]["charged_bytes"], 0);
+        assert_eq!(metrics["native_attach"]["entry_count"], 0);
+        assert_eq!(metrics["page_coordinator"]["charged_bytes"], 123);
+        assert_eq!(metrics["page_coordinator"]["entry_count"], 1);
+        assert_eq!(metrics["page_coordinator"]["completed_response_bytes"], 17);
+        assert_eq!(metrics["page_coordinator"]["completed_response_count"], 1);
+        assert_eq!(metrics["page_coordinator"]["collector_active"], true);
+        assert_eq!(metrics["page_coordinator"]["oldest_queued_at_ms"], 456);
+        handler
+            .transform_pages
+            .lock()
+            .expect("transform page mutex")
+            .discard("collecting-session");
+        let idle_pages = handler.memory_holder_metrics();
+        assert_eq!(idle_pages["page_coordinator"]["collector_active"], false);
+        assert_eq!(
+            idle_pages["page_coordinator"]["oldest_queued_at_ms"],
+            Value::Null
+        );
+        drop(lease);
     }
 
     #[test]
@@ -14648,6 +17433,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_response_release_guard_full_serializes_without_frontier() {
+        let request = native_cache_request(
+            "native-release-guard",
+            vec![ck("guard-message", 1, "hello")],
+            vec![native_text_message("guard-message", "user", "hello")],
+            "guard-fingerprint",
+        );
+        let mut response = transform::TransformResponse::passthrough(
+            request
+                .messages
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            request.full_array_fingerprint.clone(),
+        );
+
+        finalize_native_messages_response(
+            &mut response,
+            &request,
+            1,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            NativeAttachmentCacheStats::default(),
+        );
+
+        assert!(response.native_messages.is_some());
+        assert!(response.native_messages_delta.is_none());
+    }
+
+    #[test]
+    fn transform_response_seam_turns_native_omission_into_a_typed_refusal() {
+        let request = native_cache_request(
+            "native-response-seam",
+            vec![ck("seam-message", 1, "hello")],
+            vec![native_text_message("seam-message", "user", "hello")],
+            "seam-fingerprint",
+        );
+        let response = transform::TransformResponse::passthrough(
+            request
+                .messages
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            request.full_array_fingerprint.clone(),
+        );
+
+        let outcome = respond_transform(&request, response);
+
+        assert_eq!(error_code(outcome), "transform_native_response_omitted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_soft_plus_full_sync_primes_the_next_tail_delta() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let first_native = json!({
+            "info": {
+                "id": "m1",
+                "sessionID": "ses",
+                "role": "user",
+                "customInfo": "preserve-me"
+            },
+            "parts": [{ "type": "text", "text": "hello", "customPart": 7 }]
+        });
+        let full_request = |fingerprint: &str| {
+            let mut body = request(vec![ck("m1", 1, "hello")]);
+            body["serializer_profile"] = json!("opencode-aisdk");
+            body["serve_native"] = json!(true);
+            body["native_messages"] = json!([first_native.clone()]);
+            body["full_array_fingerprint"] = json!(fingerprint);
+            body
+        };
+
+        let initialized = call_transform_request(&handler, full_request("warmup")).await;
+        assert_eq!(initialized["status"], "ok", "{initialized}");
+        handler.projections.lock().unwrap().remove("ses");
+        handler.native_attachments.lock().unwrap().remove("ses");
+        handler.transform_snapshots.lock().unwrap().remove("ses");
+        handler.serialized_outputs.lock().unwrap().remove("ses");
+        handler.transform_snapshots.lock().unwrap().max_ready_bytes = 1;
+
+        let cold = call_transform_request(&handler, full_request("cold-fp-1")).await;
+        assert_eq!(cold["status"], "ok", "{cold}");
+        assert_eq!(cold["action"], "SOFT+", "{cold}");
+        assert!(cold["native_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.first() != Some(&first_native)));
+        assert!(handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_delta_request("ses")
+            .is_none());
+
+        let second_native = json!({
+            "info": { "id": "m2", "sessionID": "ses", "role": "user" },
+            "parts": [{ "type": "text", "text": "next" }]
+        });
+        let mut delta = request(vec![ck("m2", 2, "next")]);
+        delta["serializer_profile"] = json!("opencode-aisdk");
+        delta["serve_native"] = json!(true);
+        delta["native_messages"] = json!([second_native]);
+        delta["full_array_fingerprint"] = json!("cold-fp-2");
+        delta["tail_delta"] = json!({
+            "after": "cold-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        });
+        let delta_bytes = serde_json::to_vec(&delta).unwrap().len();
+        let mut full_followup = request(vec![ck("m1", 1, "hello"), ck("m2", 2, "next")]);
+        full_followup["serializer_profile"] = json!("opencode-aisdk");
+        full_followup["serve_native"] = json!(true);
+        full_followup["native_messages"] = json!([first_native, second_native]);
+        full_followup["full_array_fingerprint"] = json!("cold-fp-2");
+        assert!(delta_bytes < serde_json::to_vec(&full_followup).unwrap().len());
+
+        let attached = call_transform_request(&handler, delta).await;
+        assert_eq!(attached["status"], "ok", "{attached}");
+        assert_eq!(attached["action"], "SOFT+", "{attached}");
+        assert_eq!(attached["timings"]["projection_reused_messages"], 1);
+        assert!(
+            attached["timings"]["native_cache_reused_messages"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "tail delta must reuse the transformed native prefix: {attached}"
+        );
+    }
+
     fn native_cache_request(
         session_id: &str,
         messages: Vec<CkIngressMessage>,
@@ -14674,6 +17592,65 @@ mod tests {
             "info": { "id": mid, "role": role },
             "parts": [{ "type": "text", "text": text }],
         })
+    }
+
+    fn native_cache_fixture(
+        session_id: &str,
+        message_count: usize,
+        block_count: usize,
+        target_native_wire_bytes: usize,
+    ) -> (TransformRequest, Vec<CkWireMessage>) {
+        assert!(block_count >= message_count);
+        let blocks_per_message = block_count / message_count;
+        let extra_blocks = block_count % message_count;
+        let payload = "x".repeat(target_native_wire_bytes / block_count);
+        let mut ingress = Vec::with_capacity(message_count);
+        let mut served = Vec::with_capacity(message_count);
+        let mut native = Vec::with_capacity(message_count);
+
+        for index in 0..message_count {
+            let mid = format!("{session_id}-{index}");
+            let part_count = blocks_per_message + usize::from(index < extra_blocks);
+            let texts = (0..part_count)
+                .map(|part| format!("{mid}-{part}:{payload}"))
+                .collect::<Vec<_>>();
+            let ck = CkWireMessage::from_parts(
+                "user",
+                texts
+                    .iter()
+                    .map(|text| CkWireBlock::bare(CkKind::Text { text: text.clone() }))
+                    .collect(),
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.clone()),
+                    ..Default::default()
+                },
+            );
+            served.push(ck.clone());
+            ingress.push(CkIngressMessage {
+                mid: mid.clone(),
+                ordinal: u64::try_from(index + 1).expect("fixture ordinal fits u64"),
+                ck,
+            });
+            native.push(json!({
+                "info": { "id": mid, "role": "user" },
+                "parts": texts
+                    .iter()
+                    .map(|text| json!({ "type": "text", "text": text }))
+                    .collect::<Vec<_>>(),
+            }));
+        }
+
+        (
+            native_cache_request(
+                session_id,
+                ingress,
+                native,
+                &format!("{session_id}-fixture-fingerprint"),
+            ),
+            served,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14724,6 +17701,8 @@ mod tests {
                         delta.get("native_replace_from")?.as_u64()?,
                     )
                     .ok()?,
+                    native_prefix: Vec::new(),
+                    native_prefix_retained_bytes: Vec::new(),
                     projection_cache: None,
                 })
             });
@@ -14738,10 +17717,6 @@ mod tests {
             native_delta_frontier.as_ref(),
             revert_epoch,
             cache,
-            Some(Arc::new(
-                crate::ck_wire::project_messages(&request.messages)
-                    .expect("native cache test projection must succeed"),
-            )),
             mode,
         );
         (response, stats)
@@ -14765,6 +17740,15 @@ mod tests {
             false,
             revert_epoch,
             NativeCacheKeyMode::Normal,
+        );
+        handler.store_projection_cache(
+            request,
+            revert_epoch,
+            Arc::new(
+                crate::ck_wire::project_messages(&request.messages)
+                    .expect("seeded projection must succeed"),
+            ),
+            None,
         );
         let retained_bytes = serde_json::to_vec(request).unwrap().len();
         let mut snapshots = handler
@@ -14857,12 +17841,468 @@ mod tests {
         assert!(encoded.contains("[dropped]"));
         assert!(native.iter().any(|message| {
             message["parts"].as_array().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| part["type"] == json!("reasoning") && part["text"] == json!(""))
+                parts.iter().any(|part| {
+                    part["type"] == json!("reasoning")
+                        && part["text"] == json!("signed historical thinking")
+                })
             })
         }));
         assert_eq!(cache.lock().unwrap().stats("native-complex"), second_stats);
+    }
+
+    #[test]
+    fn native_delta_ingress_core_is_independent_of_changed_output_messages() {
+        let ingress = vec![
+            ck("core-1", 1, "one"),
+            ck("core-2", 2, "two"),
+            ck("core-3", 3, "three"),
+        ];
+        let request = native_cache_request(
+            "native-prefix-core",
+            ingress.clone(),
+            vec![
+                native_text_message("core-1", "user", "one"),
+                native_text_message("core-2", "user", "two"),
+                native_text_message("core-3", "user", "three"),
+            ],
+            "native-prefix-core-fp",
+        );
+        let mut served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        if let CkKind::Text { text } = &mut served[2].content[0].kind {
+            *text = "changed response tail".to_string();
+        }
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut cache = cache.lock().unwrap();
+        assert_eq!(
+            cache.sessions["native-prefix-core"]
+                .snapshot
+                .ingress_chunks
+                .len(),
+            3
+        );
+        let (prefix, retained_bytes) = cache
+            .delta_native_prefix("native-prefix-core", 0, "native-prefix-core-fp", 3)
+            .expect("the raw ingress prefix remains attachable");
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(retained_bytes.len(), 3);
+        assert_eq!(
+            prefix[2].as_ref(),
+            &request.native_messages.as_ref().unwrap()[2]
+        );
+    }
+
+    #[test]
+    fn giant_degraded_snapshot_accepts_tail_delta_and_reuses_projection() {
+        const GIANT_MESSAGE_COUNT: usize = 5_001;
+        const GIANT_BLOCK_COUNT: usize = GIANT_MESSAGE_COUNT;
+        const GIANT_NATIVE_WIRE_BYTES: usize = 26 * 1024 * 1024;
+        const SESSION_ID: &str = "native-giant-degraded";
+
+        let (request, served) = native_cache_fixture(
+            SESSION_ID,
+            GIANT_MESSAGE_COUNT,
+            GIANT_BLOCK_COUNT,
+            GIANT_NATIVE_WIRE_BYTES,
+        );
+        let request = Arc::new(request);
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(producer, default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), SESSION_ID));
+
+        let projection = Arc::new(
+            crate::ck_wire::project_messages(&request.messages).expect("giant projection"),
+        );
+        let projection_charge = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
+            projection: Arc::clone(&projection),
+        }
+        .retained_bytes(SESSION_ID);
+        assert!(
+            projection_charge <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
+            "required projection core must fit: charge={projection_charge} cap={PROJECTION_CACHE_ENTRY_BUDGET_BYTES}"
+        );
+        handler.store_projection_cache(&request, 0, Arc::clone(&projection), None);
+
+        let (first, first_stats) = run_native_cache_pass(
+            &handler.native_attachments,
+            &request,
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(first_stats.reused_messages, 0);
+        assert_eq!(first_stats.degraded_store, 1, "{first_stats:?}");
+        assert_eq!(first_stats.refused_store, 0, "{first_stats:?}");
+        drop(first);
+
+        {
+            let cache = handler.native_attachments.lock().unwrap();
+            let entry = &cache.sessions[SESSION_ID];
+            let snapshot = &entry.snapshot;
+            assert!(entry.retained_bytes <= cache.max_entry_retained_bytes);
+            assert!(cache.retained_bytes <= cache.max_retained_bytes);
+            assert!(snapshot.sidecar.messages.is_empty());
+            assert!(snapshot.sidecar_sizes.is_empty());
+            assert_eq!(snapshot.sidecar.order.len(), GIANT_MESSAGE_COUNT);
+            assert_eq!(snapshot.sidecar.mid_pins.len(), GIANT_MESSAGE_COUNT);
+            assert_eq!(snapshot.sidecar_hashes.len(), GIANT_MESSAGE_COUNT);
+            assert_eq!(snapshot.ingress_chunks.len(), GIANT_MESSAGE_COUNT);
+        }
+
+        let request_charge = request.retained_bytes();
+        assert!(
+            request_charge > TRANSFORM_SNAPSHOT_BUDGET_BYTES,
+            "fixture must exceed the legacy full-request snapshot budget: charge={request_charge}"
+        );
+        {
+            let mut snapshots = handler.transform_snapshots.lock().unwrap();
+            let generation = snapshots.begin(SESSION_ID);
+            snapshots.finish_ready(
+                SESSION_ID,
+                generation,
+                Arc::clone(&request),
+                0,
+                request_charge,
+            );
+            assert!(
+                snapshots.ready_delta_request(SESSION_ID).is_none(),
+                "the regression must be served by required cores, not a retained full request"
+            );
+        }
+
+        let tail = ck(
+            &format!("{SESSION_ID}-{}", GIANT_MESSAGE_COUNT),
+            u64::try_from(GIANT_MESSAGE_COUNT + 1).unwrap(),
+            "new tail",
+        );
+        let tail_native = native_text_message(&tail.mid, "user", "new tail");
+        let mut delta = native_cache_request(
+            SESSION_ID,
+            vec![tail],
+            vec![tail_native],
+            "native-giant-degraded-next-fingerprint",
+        );
+        delta.tail_delta = Some(json!({
+            "after": request.full_array_fingerprint.as_deref().unwrap(),
+            "replace_from": GIANT_MESSAGE_COUNT,
+            "native_replace_from": GIANT_MESSAGE_COUNT,
+        }));
+
+        let frontier = handler
+            .expand_transform_tail_delta(&mut delta)
+            .expect("required cores must accept the tail delta without a full-request snapshot");
+        let reusable_projection = frontier
+            .projection_cache
+            .as_ref()
+            .expect("giant tail delta retains its incremental projection");
+        assert_eq!(reusable_projection.replace_from, GIANT_MESSAGE_COUNT);
+        assert_eq!(delta.messages.len(), GIANT_MESSAGE_COUNT + 1);
+        assert_eq!(
+            delta.native_messages.as_ref().map(Vec::len),
+            Some(GIANT_MESSAGE_COUNT + 1)
+        );
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &delta.messages,
+            &reusable_projection.projection,
+            reusable_projection.replace_from,
+        )
+        .expect("giant suffix projection");
+        assert_eq!(incremental.message_count(), GIANT_MESSAGE_COUNT + 1);
+        assert!(Arc::ptr_eq(
+            &incremental.blocks[0].wire,
+            &projection.blocks[0].wire
+        ));
+
+        let mut response = transform::TransformResponse::passthrough(
+            delta
+                .messages
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            delta.full_array_fingerprint.clone(),
+        );
+        let second_stats = attach_native_messages_incremental(
+            &mut response,
+            &delta,
+            1,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            Some(&frontier),
+            0,
+            &handler.native_attachments,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(
+            second_stats.reused_messages >= GIANT_MESSAGE_COUNT - 1,
+            "{second_stats:?}"
+        );
+        assert!(second_stats.encoded_messages <= 2, "{second_stats:?}");
+        assert_eq!(second_stats.degraded_store, 0, "{second_stats:?}");
+
+        let cache = handler.native_attachments.lock().unwrap();
+        let entry = &cache.sessions[SESSION_ID];
+        assert!(entry.retained_bytes <= cache.max_entry_retained_bytes);
+        assert!(cache.retained_bytes <= cache.max_retained_bytes);
+        assert_eq!(entry.snapshot.sidecar.order.len(), GIANT_MESSAGE_COUNT + 1);
+        assert_eq!(entry.snapshot.sidecar.messages.len(), 1);
+        assert_eq!(entry.snapshot.sidecar_sizes.len(), 1);
+    }
+
+    #[test]
+    fn astro_scale_projection_cache_reuses_on_the_second_pass() {
+        const ASTRO_MESSAGE_COUNT: usize = 4_600;
+        const ASTRO_BLOCK_COUNT: usize = 15_000;
+        const ASTRO_NATIVE_WIRE_BYTES: usize = 49 * 1024 * 1024;
+
+        let (request, _served) = native_cache_fixture(
+            "astro-projection-reuse",
+            ASTRO_MESSAGE_COUNT,
+            ASTRO_BLOCK_COUNT,
+            ASTRO_NATIVE_WIRE_BYTES,
+        );
+        let first_started_at = Instant::now();
+        let projection = Arc::new(
+            crate::ck_wire::project_messages(&request.messages).expect("ASTRO projection"),
+        );
+        let first_ms = first_started_at.elapsed().as_secs_f64() * 1000.0;
+        let retained = projection.retained_bytes();
+        eprintln!("astro-projection-cache retained_bytes={retained} first_ms={first_ms:.1}");
+        assert!(
+            retained <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
+            "ASTRO projection must fit the dedicated cache: retained={retained} cap={PROJECTION_CACHE_ENTRY_BUDGET_BYTES}"
+        );
+
+        let mut cache = ProjectionCache::default();
+        cache.replace(
+            &request.session_id,
+            0,
+            ProjectionCacheSnapshot {
+                context: projection_cache_context(&request),
+                full_array_fingerprint: request.full_array_fingerprint.clone(),
+                message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
+                projection: Arc::clone(&projection),
+            },
+        );
+        let snapshot = cache
+            .snapshot(&request.session_id, 0)
+            .expect("ASTRO projection must survive in its own cache");
+        let reused = validated_projection_cache_input(
+            &request,
+            &snapshot,
+            request.full_array_fingerprint.as_deref().unwrap(),
+            request.messages.len(),
+            ProjectionCacheKeyMode::Normal,
+        )
+        .expect("second pass must hit the projection cache");
+        assert_eq!(reused.replace_from, ASTRO_MESSAGE_COUNT);
+
+        let second_started_at = Instant::now();
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &request.messages,
+            &reused.projection,
+            reused.replace_from,
+        )
+        .expect("full-prefix incremental projection");
+        let second_ms = second_started_at.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(incremental, *projection);
+        assert!(
+            second_ms < first_ms / 10.0 || second_ms < 5.0,
+            "second-pass projection must be near zero: first={first_ms:.1}ms second={second_ms:.1}ms"
+        );
+    }
+
+    #[test]
+    fn projection_cache_invalidators_are_mutation_checked_in_both_directions() {
+        let ingress = vec![ck("inv-1", 1, "one"), ck("inv-2", 2, "two")];
+        let baseline = native_cache_request(
+            "projection-invalidators",
+            ingress,
+            vec![
+                native_text_message("inv-1", "user", "one"),
+                native_text_message("inv-2", "user", "two"),
+            ],
+            "inv-fp-1",
+        );
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&baseline),
+            full_array_fingerprint: baseline.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; baseline.messages.len()]),
+            projection: Arc::new(
+                crate::ck_wire::project_messages(&baseline.messages).expect("baseline projection"),
+            ),
+        };
+
+        assert!(
+            validated_projection_cache_input(
+                &baseline,
+                &snapshot,
+                "inv-fp-1",
+                2,
+                ProjectionCacheKeyMode::Normal,
+            )
+            .is_some(),
+            "unchanged request must hit"
+        );
+
+        for (label, mutate) in [
+            (
+                "fingerprint",
+                Box::new(|request: &mut TransformRequest| {
+                    request.full_array_fingerprint = Some("inv-fp-mutated".to_string());
+                }) as Box<dyn Fn(&mut TransformRequest)>,
+            ),
+            (
+                "session_id",
+                Box::new(|request: &mut TransformRequest| {
+                    request.session_id = "projection-invalidators-other".to_string();
+                }),
+            ),
+            (
+                "serializer_profile",
+                Box::new(|request: &mut TransformRequest| {
+                    request.serializer_profile = "opencode-aisdk-next".to_string();
+                }),
+            ),
+            (
+                "render_config",
+                Box::new(|request: &mut TransformRequest| {
+                    request.render_config = "cfg1".to_string();
+                }),
+            ),
+        ] {
+            let mut mutated = baseline.clone();
+            mutate(&mut mutated);
+            let after = mutated
+                .full_array_fingerprint
+                .clone()
+                .unwrap_or_else(|| "inv-fp-1".to_string());
+            assert!(
+                validated_projection_cache_input(
+                    &mutated,
+                    &snapshot,
+                    &after,
+                    2,
+                    ProjectionCacheKeyMode::Normal,
+                )
+                .is_none(),
+                "{label} must invalidate the projection cache"
+            );
+            assert!(
+                validated_projection_cache_input(
+                    &baseline,
+                    &snapshot,
+                    "inv-fp-1",
+                    2,
+                    ProjectionCacheKeyMode::Normal,
+                )
+                .is_some(),
+                "{label} mutation must not poison the baseline hit"
+            );
+        }
+
+        // Transition salt is a native-render concern and must not bust ingress projection reuse.
+        let hit = validated_projection_cache_input(
+            &baseline,
+            &snapshot,
+            "inv-fp-1",
+            2,
+            ProjectionCacheKeyMode::Normal,
+        );
+        assert!(
+            hit.is_some(),
+            "transition salt is not a projection invalidator"
+        );
+    }
+
+    #[test]
+    fn multiple_large_sessions_do_not_ping_pong_under_the_native_cache_total_budget() {
+        const SESSION_NATIVE_WIRE_BYTES: usize = 5 * 1024 * 1024;
+        let cache = Mutex::new(NativeAttachmentCache::default());
+        let (request_a, served_a) = native_cache_fixture(
+            "native-large-session-a",
+            512,
+            1_536,
+            SESSION_NATIVE_WIRE_BYTES,
+        );
+        let (request_b, served_b) = native_cache_fixture(
+            "native-large-session-b",
+            512,
+            1_536,
+            SESSION_NATIVE_WIRE_BYTES,
+        );
+
+        run_native_cache_pass(
+            &cache,
+            &request_a,
+            served_a.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let charge_a = cache.lock().unwrap().sessions["native-large-session-a"].retained_bytes;
+        run_native_cache_pass(
+            &cache,
+            &request_b,
+            served_b.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let charge_b = cache.lock().unwrap().sessions["native-large-session-b"].retained_bytes;
+        assert!(
+            charge_a.saturating_add(charge_b) > 64 * 1024 * 1024,
+            "fixture must exceed the former shared 64 MiB budget"
+        );
+
+        let (_second_a, second_a_stats) = run_native_cache_pass(
+            &cache,
+            &request_a,
+            served_a.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            second_a_stats.reused_messages,
+            served_a.len(),
+            "session A was evicted by session B and re-encoded from scratch"
+        );
+        let (_second_b, second_b_stats) = run_native_cache_pass(
+            &cache,
+            &request_b,
+            served_b.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            second_b_stats.reused_messages,
+            served_b.len(),
+            "session B was evicted by session A and re-encoded from scratch"
+        );
     }
 
     #[test]
@@ -15460,7 +18900,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_prefix_is_charged_to_the_shared_native_lru_budget() {
+    fn projected_prefix_is_charged_to_the_projection_cache_not_native_lru() {
         let ingress = vec![ck("budget-projection", 1, &"x".repeat(4096))];
         let request = native_cache_request(
             "projection-budget",
@@ -15477,37 +18917,13 @@ mod tests {
             crate::ck_wire::project_messages(&request.messages)
                 .expect("budget projection must succeed"),
         );
-        let without_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        let mut without_response = transform::TransformResponse::passthrough(
-            served.clone(),
-            request.full_array_fingerprint.clone(),
-        );
-        attach_native_messages_incremental(
-            &mut without_response,
-            &request,
-            0,
-            &BTreeMap::new(),
-            None,
-            None,
-            false,
-            None,
-            0,
-            &without_projection,
-            None,
-            NativeCacheKeyMode::Normal,
-        );
-        let without_charge = without_projection
-            .lock()
-            .expect("native attachment cache mutex")
-            .retained_bytes;
-
-        let with_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        let mut with_response = transform::TransformResponse::passthrough(
+        let native = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut response = transform::TransformResponse::passthrough(
             served,
             request.full_array_fingerprint.clone(),
         );
         attach_native_messages_incremental(
-            &mut with_response,
+            &mut response,
             &request,
             0,
             &BTreeMap::new(),
@@ -15516,22 +18932,219 @@ mod tests {
             false,
             None,
             0,
-            &with_projection,
-            Some(Arc::clone(&projection)),
+            &native,
             NativeCacheKeyMode::Normal,
         );
-        let with_charge = with_projection
+        let native_charge = native
             .lock()
             .expect("native attachment cache mutex")
             .retained_bytes;
-        assert_eq!(
-            with_charge.saturating_sub(without_charge),
-            projection.retained_bytes()
+        assert!(
+            native_charge > 0,
+            "native attach still charges its own bytes"
+        );
+
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
+            projection: Arc::clone(&projection),
+        };
+        let projection_charge = snapshot.retained_bytes(&request.session_id);
+        let mut projections = ProjectionCache::new(1024 * 1024);
+        projections.replace(&request.session_id, 0, snapshot);
+        assert_eq!(projections.retained_bytes, projection_charge);
+        assert!(
+            projection_charge > projection.retained_bytes(),
+            "projection cache charge must include its outer context and session keys"
+        );
+        assert_ne!(
+            native_charge, projection_charge,
+            "projection bytes must not be double-charged onto the native LRU"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handler_small_lru_evicts_projection_and_attachment_together_then_runs_cold() {
+    async fn handler_mismatched_native_delta_cache_serves_full_output() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let session = "native-delta-fingerprint-mismatch";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+
+        let initial = native_cache_request(
+            session,
+            vec![
+                ck("mismatch-prefix", 1, "prefix"),
+                ck("mismatch-tail", 2, "before"),
+            ],
+            vec![
+                native_text_message("mismatch-prefix", "user", "prefix"),
+                native_text_message("mismatch-tail", "user", "before"),
+            ],
+            "mismatch-fp-1",
+        );
+        let first =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(initial).unwrap())
+                .await;
+        assert_eq!(first["status"], "ok", "{first}");
+        assert!(first["native_messages"].is_array(), "{first}");
+
+        handler
+            .native_attachments
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(session)
+            .expect("initial native attachment snapshot")
+            .snapshot
+            .full_array_fingerprint = Some("stale-native-cache-fingerprint".to_string());
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("mismatch-tail", 2, "after")],
+            vec![native_text_message("mismatch-tail", "user", "after")],
+            "mismatch-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "mismatch-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let response =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(delta).unwrap())
+                .await;
+
+        assert_eq!(response["status"], "ok", "{response}");
+        assert!(
+            response["native_messages"].is_array(),
+            "a mismatched attachment snapshot must fall back to a full native serve: {response}"
+        );
+        assert!(
+            response.get("native_messages_delta").is_none(),
+            "{response}"
+        );
+        assert_eq!(
+            handler
+                .native_attachments
+                .lock()
+                .unwrap()
+                .stats(session)
+                .delta_fallback_reason
+                .map(NativeDeltaFallbackReason::as_str),
+            Some("fingerprint_mismatch")
+        );
+
+        let mut healed_delta = native_cache_request(
+            session,
+            vec![ck("mismatch-tail", 2, "after-heal")],
+            vec![native_text_message("mismatch-tail", "user", "after-heal")],
+            "mismatch-fp-3",
+        );
+        healed_delta.tail_delta = Some(json!({
+            "after": "mismatch-fp-2",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let healed = call_transform_request_on_channel(
+            &handler,
+            7,
+            serde_json::to_value(healed_delta).unwrap(),
+        )
+        .await;
+        assert_eq!(healed["status"], "ok", "{healed}");
+        assert!(healed["native_messages_delta"].is_object(), "{healed}");
+        assert!(healed.get("native_messages").is_none(), "{healed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_native_delta_cache_eviction_self_heals_full_then_delta() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let session = "native-delta-eviction-heal";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+
+        let initial = native_cache_request(
+            session,
+            vec![ck("evict-prefix", 1, "prefix"), ck("evict-tail", 2, "zero")],
+            vec![
+                native_text_message("evict-prefix", "user", "prefix"),
+                native_text_message("evict-tail", "user", "zero"),
+            ],
+            "evict-fp-0",
+        );
+        let cold =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(initial).unwrap())
+                .await;
+        assert!(cold["native_messages"].is_array(), "{cold}");
+
+        let delta_request = |after: &str, fingerprint: &str, text: &str| {
+            let mut delta = native_cache_request(
+                session,
+                vec![ck("evict-tail", 2, text)],
+                vec![native_text_message("evict-tail", "user", text)],
+                fingerprint,
+            );
+            delta.tail_delta = Some(json!({
+                "after": after,
+                "replace_from": 1,
+                "native_replace_from": 1,
+            }));
+            serde_json::to_value(delta).unwrap()
+        };
+
+        let pass_n = call_transform_request_on_channel(
+            &handler,
+            7,
+            delta_request("evict-fp-0", "evict-fp-1", "one"),
+        )
+        .await;
+        assert!(pass_n["native_messages_delta"].is_object(), "{pass_n}");
+        assert!(pass_n.get("native_messages").is_none(), "{pass_n}");
+
+        handler.native_attachments.lock().unwrap().remove(session);
+        let pass_n_plus_1 = call_transform_request_on_channel(
+            &handler,
+            7,
+            delta_request("evict-fp-1", "evict-fp-2", "two"),
+        )
+        .await;
+        assert!(
+            pass_n_plus_1["native_messages"].is_array(),
+            "{pass_n_plus_1}"
+        );
+        assert!(
+            pass_n_plus_1.get("native_messages_delta").is_none(),
+            "{pass_n_plus_1}"
+        );
+        assert_eq!(
+            handler
+                .native_attachments
+                .lock()
+                .unwrap()
+                .stats(session)
+                .delta_fallback_reason
+                .map(NativeDeltaFallbackReason::as_str),
+            Some("missing_cache_state")
+        );
+
+        let pass_n_plus_2 = call_transform_request_on_channel(
+            &handler,
+            7,
+            delta_request("evict-fp-2", "evict-fp-3", "three"),
+        )
+        .await;
+        assert!(
+            pass_n_plus_2["native_messages_delta"].is_object(),
+            "{pass_n_plus_2}"
+        );
+        assert!(
+            pass_n_plus_2.get("native_messages").is_none(),
+            "{pass_n_plus_2}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_small_lru_evicts_attachment_without_dropping_projection() {
         let (handler, _store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let session_a = "projection-lru-a";
@@ -15558,20 +19171,21 @@ mod tests {
         .await;
         assert_eq!(response_a["status"], "ok", "{response_a}");
         let (entry_charge, projection_weak, attachment_weak) = {
-            let mut cache = handler.native_attachments.lock().unwrap();
-            let entry = &cache.sessions[session_a];
-            let projection = entry.snapshot.projection.as_ref().unwrap();
-            let chunk = entry
+            let mut native = handler.native_attachments.lock().unwrap();
+            let projections = handler.projections.lock().unwrap();
+            let native_entry = &native.sessions[session_a];
+            let projection = &projections.sessions[session_a].snapshot.projection;
+            let chunk = native_entry
                 .snapshot
                 .chunks
                 .first()
                 .expect("encoded attachment chunk");
             let values = (
-                entry.retained_bytes,
+                native_entry.retained_bytes,
                 Arc::downgrade(projection),
                 Arc::downgrade(&chunk.value),
             );
-            cache.max_retained_bytes = entry.retained_bytes;
+            native.max_retained_bytes = native_entry.retained_bytes;
             values
         };
 
@@ -15592,11 +19206,16 @@ mod tests {
         .await;
         assert_eq!(response_b["status"], "ok", "{response_b}");
         {
-            let cache = handler.native_attachments.lock().unwrap();
-            assert!(!cache.sessions.contains_key(session_a));
-            assert!(cache.sessions.contains_key(session_b));
+            let native = handler.native_attachments.lock().unwrap();
+            let projections = handler.projections.lock().unwrap();
+            assert!(!native.sessions.contains_key(session_a));
+            assert!(native.sessions.contains_key(session_b));
+            assert!(
+                projections.sessions.contains_key(session_a),
+                "native LRU eviction must not drop the projection owner"
+            );
         }
-        assert!(projection_weak.upgrade().is_none());
+        assert!(projection_weak.upgrade().is_some());
         assert!(attachment_weak.upgrade().is_none());
 
         assert!(entry_charge > 1);
@@ -15627,30 +19246,39 @@ mod tests {
             .unwrap()
             .sessions
             .contains_key(session_c));
+        assert!(
+            handler
+                .projections
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(session_c),
+            "refusing an oversized native snapshot must not refuse the projection"
+        );
 
-        let mut cold_delta = native_cache_request(
+        let mut warm_delta = native_cache_request(
             session_a,
             vec![ck("lru-a-tail", 2, "after")],
             Vec::new(),
             "lru-a-fp-2",
         );
-        cold_delta.tail_delta = Some(json!({
+        warm_delta.tail_delta = Some(json!({
             "after": "lru-a-fp-1",
             "replace_from": 1,
             "native_replace_from": 0,
         }));
-        let cold = call_transform_request_on_channel(
+        let warm = call_transform_request_on_channel(
             &handler,
             7,
-            serde_json::to_value(cold_delta).unwrap(),
+            serde_json::to_value(warm_delta).unwrap(),
         )
         .await;
-        assert_eq!(cold["status"], "ok", "{cold}");
-        assert_eq!(cold["timings"]["projection_reused_messages"], 0);
-        assert_eq!(cold["timings"]["projection_projected_messages"], 2);
-        assert_eq!(cold["timings"]["native_cache_reused_messages"], 0);
+        assert_eq!(warm["status"], "ok", "{warm}");
+        assert_eq!(warm["timings"]["projection_reused_messages"], 1);
+        assert_eq!(warm["timings"]["projection_projected_messages"], 1);
+        assert_eq!(warm["timings"]["native_cache_reused_messages"], 0);
         assert!(
-            cold["timings"]["native_cache_encoded_messages"]
+            warm["timings"]["native_cache_encoded_messages"]
                 .as_u64()
                 .unwrap()
                 > 0
@@ -15670,25 +19298,15 @@ mod tests {
             ],
             "projection-fp-1",
         );
-        let served = ingress
-            .iter()
-            .map(|message| message.ck.clone())
-            .collect::<Vec<_>>();
-        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        run_native_cache_pass(
-            &cache,
-            &request,
-            served,
-            &BTreeMap::new(),
-            false,
-            0,
-            NativeCacheKeyMode::Normal,
-        );
-        let snapshot = cache
-            .lock()
-            .expect("native attachment cache mutex")
-            .snapshot(&request.session_id, 0)
-            .expect("projection cache snapshot");
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
+            projection: Arc::new(
+                crate::ck_wire::project_messages(&request.messages)
+                    .expect("projection cache snapshot"),
+            ),
+        };
         let mut changed = request;
         changed.messages[1] = ck("p2", 2, "changed");
         changed.full_array_fingerprint = Some("projection-fp-2".to_string());
@@ -15766,7 +19384,8 @@ mod tests {
             assistant_tool_call("call-project", 2),
             tool_result("result-project", 3, "first result"),
         ];
-        for handler in [&cached_handler, &control_handler] {
+        let mut cached_native_before = Vec::new();
+        for (index, handler) in [&cached_handler, &control_handler].into_iter().enumerate() {
             let initial = native_cache_request(
                 "ses",
                 initial_messages.clone(),
@@ -15776,6 +19395,12 @@ mod tests {
             let response =
                 call_transform_request(handler, serde_json::to_value(initial).unwrap()).await;
             assert_eq!(response["status"], "ok", "{response}");
+            if index == 0 {
+                cached_native_before = response["native_messages"]
+                    .as_array()
+                    .expect("initial native response array")
+                    .clone();
+            }
         }
 
         let changed_messages = vec![
@@ -15794,7 +19419,7 @@ mod tests {
             "replace_from": 2,
             "native_replace_from": 0,
         }));
-        let cached =
+        let mut cached =
             call_transform_request(&cached_handler, serde_json::to_value(delta).unwrap()).await;
         let full = call_transform_request(
             &control_handler,
@@ -15811,6 +19436,23 @@ mod tests {
         assert_eq!(full["status"], "ok", "{full}");
         assert_eq!(cached["timings"]["projection_reused_messages"], 2);
         assert_eq!(cached["timings"]["projection_projected_messages"], 1);
+        let native_delta = cached["native_messages_delta"]
+            .as_object()
+            .expect("cached response uses a native suffix");
+        assert_eq!(native_delta["after"], "projection-handler-fp-1");
+        let replace_from = native_delta["replace_from"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .expect("native suffix frontier");
+        let mut expanded_native = cached_native_before[..replace_from].to_vec();
+        expanded_native.extend(
+            native_delta["messages"]
+                .as_array()
+                .expect("native suffix messages")
+                .iter()
+                .cloned(),
+        );
+        cached["native_messages"] = Value::Array(expanded_native);
         assert_eq!(full["timings"]["projection_reused_messages"], 0);
         assert_eq!(full["timings"]["projection_projected_messages"], 3);
 
@@ -15844,19 +19486,19 @@ mod tests {
         );
 
         let cached_projection = cached_handler
-            .native_attachments
+            .projections
             .lock()
-            .expect("cached native attachment mutex")
+            .expect("cached projection mutex")
             .snapshot("ses", cached_store.load("ses").unwrap().meta.revert_epoch)
-            .and_then(|snapshot| snapshot.projection)
-            .expect("cached projection snapshot");
+            .expect("cached projection snapshot")
+            .projection;
         let full_projection = control_handler
-            .native_attachments
+            .projections
             .lock()
-            .expect("control native attachment mutex")
+            .expect("control projection mutex")
             .snapshot("ses", control_store.load("ses").unwrap().meta.revert_epoch)
-            .and_then(|snapshot| snapshot.projection)
-            .expect("full projection snapshot");
+            .expect("full projection snapshot")
+            .projection;
         assert_eq!(cached_projection, full_projection);
         assert_eq!(
             cached_projection.differential_bytes(),
@@ -16009,13 +19651,21 @@ mod tests {
             .ready_request_clone(session)
             .unwrap();
         let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
-        let cache = handler
+        let native = handler
             .native_attachments
             .lock()
             .expect("native attachment cache mutex");
-        let cached = &cache.sessions[session];
-        assert_eq!(cached.revert_epoch, durable.meta.revert_epoch);
-        assert_eq!(cached.snapshot.projection.as_deref(), Some(&expected));
+        assert_eq!(
+            native.sessions[session].revert_epoch,
+            durable.meta.revert_epoch
+        );
+        let cached = handler
+            .projections
+            .lock()
+            .expect("projection cache mutex")
+            .snapshot(session, durable.meta.revert_epoch)
+            .expect("projection cache snapshot");
+        assert_eq!(cached.projection.as_ref(), &expected);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16079,13 +19729,14 @@ mod tests {
             .ready_request_clone(session)
             .unwrap();
         let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
-        let cache = handler.native_attachments.lock().unwrap();
-        let cached = cache.sessions[session]
-            .snapshot
-            .projection
-            .as_deref()
-            .expect("post-retry projection");
-        assert_eq!(cached, &expected);
+        let cached = handler
+            .projections
+            .lock()
+            .unwrap()
+            .snapshot(session, store.load(session).unwrap().meta.revert_epoch)
+            .expect("post-retry projection")
+            .projection;
+        assert_eq!(cached.as_ref(), &expected);
         assert_eq!(cached.differential_bytes(), expected.differential_bytes());
     }
 
@@ -16134,10 +19785,13 @@ mod tests {
             .unwrap();
         let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
         assert_eq!(
-            handler.native_attachments.lock().unwrap().sessions[session]
-                .snapshot
-                .projection
-                .as_deref(),
+            handler
+                .projections
+                .lock()
+                .unwrap()
+                .snapshot(session, durable.meta.revert_epoch)
+                .as_ref()
+                .map(|snapshot| snapshot.projection.as_ref()),
             Some(&expected)
         );
     }
@@ -16259,9 +19913,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn handler_delta_normalization_matches_full_when_reserved_todo_starts_at_frontier() {
-        let (cached_handler, _cached_store, _cached_dir, _cached_project) =
+        let (cached_handler, cached_store, _cached_dir, _cached_project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let (control_handler, _control_store, _control_dir, _control_project) =
+        let (control_handler, control_store, _control_dir, _control_project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let initial_messages = vec![
             ck("todo-prefix", 1, "prefix"),
@@ -16330,16 +19984,22 @@ mod tests {
         assert_eq!(cached["status"], "ok", "{cached}");
         assert_eq!(cached["timings"]["projection_reused_messages"], 1);
         assert_eq!(cached["ck_messages"], full["ck_messages"]);
-        let cached_projection = cached_handler.native_attachments.lock().unwrap().sessions["ses"]
-            .snapshot
-            .projection
-            .clone()
-            .unwrap();
-        let full_projection = control_handler.native_attachments.lock().unwrap().sessions["ses"]
-            .snapshot
-            .projection
-            .clone()
-            .unwrap();
+        let cached_epoch = cached_store.load("ses").unwrap().meta.revert_epoch;
+        let full_epoch = control_store.load("ses").unwrap().meta.revert_epoch;
+        let cached_projection = cached_handler
+            .projections
+            .lock()
+            .unwrap()
+            .snapshot("ses", cached_epoch)
+            .expect("cached projection")
+            .projection;
+        let full_projection = control_handler
+            .projections
+            .lock()
+            .unwrap()
+            .snapshot("ses", full_epoch)
+            .expect("full projection")
+            .projection;
         assert_eq!(cached_projection, full_projection);
         assert!(cached_projection
             .blocks
@@ -16407,13 +20067,17 @@ mod tests {
             0,
             "serve_native must reuse transform tag rows instead of issuing a numbers-only scan"
         );
-        let cleared_reasoning = actual_native
+        let preserved_reasoning = actual_native
             .iter()
             .find(|message| message["info"]["id"] == json!("assistant-old"))
             .expect("tagged historical reasoning remains addressable");
         assert_eq!(
-            cleared_reasoning["parts"][0],
-            json!({ "type": "reasoning", "text": "" })
+            preserved_reasoning["parts"][0],
+            json!({
+                "type": "reasoning",
+                "text": "signed historical thinking",
+                "metadata": { "signature": "signature-assistant-old" }
+            })
         );
 
         let mut old_tag_numbers = std::collections::BTreeMap::new();
@@ -16571,6 +20235,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn child_passthrough_refuses_an_unexpanded_native_tail_delta() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let session = format!("{}native-child", historian::MC_CHILD_SESSION_PREFIX);
+
+        let first = native_cache_request(
+            &session,
+            vec![
+                ck("child-prefix", 1, "prefix"),
+                ck("child-tail", 2, "before"),
+            ],
+            vec![
+                native_text_message("child-prefix", "user", "prefix"),
+                native_text_message("child-tail", "user", "before"),
+            ],
+            "child-fp-1",
+        );
+        let first = call_transform_request(&handler, serde_json::to_value(first).unwrap()).await;
+        assert_eq!(first["status"], "ok", "{first}");
+        assert_eq!(first["native_messages"].as_array().map(Vec::len), Some(2));
+
+        let mut delta = native_cache_request(
+            &session,
+            vec![ck("child-tail", 2, "after")],
+            vec![native_text_message("child-tail", "user", "after")],
+            "child-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "child-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let refused = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+
+        assert_eq!(refused["status"], "need_full_sync", "{refused}");
+        assert!(refused.get("native_messages").is_none(), "{refused}");
+        assert!(refused.get("native_messages_delta").is_none(), "{refused}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registered_dreamer_passthrough_refuses_an_unexpanded_native_tail_delta() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(producer, default_test_config());
+        let session = "native-dreamer";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        let _registration = handler.register_dreamer_run(session);
+
+        let first = native_cache_request(
+            session,
+            vec![
+                ck("dreamer-prefix", 1, "prefix"),
+                ck("dreamer-tail", 2, "before"),
+            ],
+            vec![
+                native_text_message("dreamer-prefix", "user", "prefix"),
+                native_text_message("dreamer-tail", "user", "before"),
+            ],
+            "dreamer-fp-1",
+        );
+        let first =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(first).unwrap())
+                .await;
+        assert_eq!(first["status"], "ok", "{first}");
+        assert_eq!(first["native_messages"].as_array().map(Vec::len), Some(2));
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("dreamer-tail", 2, "after")],
+            vec![native_text_message("dreamer-tail", "user", "after")],
+            "dreamer-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "dreamer-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let refused =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(delta).unwrap())
+                .await;
+
+        assert_eq!(refused["status"], "need_full_sync", "{refused}");
+        assert!(refused.get("native_messages").is_none(), "{refused}");
+        assert!(refused.get("native_messages_delta").is_none(), "{refused}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn channel2_host_directive_is_deterministic_due_gated_and_profile_scoped() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -16588,14 +20338,17 @@ mod tests {
             "serializer_profile": "opencode-aisdk",
             "session_id": "ses",
             "render_config": "cfg0",
+            "protected_tags": 0,
             "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
-            "messages": messages,
+            "messages": messages.clone(),
         });
         let first = call_transform_request(&handler, opencode_request.clone()).await;
         let first_text = first["host_directives"]["channel2_nudge"]["text"]
             .as_str()
             .expect("due OpenCode pass must carry channel2 text");
         assert!(first_text.contains("Routine context housekeeping is near"));
+        assert!(first.get("channel2_directive").is_none());
+
         let mut terminal_request = opencode_request;
         terminal_request["channel2_nudge_state"] = json!("delivered");
         let second = call_transform_request(&handler, terminal_request).await;
@@ -16610,21 +20363,147 @@ mod tests {
         assert!(not_due_response.get("host_directives").is_none());
 
         handler.bind_route(8, binding("/tmp/cc", "cc-ses"));
-        let mut cc_request = json!({
-            "kind": "transform",
-            "v": 2,
-            "serializer_profile": "claude-code-anthropic",
-            "tool_present": true,
-            "session_id": "cc-ses",
-            "render_config": "cfg0",
-            "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
-            "messages": first["ck_messages"],
-        });
-        // The CC response is used only to prove the additive directive remains profile-gated;
-        // its transformed messages are not a request fixture for the OpenCode lane.
-        cc_request["messages"] = json!([ck("cc-short", 1, "small")]);
-        let cc_response = call_transform_request_on_channel(&handler, 8, cc_request).await;
+        let cc_response = call_transform_request_on_channel(
+            &handler,
+            8,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "claude-code-anthropic",
+                "tool_present": true,
+                "session_id": "cc-ses",
+                "render_config": "cfg0",
+                "protected_tags": 0,
+                "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+                "messages": messages.clone(),
+            }),
+        )
+        .await;
+        let cc_directive = cc_response["channel2_directive"]
+            .as_object()
+            .expect("due Claude Code pass must carry the gateway directive");
+        let cc_text = cc_directive["text"].as_str().unwrap();
+        assert!(cc_text.contains("Routine context housekeeping is near"));
+        assert!(!cc_text.contains("<system-reminder>"));
+        assert_eq!(cc_directive["directive_id"].as_str().unwrap().len(), 64);
+        assert!(cc_directive["armed_at_ms"].as_i64().unwrap() > 0);
         assert!(cc_response.get("host_directives").is_none());
+
+        handler.bind_route(9, binding("/tmp/pi", "pi-ses"));
+        let pi_response = call_transform_request_on_channel(
+            &handler,
+            9,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "pi",
+                "session_id": "pi-ses",
+                "render_config": "cfg0",
+                "protected_tags": 0,
+                "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+                "messages": messages,
+            }),
+        )
+        .await;
+        assert!(pi_response.get("host_directives").is_none());
+        assert!(pi_response.get("channel2_directive").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_channel2_lease_is_frozen_idempotent_and_pressure_changes_do_not_rearm() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let messages_for = |pair_count: u64| {
+            let output = "tool output ".repeat(5_000);
+            let mut messages = Vec::new();
+            for index in 0..pair_count {
+                messages.push(assistant_tool_call(
+                    &format!("call-cc-{index}"),
+                    index * 2 + 1,
+                ));
+                messages.push(tool_result(
+                    &format!("result-cc-{index}"),
+                    index * 2 + 2,
+                    &output,
+                ));
+            }
+            messages
+        };
+        let request_for =
+            |messages: Vec<CkIngressMessage>, input_tokens: u64, context_limit: u64| {
+                json!({
+                    "kind": "transform",
+                    "v": 2,
+                    "serializer_profile": "claude-code-anthropic",
+                    "tool_present": true,
+                    "session_id": "ses",
+                    "render_config": "cfg0",
+                    "protected_tags": 0,
+                    "usage": {
+                        "current_total_input_tokens": input_tokens,
+                        "context_limit_tokens": context_limit,
+                    },
+                    "messages": messages,
+                })
+            };
+
+        let initial_messages = messages_for(12);
+        let initial_request = request_for(initial_messages, 79_000, 100_000);
+        let first = call_transform_request(&handler, initial_request.clone()).await;
+        let first_directive = first["channel2_directive"].clone();
+        let first_id = first_directive["directive_id"]
+            .as_str()
+            .expect("first pressure crossing must arm a directive")
+            .to_string();
+        assert!(!first_directive["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
+
+        let retry = call_transform_request(&handler, initial_request).await;
+        assert_eq!(retry["channel2_directive"], first_directive);
+
+        let grown_messages = messages_for(16);
+        let grown_request = request_for(grown_messages.clone(), 79_000, 100_000);
+        let grown_pending = call_transform_request(&handler, grown_request.clone()).await;
+        assert_eq!(
+            grown_pending["channel2_directive"], first_directive,
+            "pending directive bytes must not be re-derived after pressure changes"
+        );
+        let pending_ck_bytes = serde_json::to_vec(&grown_pending["ck_messages"]).unwrap();
+
+        let mut delivered_request = grown_request.clone();
+        delivered_request["channel2_delivered_id"] = json!(first_id);
+        let delivered = call_transform_request(&handler, delivered_request.clone()).await;
+        assert!(delivered.get("channel2_directive").is_none());
+        assert_eq!(
+            serde_json::to_vec(&delivered["ck_messages"]).unwrap(),
+            pending_ck_bytes,
+            "response-side delivery metadata must not alter served message bytes"
+        );
+        let after_delivery = store.load("ses").unwrap();
+        assert!(after_delivery.meta.pending_channel2_directive.is_none());
+        assert!(after_delivery.meta.channel2_pressure_latched);
+        assert_eq!(after_delivery.meta.channel2_arming_watermark, 1);
+
+        let double_echo = call_transform_request(&handler, delivered_request).await;
+        assert!(double_echo.get("channel2_directive").is_none());
+        let after_double_echo = store.load("ses").unwrap();
+        assert!(after_double_echo.meta.pending_channel2_directive.is_none());
+        assert_eq!(after_double_echo.meta.channel2_arming_watermark, 1);
+
+        let low_pressure = call_transform_request(
+            &handler,
+            request_for(grown_messages.clone(), 79_000, 1_000_000),
+        )
+        .await;
+        assert!(low_pressure.get("channel2_directive").is_none());
+        let after_pressure_change = store.load("ses").unwrap();
+        assert!(
+            after_pressure_change.meta.channel2_pressure_latched,
+            "whole-input pressure is no longer a cap transition; only fold, measured U collapse, or reap re-arm"
+        );
+        assert_eq!(after_pressure_change.meta.channel2_arming_watermark, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16828,6 +20707,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn guidance_uses_user_path_text_resolved_before_route_bind() {
+        let producer = Arc::new(ProducerState::default());
+        let config_dir = tempfile::tempdir().unwrap();
+        let user_config_path = config_dir.path().join("magic-context.jsonc");
+        std::fs::write(
+            config_dir.path().join("cc-guidance.md"),
+            "## Magic Context\n\nTrusted route guidance.",
+        )
+        .unwrap();
+        std::fs::write(
+            &user_config_path,
+            r#"{
+                "prompt_surface": {
+                    "guidance_override_path": "cc-guidance.md"
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut config_cache = ConfigCache::default();
+        let config = config_cache.effective_for_paths(&user_config_path, config_dir.path());
+        let (handler, _store, _dir, project) = handler_with_store(producer, config.clone());
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = config;
+        handler.bind_route(7, route);
+        handler.guidance_dates.lock().unwrap().insert(
+            "ses".to_string(),
+            "Today's date: Fri Jan 01 2016".to_string(),
+        );
+
+        let guidance = call_dispatch_request(
+            &handler,
+            json!({
+                "kind": "guidance.get",
+                "session_id": "ses",
+                "tool_present": true,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            guidance["bytes"],
+            json!("## Magic Context\n\nTrusted route guidance.\nToday's date: Fri Jan 01 2016")
+        );
+        assert_eq!(
+            guidance["content_hash"],
+            json!(prompt_surface::guidance_content_hash(
+                "## Magic Context\n\nTrusted route guidance.",
+                PromptSurfacePreset::Full,
+            ))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn guidance_presets_cover_both_authored_light_variants() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -16900,6 +20832,51 @@ mod tests {
             assert_eq!(light["served_preset"], "light");
             assert_eq!(light["fallback_notice"], Value::Null);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_known_and_unknown_descriptions_apply_known_and_only_warn_for_unknown() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let transform = call_dispatch_request(
+            &handler,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "opencode-aisdk",
+                "session_id": "ses",
+                "render_config": "cfg",
+                "prompt_surface_config_identity": "mixed-descriptions",
+                "prompt_surface_tool_descriptions": {
+                    "ctx_search": "Known search override.",
+                    "ctx_typo": "Unknown override."
+                },
+                "messages": []
+            }),
+        )
+        .await;
+        assert_eq!(transform["status"], json!("ok"));
+
+        let manifest = call_dispatch_request(
+            &handler,
+            json!({
+                "kind": "manifest.get",
+                "session_id": "ses",
+                "config_identity": "mixed-descriptions",
+                "tool_descriptions": {}
+            }),
+        )
+        .await;
+        assert_eq!(manifest["tools"][3]["name"], json!("ctx_search"));
+        assert_eq!(
+            manifest["tools"][3]["description"],
+            json!("Known search override.")
+        );
+        assert!(manifest["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != json!("ctx_typo")));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17338,7 +21315,8 @@ mod tests {
                 primer_candidates: &[],
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 12,
-                chunk_transcript: Some("U: exact prompt text\nA: exact answer"),
+                chunk_transcript: Some("[10] U: exact prompt text\n[11] A: exact answer\n[12] A: TC: read(src/lib.rs) → output ~42 tok"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -17362,15 +21340,98 @@ mod tests {
 
         let expanded =
             tool_text(call_facade(&handler, "ctx_expand", json!({"start": 10, "end": 12})).await);
-        assert!(expanded.contains("Compartment 1 (10-12)"));
-        assert!(expanded.contains("U: exact prompt text"));
+        assert_eq!(
+            expanded,
+            "Messages 10-12 from persisted historian chunk transcripts:\n\n### Compartment 1 (10-12)\n[10] U: exact prompt text\n[11] A: exact answer\n[12] A: TC: read(src/lib.rs) → output ~42 tok",
+            "verbose=false must preserve the pre-verbose range bytes"
+        );
+
+        let raw_messages = vec![
+            ck_with_role("m10", 10, "user", "exact prompt text"),
+            CkIngressMessage {
+                mid: "m11".to_string(),
+                ordinal: 11,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        CkWireBlock::bare(CkKind::Text {
+                            text: "Reading it now.".to_string(),
+                        }),
+                        CkWireBlock::bare(CkKind::ToolCall {
+                            id: "read:1".to_string(),
+                            name: "read".to_string(),
+                            input: json!({ "filePath": "src/lib.rs" }),
+                            provider_executed: false,
+                        }),
+                    ],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+            CkIngressMessage {
+                mid: "m12".to_string(),
+                ordinal: 12,
+                ck: CkWireMessage::from_parts(
+                    "user",
+                    vec![CkWireBlock::bare(CkKind::ToolResult {
+                        id: "read:1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: CkToolOutput::bare(CkOutputKind::Text {
+                            text: "line1\nline2\nline3".to_string(),
+                        }),
+                        provider_executed: false,
+                    })],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+        ];
+        let mut snapshots = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex");
+        let generation = snapshots.begin("ses");
+        snapshots.finish_ready(
+            "ses",
+            generation,
+            Arc::new(transform_request(raw_messages, 45_000, 50_000)),
+            0,
+            0,
+        );
+        drop(snapshots);
+
+        let verbose = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 10, "end": 12, "verbose": true}),
+            )
+            .await,
+        );
+        assert!(verbose.contains("[10] U (user)"));
+        assert!(verbose.contains("[11] A (assistant)"));
+        assert!(verbose.contains("[12] U (user)"));
+        assert!(verbose.contains("• tool read(src/lib.rs)"));
+        assert!(verbose.contains(&format!(
+            "• tool read → output ~{} tok",
+            mc_tokenizer::estimate_tokens("line1\nline2\nline3")
+        )));
+        let replayed_default =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 10, "end": 12})).await);
+        assert_eq!(
+            replayed_default, expanded,
+            "verbose must not perturb the default renderer"
+        );
         let giant_range = tool_text(
             call_facade(&handler, "ctx_expand", json!({"start": 1, "end": i64::MAX})).await,
         );
         assert!(giant_range.contains("Messages 1-12"));
         assert!(giant_range.len() <= CTX_EXPAND_BYTE_BUDGET);
         let message = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 11})).await);
-        assert!(message.contains("chunk-builder view"));
+        assert!(message.contains("[tool: read #read:1]"));
+        assert!(message.contains("input: {\"filePath\":\"src/lib.rs\"}"));
 
         let write = tool_text(
             call_facade(
@@ -18332,7 +22393,8 @@ mod tests {
         assert_eq!(echo_body["echo"]["kind"], "echo");
 
         let reduce = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await);
-        assert_eq!(reduce, CTX_REDUCE_ACKNOWLEDGEMENT);
+        assert!(reduce.contains("Refused: no valid tags to queue"));
+        assert!(reduce.contains("tags 1, 2, 3 not found"));
     }
 
     #[test]
@@ -18360,8 +22422,79 @@ mod tests {
         assert_eq!(arguments["stray"], json!("kept"));
     }
 
+    #[test]
+    fn ctx_expand_verbose_range_separates_messages_and_previews_raw_parts() {
+        let output = "line1\nline2\nline3";
+        let messages = vec![
+            CkIngressMessage {
+                mid: "m10".to_string(),
+                ordinal: 10,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        CkWireBlock::bare(CkKind::Text {
+                            text: "x".repeat(201),
+                        }),
+                        CkWireBlock::bare(CkKind::ToolCall {
+                            id: "read:1".to_string(),
+                            name: "read".to_string(),
+                            input: json!({ "filePath": "config.ts" }),
+                            provider_executed: false,
+                        }),
+                    ],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+            CkIngressMessage {
+                mid: "m11".to_string(),
+                ordinal: 11,
+                ck: CkWireMessage::from_parts(
+                    "user",
+                    vec![CkWireBlock::bare(CkKind::ToolResult {
+                        id: "read:1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: CkToolOutput::bare(CkOutputKind::Text {
+                            text: output.to_string(),
+                        }),
+                        provider_executed: false,
+                    })],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+        ];
+
+        let rendered = render_verbose_range_expand(&messages, 10, 11);
+        assert!(rendered.text.contains("[10] A (assistant)"));
+        assert!(rendered.text.contains("[11] U (user)"));
+        assert!(rendered
+            .text
+            .contains(&format!("    • {}…", "x".repeat(200))));
+        assert!(rendered.text.contains("    • tool read(config.ts)"));
+        assert!(rendered.text.contains(&format!(
+            "    • tool read → output ~{} tok",
+            mc_tokenizer::estimate_tokens(output)
+        )));
+        assert_eq!(rendered.last_ordinal, 11);
+        assert!(!rendered.truncated);
+
+        let first = render_verbose_expand_message(&messages[0]);
+        let bounded = render_verbose_range_expand_with_budget(
+            &messages,
+            10,
+            11,
+            mc_tokenizer::estimate_tokens(&first),
+        );
+        assert_eq!(bounded.last_ordinal, 10);
+        assert!(bounded.truncated);
+        assert!(!bounded.text.contains("[11] U (user)"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_ctx_reduce_is_inert_before_resolution_or_storage() {
+    async fn facade_ctx_reduce_resolves_the_session_before_validating_tags() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[("unresolvable", FakeResolve::None)]);
         let handler = McHandler::with_producer_factory_config_resolver(
@@ -18371,19 +22504,100 @@ mod tests {
         );
         handler.bind_route(8, binding("/path/that/does/not/exist", "unresolvable"));
 
-        let response = tool_text(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "not parsed" }))
-                .await,
-        );
-        assert_eq!(response, CTX_REDUCE_ACKNOWLEDGEMENT);
-        assert!(
-            resolver.calls().is_empty(),
-            "the inert facade must not resolve tokens"
-        );
+        let response =
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await;
+        assert_eq!(error_code(response), "session_unresolved");
+        assert_eq!(resolver.calls(), vec!["unresolvable"]);
         assert!(
             handler.store.get().is_none(),
-            "the inert facade must not open or read storage"
+            "an unresolved session must not open storage to validate tags"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_ctx_reduce_ack_validates_unknown_queued_and_protected_tags_without_committing()
+    {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tag_inputs = (1..=21)
+            .map(|number| TagMintInput {
+                block_id: format!("m{number}#0"),
+                kind: "tool_result".to_string(),
+                token_count: 10,
+                source_bytes: format!("output {number}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tag_inputs, 1_000).unwrap();
+
+        let mixed_ack = tool_text(
+            call_facade(
+                &handler,
+                "ctx_reduce",
+                json!({ "drop": "1, 21, 99, 100", "command_id": "mixed-delivery" }),
+            )
+            .await,
+        );
+        assert!(mixed_ack.contains("drop §1§"));
+        assert!(mixed_ack.contains("deferred drop §21§"));
+        assert!(mixed_ack.contains("tags 99, 100 not found"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        // The response observer delivers the same mixed request later. It queues only
+        // known tags, leaving acknowledgement validation side-effect free.
+        let delivered = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1, 21, 99, 100",
+                "command_id": "mixed-delivery",
+            }),
+        );
+        assert_eq!(tool_body(delivered), json!({ "ok": true, "queued": 2 }));
+        let pending_after_delivery = store.load_pending_agent_drops("ses").unwrap();
+        let retry = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1, 21, 99, 100",
+                "command_id": "mixed-delivery",
+            }),
+        );
+        assert_eq!(
+            tool_body(retry),
+            json!({ "ok": true, "queued": 0, "duplicate": true })
+        );
+        assert_eq!(
+            store.load_pending_agent_drops("ses").unwrap(),
+            pending_after_delivery
+        );
+
+        let queued_ack =
+            tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1, 2, 99" })).await);
+        assert!(queued_ack.contains("deferred drop §2§"));
+        assert!(queued_ack.contains("tags 1 already queued"));
+        assert!(queued_ack.contains("tags 99 not found"));
+
+        let refused = tool_body(call_facade(&handler, "ctx_reduce", json!({ "drop": "99" })).await);
+        assert_eq!(refused["isError"], json!(true));
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Refused: no valid tags to queue. tags 99 not found"));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 2);
+
+        let invalid =
+            tool_body(call_facade(&handler, "ctx_reduce", json!({ "drop": "3-1" })).await);
+        assert_eq!(invalid["isError"], json!(true));
+        assert!(invalid["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid range"));
     }
 
     #[test]
@@ -18413,7 +22627,7 @@ mod tests {
                 ],
             ),
             ("ctx_search", vec!["query", "limit"]),
-            ("ctx_expand", vec!["start", "end", "message"]),
+            ("ctx_expand", vec!["start", "end", "verbose", "message"]),
             (
                 "ctx_note",
                 vec![
@@ -18443,6 +22657,12 @@ mod tests {
                 "additionalProperties": false
             }),
             "ctx_reduce advertised schema must stay byte-canonical (authorizer contract)"
+        );
+
+        assert_eq!(
+            by_name["ctx_expand"].schema["properties"]["verbose"]["type"],
+            json!("boolean"),
+            "ctx_expand must advertise verbose range previews"
         );
 
         for (name, expected) in expected_fields {
@@ -20119,12 +24339,56 @@ mod tests {
         ));
         assert!(session_status["pass_trace"]["first_divergence"].is_null());
         assert!(session_status["pass_trace"]["last_divergence"].is_string());
+        assert!(session_status["tail_hygiene"]["u"].is_number());
+        assert!(session_status["tail_hygiene"]["t"].is_number());
+        assert!(session_status["tail_hygiene"]["severity"].is_number());
+        assert!(session_status["tail_hygiene"]["evaluable"].is_boolean());
         assert_eq!(session_status["epochs"]["state_sync_deltas"], json!(true));
         assert_eq!(
             session_status["fake_compaction"]["descent_pending"],
             json!({ "build_skew": 0, "no_responses": 0 })
         );
         assert!(session_status["fake_compaction"]["dispositions"]["descended"].is_number());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_status_preserves_zero_valued_tail_hygiene_fields() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.tail_hygiene_baseline = Some(mc_store::TailHygieneBaseline {
+            baseline_u: 0,
+            baseline_t: 0,
+            turn_delta_u: 0,
+            turn_delta_t: 0,
+            baseline_generation: 0,
+            computed_at_ms: 0,
+            evaluable: true,
+            generation_invalidated: false,
+            baseline_parts: Vec::new(),
+            content_signature: String::new(),
+        });
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
+        let status = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({
+                "method": "session.status",
+                "v": 1,
+                "session_id": "ses",
+            }),
+        ));
+
+        assert_eq!(status["tail_hygiene"]["u"], json!(0));
+        assert_eq!(status["tail_hygiene"]["t"], json!(0));
+        assert_eq!(status["tail_hygiene"]["severity"], json!(0.0));
+        assert_eq!(status["tail_hygiene"]["evaluable"], json!(true));
+        assert_eq!(status["tail_hygiene"]["baseline_generation"], json!(0));
+        assert_eq!(status["tail_hygiene"]["computed_at_ms"], json!(0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20253,12 +24517,34 @@ mod tests {
         cache_wrapup_messages_for_session(handler, "ses", messages);
     }
 
+    fn cache_wrapup_messages_with_limit(
+        handler: &McHandler,
+        messages: Vec<CkIngressMessage>,
+        context_limit_tokens: u64,
+    ) {
+        cache_wrapup_messages_for_session_with_limit(
+            handler,
+            "ses",
+            messages,
+            context_limit_tokens,
+        );
+    }
+
     fn cache_wrapup_messages_for_session(
         handler: &McHandler,
         session_id: &str,
         messages: Vec<CkIngressMessage>,
     ) {
-        let mut parsed = transform_request(messages, 1, 200_000);
+        cache_wrapup_messages_for_session_with_limit(handler, session_id, messages, 200_000);
+    }
+
+    fn cache_wrapup_messages_for_session_with_limit(
+        handler: &McHandler,
+        session_id: &str,
+        messages: Vec<CkIngressMessage>,
+        context_limit_tokens: u64,
+    ) {
+        let mut parsed = transform_request(messages, 1, context_limit_tokens);
         parsed.session_id = session_id.to_string();
         parsed.serializer_profile = SerializerProfile::ClaudeCodeAnthropic.wire_id().to_string();
         let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
@@ -20598,7 +24884,6 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
-
     /// Imported compartments whose anchor mids never appear in the live array
     /// must refuse at the bootstrap fold: the minted boundary has to name a real
     /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
@@ -20697,7 +24982,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn state_import_synthetic_anchors_refuse_at_bootstrap_fold() {
         let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         let imported = call_dispatch_request(
             &handler,
             state_import_request(
@@ -21381,7 +25666,17 @@ mod tests {
                 session_id,
                 None,
                 &CoreState::default(),
-                &ModuleMeta::default(),
+                &ModuleMeta {
+                    pending_channel2_directive: Some(mc_store::PendingChannel2Directive {
+                        text: "frozen reminder".to_string(),
+                        directive_id: "directive-id".to_string(),
+                        armed_at_ms: 1,
+                        arming_watermark: 1,
+                    }),
+                    channel2_pressure_latched: true,
+                    channel2_arming_watermark: 1,
+                    ..Default::default()
+                },
             )
             .unwrap();
         store
@@ -21405,6 +25700,12 @@ mod tests {
         assert!(deleted["deleted_rows"].as_u64().unwrap() >= 2);
         assert!(!store.has_cache_state(session_id).unwrap());
         assert!(store.load_tags_for_session(session_id).unwrap().is_empty());
+        assert!(store
+            .load(session_id)
+            .unwrap()
+            .meta
+            .pending_channel2_directive
+            .is_none());
     }
 
     #[test]
@@ -21501,15 +25802,32 @@ mod tests {
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
     }
 
-    #[test]
-    fn ctx_reduce_no_targets_append_records_terminal_disposition() {
-        // When a drop range references tag numbers that don't exist in the session,
-        // the ledger row is still recorded (for idempotency) but with disposition='no_targets'
-        // and queued=0. A retry of the same command_id still dedupes.
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_no_targets_refuses_without_a_ledger_row() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
 
-        // No tags minted, so drop "1" resolves zero targets.
+        // No tags minted, so acknowledgement and later delivery both refuse "1" rather
+        // than committing the terminal no_targets ledger row that used to hide this error.
+        let acknowledgement = tool_body(
+            call_facade(
+                &handler,
+                "ctx_reduce",
+                json!({ "drop": "1", "command_id": "no-target-cmd" }),
+            )
+            .await,
+        );
+        assert_eq!(acknowledgement["isError"], json!(true));
+        assert!(acknowledgement["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Refused: no valid tags to queue. tags 1 not found"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
         let outcome = handler.handle_agent_drops_value(
             7,
             json!({
@@ -21519,35 +25837,18 @@ mod tests {
                 "command_id": "no-target-cmd",
             }),
         );
-        let body: Value = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
-            other => panic!("unexpected outcome: {other:?}"),
-        };
-        assert_eq!(
-            body,
-            json!({ "ok": true, "queued": 0, "disposition": "no_targets" })
-        );
+        let (code, message) = error_frame(outcome);
+        assert_eq!(code, "bad_request");
+        assert!(message.contains("no valid tags: 1 not found"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        // Retry of the same command_id must still dedupe (idempotency).
-        let retry = handler.handle_agent_drops_value(
-            7,
-            json!({
-                "method": "agent_drops.append",
-                "session_id": "ses",
-                "drop": "1",
-                "command_id": "no-target-cmd",
-            }),
-        );
-        let retry_body: Value = match retry {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
-            other => panic!("unexpected outcome: {other:?}"),
-        };
+        // Reusing this command id after a tag arrives must queue it. If refusal had
+        // committed a zero-target ledger row, this would be acknowledged as duplicate.
+        mint_drop_tag(&store, "a#0");
         assert_eq!(
-            retry_body,
-            json!({ "ok": true, "queued": 0, "duplicate": true })
+            queue_drop_command_with_id(&handler, "no-target-cmd"),
+            json!({ "ok": true, "queued": 1 })
         );
-        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21979,7 +26280,10 @@ mod tests {
             .unwrap()
             .contains("takes effect on your next message"));
         let starts = producer.starts.load(Ordering::SeqCst);
-        assert!((2..=historian::MAX_WRAPUP_ROUNDS).contains(&starts));
+        assert!(
+            starts >= 2,
+            "the drain needs as many rounds as the backlog requires: {starts}"
+        );
         let final_end = store
             .load_compartments("ses")
             .unwrap()
@@ -22004,6 +26308,156 @@ mod tests {
             .unwrap()
             .contains("nothing to compact"));
         assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_drains_beyond_five_rounds_to_the_keep_watermark() {
+        // The drain is bounded by the request budget, not a round-count cap: this
+        // backlog needs more producer rounds than the historical five-round limit,
+        // and one session.wrapup call must still reach the keep watermark.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(320, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        let starts = producer.starts.load(Ordering::SeqCst);
+        assert!(
+            starts >= 6,
+            "the backlog requires more than five producer rounds: {starts}"
+        );
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(final_end, 300, "the drain must reach the keep watermark");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_honors_requested_keep_watermark_without_clamping() {
+        // keep=1 is honored as given (floored only to the boundary's one-message
+        // minimum): the drain compacts everything except the protected tail. The
+        // user-boundary snap then retains the final user message as well, leaving
+        // exactly the last two messages (79..=80) unwrapped. A clamping module
+        // would stop earlier.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 1
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(final_end, 78, "keep=1 must keep a one-message tail: {body}");
+
+        // keep=250 exceeds the live tail and must be honored unchanged: nothing is
+        // compacted. A module clamping keep to 100 would instead compact 50 messages.
+        let producer_large = Arc::new(ProducerState::default());
+        let (handler_large, _store_large, _dir_large, _project_large) =
+            handler_with_store(Arc::clone(&producer_large), default_test_config());
+        cache_wrapup_messages(&handler_large, wrapup_messages(150, 40));
+        let large = tool_body(
+            handler_large
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 250
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(large["disposition"], json!("nothing_to_compact"), "{large}");
+        assert!(
+            large["summary"]
+                .as_str()
+                .unwrap()
+                .contains("keep watermark of 250"),
+            "{large}"
+        );
+        assert_eq!(producer_large.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_user_snap_uses_session_geometry() {
+        // A meaningful user message sits about 10k tokens before the raw keep
+        // candidate. With the session's 1M-context geometry the derived trigger
+        // budget is about 32.5k, so the snap window reaches the user message and
+        // retains it; the legacy hard-coded 128k/65 budget floors at 5k and would
+        // keep the later candidate instead.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = vec![
+            ck_with_role("m1", 1, "user", "start the session"),
+            ck_with_role("m2", 2, "assistant", &"preamble filler ".repeat(4_000)),
+            ck_with_role("m3", 3, "user", "now the real request"),
+            ck_with_role("m4", 4, "assistant", &"followup filler ".repeat(2_500)),
+            ck_with_role("m5", 5, "assistant", "interim note"),
+            ck_with_role("m6", 6, "user", "latest prompt"),
+        ];
+        cache_wrapup_messages_with_limit(&handler, messages, 1_000_000);
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 2
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(
+            final_end, 2,
+            "the geometry-sized snap must retain the user message at ordinal 3: {body}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -22071,7 +26525,11 @@ mod tests {
             other => panic!("empty command_id must reject, got {other:?}"),
         }
 
-        // Negative keep is a clamp input, not an error: [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX].
+        // Negative keep is not an error: it floors to the one-message watermark the
+        // TypeScript orchestrator applies (Math.max(1, ...)), so the drain compacts
+        // everything except the protected tail. With uniform text messages the
+        // user-boundary snap retains the final user message too, leaving exactly the
+        // last two messages (79..=80) unwrapped.
         let negative_keep = tool_body(
             handler
                 .dispatch_value(
@@ -22087,8 +26545,6 @@ mod tests {
         );
         assert_eq!(negative_keep["ok"], json!(true), "{negative_keep}");
         assert_eq!(negative_keep["disposition"], json!("completed"));
-        // keep=-3 clamps to WRAPUP_KEEP_MIN=5: coverage must reach past keep=20's
-        // watermark (60), proving the clamp floor was used, not the default or a reject.
         let final_end = _store
             .load_compartments("ses")
             .unwrap()
@@ -22096,9 +26552,9 @@ mod tests {
             .map(|compartment| compartment.end_message)
             .max()
             .unwrap();
-        assert!(
-            final_end > 60,
-            "keep must clamp to MIN=5, got end {final_end}"
+        assert_eq!(
+            final_end, 78,
+            "keep must floor to 1 (not clamp to a larger minimum), got end {final_end}"
         );
     }
 
@@ -22841,7 +27297,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_wrapup_stops_at_the_five_round_cap() {
+    async fn session_wrapup_drains_huge_chunks_past_the_old_round_cap() {
+        // Each message is one historian chunk, so this backlog needs ten producer
+        // rounds. The drain is bounded by the request budget rather than the
+        // historical five-round cap, so one call must compact all ten messages and
+        // reach the keep watermark instead of stopping halfway.
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -22856,15 +27316,10 @@ mod tests {
                 .await,
         );
 
-        assert_eq!(body["ok"], json!(false), "{body}");
-        assert_eq!(body["disposition"], json!("retryable"));
-        assert_eq!(body["reason"], json!("snapshot_unavailable"));
-        assert!(body["summary"]
-            .as_str()
-            .unwrap()
-            .contains("stopped at the 5-round cap"));
-        assert_eq!(producer.starts.load(Ordering::SeqCst), 5);
-        assert_eq!(store.load_compartments("ses").unwrap().len(), 5);
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 10);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 10);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -23317,6 +27772,7 @@ mod tests {
                 temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
+                compaction_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
@@ -23851,6 +28307,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -24091,6 +28548,7 @@ mod tests {
                 temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
+                compaction_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
@@ -24265,29 +28723,254 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transform_request_retained_bytes_tracks_typed_original_and_native_trees() {
+        use std::mem::size_of;
+
+        fn manual_value_retained_bytes(value: &Value) -> usize {
+            fn heap(value: &Value) -> usize {
+                match value {
+                    Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+                    Value::String(value) => value.capacity(),
+                    Value::Array(values) => values
+                        .capacity()
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(values.iter().map(heap).sum::<usize>()),
+                    Value::Object(values) => values
+                        .len()
+                        .saturating_mul(
+                            size_of::<String>() + size_of::<Value>() + size_of::<usize>() * 3,
+                        )
+                        .saturating_add(
+                            values
+                                .iter()
+                                .map(|(key, value)| key.capacity().saturating_add(heap(value)))
+                                .sum::<usize>(),
+                        ),
+                }
+            }
+            size_of::<Value>().saturating_add(heap(value))
+        }
+
+        let input = Value::Object(
+            (0..48)
+                .map(|index| {
+                    (
+                        format!("k{index}"),
+                        json!({"flag": index % 2 == 0, "value": format!("v{index}")}),
+                    )
+                })
+                .collect(),
+        );
+        let message = CkIngressMessage {
+            mid: "tool-heavy-mid".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::ToolCall {
+                    id: "call-tool-heavy".to_string(),
+                    name: "fixture_tool".to_string(),
+                    input: input.clone(),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some("tool-heavy-mid".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let mut raw = request(vec![message]);
+        raw["native_messages"] = json!([{
+            "id": "native-tool-heavy",
+            "parts": [{"type": "tool", "input": input}]
+        }]);
+        raw["channel2_delivered_id"] = json!("directive-echo".repeat(100));
+        let wire_bytes = serde_json::to_vec(&raw).unwrap().len();
+        let parsed: TransformRequest = serde_json::from_value(raw).unwrap();
+        let block = &parsed.messages[0].ck.content[0];
+        let block_original = serde_json::to_value(block).unwrap();
+        let message_original = serde_json::to_value(&parsed.messages[0].ck).unwrap();
+        let CkKind::ToolCall {
+            id, name, input, ..
+        } = &block.kind
+        else {
+            panic!("fixture must retain a tool call");
+        };
+        let typed_block_heap = id
+            .capacity()
+            .saturating_add(name.capacity())
+            .saturating_add(manual_value_retained_bytes(input).saturating_sub(size_of::<Value>()));
+        let block_extra =
+            typed_block_heap.saturating_add(manual_value_retained_bytes(&block_original));
+        let ck_tree = size_of::<CkWireMessage>()
+            .saturating_add(parsed.messages[0].ck.role.capacity())
+            .saturating_add(
+                parsed.messages[0]
+                    .ck
+                    .content
+                    .capacity()
+                    .saturating_mul(size_of::<CkWireBlock>()),
+            )
+            .saturating_add(block_extra)
+            .saturating_add(
+                parsed.messages[0]
+                    .ck
+                    .meta
+                    .harness_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(manual_value_retained_bytes(&message_original));
+        let message_tree = parsed
+            .messages
+            .capacity()
+            .saturating_mul(size_of::<CkIngressMessage>())
+            .saturating_add(parsed.messages[0].mid.capacity())
+            .saturating_add(ck_tree.saturating_sub(size_of::<CkWireMessage>()));
+        let native_tree = parsed.native_messages.as_ref().map_or(0, |messages| {
+            messages
+                .capacity()
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(
+                    messages
+                        .iter()
+                        .map(|message| {
+                            manual_value_retained_bytes(message).saturating_sub(size_of::<Value>())
+                        })
+                        .sum::<usize>(),
+                )
+        });
+        let direct_strings = parsed
+            .kind
+            .capacity()
+            .saturating_add(parsed.serializer_profile.capacity())
+            .saturating_add(parsed.session_id.capacity())
+            .saturating_add(parsed.render_config.capacity())
+            .saturating_add(parsed.system_prompt_hash.capacity())
+            .saturating_add(parsed.upgrade_state.capacity())
+            .saturating_add(parsed.prompt_surface_config_identity.capacity())
+            .saturating_add(parsed.channel2_nudge_state.capacity())
+            .saturating_add(
+                parsed
+                    .channel2_delivered_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(parsed.prior_conversation_key.capacity());
+        let cache_metadata = size_of::<TransformSnapshot>()
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add((size_of::<String>() + parsed.session_id.len()).saturating_mul(2));
+        let expected = size_of::<TransformRequest>()
+            .saturating_add(direct_strings)
+            .saturating_add(message_tree)
+            .saturating_add(native_tree)
+            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(cache_metadata);
+        let retained = parsed.retained_bytes();
+        let delta = retained.abs_diff(expected);
+
+        assert!(
+            retained >= wire_bytes.saturating_mul(2),
+            "legacy wire-length charge was not at least 2x low: retained={retained} wire={wire_bytes}"
+        );
+        assert!(
+            delta <= expected / 10,
+            "retained-size estimate left 10% fixture tolerance: retained={retained} expected={expected}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn transform_snapshot_charge_uses_unpaged_body_length() {
+    async fn tail_delta_snapshot_charges_expanded_tree_and_evicts_at_budget() {
         let (handler, _store, _dir, _project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let request = request(vec![ck("charge", 0, "body length")]);
-        let body_length = serde_json::to_vec(&request).unwrap().len();
+        let mut full = request(vec![ck("m1", 1, &"history ".repeat(2_000))]);
+        full["full_array_fingerprint"] = json!("fp-full");
+        full["native_messages"] = json!([]);
+        let full_body_bytes = serde_json::to_vec(&full).unwrap().len();
         let outcome = handler
-            .handle_transform_for_test_with_body_size(7, request, body_length)
+            .handle_transform_for_test_with_body_size(7, full, full_body_bytes)
             .await;
         assert!(
             matches!(outcome, HandlerOutcome::Response(_)),
             "{outcome:?}"
         );
-
-        let snapshots = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex");
-        let Some(TransformSnapshot::Ready { retained_bytes, .. }) = snapshots.entries.get("ses")
-        else {
-            panic!("expected retained transform snapshot");
+        let full_charge = {
+            let snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let Some(TransformSnapshot::Ready { retained_bytes, .. }) =
+                snapshots.entries.get("ses")
+            else {
+                panic!("expected retained full transform snapshot");
+            };
+            *retained_bytes
         };
-        assert_eq!(*retained_bytes, body_length);
+
+        let mut first_delta = request(vec![ck("m2", 2, "small tail")]);
+        first_delta["full_array_fingerprint"] = json!("fp-delta-1");
+        first_delta["native_messages"] = json!([]);
+        first_delta["tail_delta"] = json!({
+            "after": "fp-full",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        });
+        let delta_body_bytes = serde_json::to_vec(&first_delta).unwrap().len();
+        let outcome = handler
+            .handle_transform_for_test_with_body_size(7, first_delta, delta_body_bytes)
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "{outcome:?}"
+        );
+        let expanded_charge = {
+            let snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let Some(TransformSnapshot::Ready { retained_bytes, .. }) =
+                snapshots.entries.get("ses")
+            else {
+                panic!("expected retained expanded transform snapshot");
+            };
+            *retained_bytes
+        };
+        assert!(expanded_charge >= full_charge);
+        assert!(expanded_charge >= delta_body_bytes.saturating_mul(2));
+
+        {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            snapshots.max_ready_bytes = expanded_charge.saturating_sub(1);
+        }
+        let mut second_delta = request(vec![ck("m3", 3, "tiny tail")]);
+        second_delta["full_array_fingerprint"] = json!("fp-delta-2");
+        second_delta["native_messages"] = json!([]);
+        second_delta["tail_delta"] = json!({
+            "after": "fp-delta-1",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        });
+        let second_delta_body_bytes = serde_json::to_vec(&second_delta).unwrap().len();
+        let outcome = handler
+            .handle_transform_for_test_with_body_size(7, second_delta, second_delta_body_bytes)
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .get("ses"),
+            TransformSnapshotLookup::Missing
+        ));
     }
 
     #[allow(dead_code)]
@@ -24419,7 +29102,8 @@ mod tests {
         let errors = outcomes
             .into_iter()
             .filter_map(|outcome| match outcome {
-                HandlerOutcome::Error { code, .. } => Some(code),
+                HandlerOutcome::Error { code, .. }
+                | HandlerOutcome::ErrorWithDetail { code, .. } => Some(code),
                 HandlerOutcome::Response(_) | HandlerOutcome::Streamed => None,
             })
             .collect::<Vec<_>>();
@@ -24493,7 +29177,9 @@ mod tests {
         assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
         let absent_response = match &absent {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => Value::Null,
+            HandlerOutcome::Error { .. }
+            | HandlerOutcome::ErrorWithDetail { .. }
+            | HandlerOutcome::Streamed => Value::Null,
         };
         assert_eq!(absent_response["memories_skipped"], json!(true));
         assert!(store
@@ -24548,7 +29234,9 @@ mod tests {
         assert!(matches!(workspace, HandlerOutcome::Response(_)));
         let workspace_response = match &workspace {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => Value::Null,
+            HandlerOutcome::Error { .. }
+            | HandlerOutcome::ErrorWithDetail { .. }
+            | HandlerOutcome::Streamed => Value::Null,
         };
         assert_eq!(workspace_response["memories_skipped"], json!(true));
         assert!(store
@@ -24875,7 +29563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paged_authority_transform_reassembles_and_executes() {
+    async fn paged_authority_transform_charges_reassembled_request_tree() {
         let state = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
         let first = paged_transform_page(
@@ -24912,7 +29600,7 @@ mod tests {
         let mut final_page = final_page;
         final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
         final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
-        let expected_inbound_bytes = serde_json::to_vec(&first).unwrap().len()
+        let inbound_bytes = serde_json::to_vec(&first).unwrap().len()
             + serde_json::to_vec(&final_page).unwrap().len();
 
         let first_ack = handler.dispatch_value(7, first).await;
@@ -24928,11 +29616,19 @@ mod tests {
             .transform_snapshots
             .lock()
             .expect("transform snapshots mutex");
-        let Some(TransformSnapshot::Ready { retained_bytes, .. }) = snapshots.entries.get("ses")
+        let Some(TransformSnapshot::Ready {
+            request,
+            retained_bytes,
+            ..
+        }) = snapshots.entries.get("ses")
         else {
             panic!("expected retained transform snapshot");
         };
-        assert_eq!(*retained_bytes, expected_inbound_bytes);
+        assert_eq!(*retained_bytes, request.retained_bytes());
+        assert!(
+            *retained_bytes > inbound_bytes,
+            "paged snapshot must charge its parsed request tree, not staged wire length"
+        );
     }
 
     #[tokio::test]
@@ -25249,6 +29945,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_discard_logs_partial_transform_pages_and_allows_a_fresh_series() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        let project_root = project.to_str().expect("test project path");
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "discarded-series",
+            0,
+            0,
+            2,
+            false,
+            vec![serde_json::to_value(ck("discarded-m0", 0, "discarded first")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        handler.bind_route(7, binding(project_root, "replacement"));
+        let discard_logs = handler
+            .transform_page_discard_logs
+            .lock()
+            .expect("transform page discard logs mutex")
+            .clone();
+        assert_eq!(
+            discard_logs,
+            vec![
+                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_replaced"
+                    .to_string()
+            ]
+        );
+
+        handler.bind_route(7, binding(project_root, "ses"));
+        let fresh_first = paged_transform_page(
+            "transform",
+            "ses",
+            "fresh-series",
+            0,
+            0,
+            2,
+            false,
+            vec![serde_json::to_value(ck("fresh-m0", 0, "fresh first")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, fresh_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let fresh_final = paged_transform_page(
+            "transform",
+            "ses",
+            "fresh-series",
+            0,
+            1,
+            2,
+            true,
+            vec![serde_json::to_value(ck("fresh-m1", 1, "fresh final")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, fresh_final).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        handler.unbind_route(7);
+        assert_eq!(
+            handler
+                .transform_page_discard_logs
+                .lock()
+                .expect("transform page discard logs mutex")
+                .len(),
+            1,
+            "route teardown must not log when no transform pages were staged"
+        );
+
+        handler.bind_route(7, binding(project_root, "ses"));
+        let teardown_first = paged_transform_page(
+            "transform",
+            "ses",
+            "teardown-series",
+            0,
+            0,
+            2,
+            false,
+            vec![serde_json::to_value(ck("teardown-m0", 0, "teardown first")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, teardown_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        handler.unbind_route(7);
+        assert_eq!(
+            handler
+                .transform_page_discard_logs
+                .lock()
+                .expect("transform page discard logs mutex")
+                .as_slice(),
+            [
+                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_replaced",
+                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_teardown",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn paged_state_sync_seed_replaces_stale_collector_after_lost_ack() {
         let state = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
@@ -25482,6 +30282,7 @@ mod tests {
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
                 temporal_awareness: true,
+                mural: None,
             },
             |_| 0,
         )
@@ -25490,5 +30291,163 @@ mod tests {
             composed.m0_bytes,
             "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history>\n## 0-0 · c0\nfirst compartment-p1\n</session-history>"
         );
+    }
+    fn publish_ctx_expand_fixture(
+        store: &McStore,
+        session_id: &str,
+        project_path: &str,
+        messages: &[CkIngressMessage],
+    ) {
+        let start = i64::try_from(messages.first().expect("fixture messages").ordinal).unwrap();
+        let end = i64::try_from(messages.last().expect("fixture messages").ordinal).unwrap();
+        let selected_range_identities = messages
+            .iter()
+            .map(|message| mc_store::HistorianSelectedMessageIdentity {
+                mid: message.mid.clone(),
+                block_identities: vec![mc_store::BlockIdentity {
+                    kind_tag: "text".to_string(),
+                    byte_fingerprint: format!("{}-identity", message.mid),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let meta = ModuleMeta {
+            block_identity_by_mid: selected_range_identities
+                .iter()
+                .map(|identity| (identity.mid.clone(), identity.block_identities.clone()))
+                .collect(),
+            historian: HistorianDurableState {
+                state: HistorianPhase::Publishing,
+                firing_seq: 1,
+                chunk_range: Some(HistorianChunkRange {
+                    from_ordinal: start as u64,
+                    to_ordinal: end as u64,
+                }),
+                chunk_fingerprint: "ctx-expand-fixture".to_string(),
+                selected_range_identities: selected_range_identities.clone(),
+                producer_session_id: Some("ctx-expand-producer".to_string()),
+                producer_run_id: Some("ctx-expand-run".to_string()),
+                fired_at_ms: Some(1),
+                expected_revert_epoch: 0,
+                compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .commit(session_id, None, &CoreState::default(), &meta)
+            .unwrap();
+        let raw_messages = serde_json::to_string(messages).unwrap();
+        let predicate = mc_store::HistorianPublishPredicate {
+            firing_seq: 1,
+            producer_run_id: "ctx-expand-run".to_string(),
+            chunk_fingerprint: "ctx-expand-fixture".to_string(),
+            selected_range_identities,
+            compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
+        };
+        store
+            .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                session_id,
+                expected_row_version: store.load(session_id).unwrap().row_version,
+                expected_revert_epoch: 0,
+                predicate: &predicate,
+                project_path,
+                compartments: &[stored_comp(
+                    1,
+                    start,
+                    end,
+                    &format!("{}#0", messages.last().unwrap().mid),
+                    "condensed fixture",
+                )],
+                facts: &[],
+                promote_facts: false,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: end as u64,
+                chunk_transcript: Some(&format!("[{start}-{end}] U: condensed fixture")),
+                raw_chunk_messages: Some(&raw_messages),
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_uses_durable_raw_messages_for_exact_ranges_and_snapshot_loss() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let full_tool_output = "durable full tool output\n".repeat(20_000);
+        let mut messages = (1..=100)
+            .map(|ordinal| {
+                ck_with_role(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    "user",
+                    &format!("ordinal-{ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        messages[51] = tool_result("m52", 52, &full_tool_output);
+        publish_ctx_expand_fixture(&store, "ses", project.to_str().unwrap(), &messages);
+
+        // R5-09: a persisted transcript covering 1-100 must expose only the requested ordinals.
+        let sliced =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 50, "end": 55})).await);
+        assert!(sliced.contains("Messages 50-55"));
+        assert!(sliced.contains("[50] U: ordinal-50"));
+        assert!(sliced.contains("[55] U: ordinal-55"));
+        assert!(!sliced.contains("[1] U:"));
+        assert!(!sliced.contains("[100] U:"));
+
+        // R5-10: no transform snapshot is installed, so both routes must decode the durable
+        // original-message payload instead of falling back to the condensed historian line.
+        let full = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 52})).await);
+        assert!(full.contains("[52] tool — full recovery:"), "{full}");
+        assert!(full.contains(&full_tool_output));
+        let verbose = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 52, "end": 52, "verbose": true}),
+            )
+            .await,
+        );
+        assert!(verbose.contains("[52] tool"));
+        assert!(verbose.contains(&format!(
+            "output ~{} tok",
+            mc_tokenizer::estimate_tokens(&full_tool_output)
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_accepts_native_ordinal_zero_in_message_and_range_forms() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        publish_ctx_expand_fixture(
+            &store,
+            "ses",
+            project.to_str().unwrap(),
+            &[ck_with_role("m0", 0, "user", "ordinal zero")],
+        );
+
+        // R5-11: the shape published by a zero-based native history round-trips exactly.
+        let by_message =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 0})).await);
+        assert!(by_message.contains("[0] U (user) — full recovery:"));
+        assert!(by_message.contains("ordinal zero"));
+        let by_range =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 0})).await);
+        assert!(by_range.contains("Messages 0-0"));
+        assert!(by_range.contains("[0] U: ordinal zero"));
+        let schema = ctx_expand_schema();
+        assert_eq!(schema["properties"]["message"]["minimum"], json!(0));
+        assert_eq!(schema["properties"]["start"]["minimum"], json!(0));
+        assert_eq!(schema["properties"]["end"]["minimum"], json!(0));
     }
 }

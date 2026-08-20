@@ -17,7 +17,8 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 │   ├── cli/                # Unified setup/doctor/migrate CLI (@cortexkit/magic-context)
 │   ├── dashboard/          # Dashboard (Tauri-based)
 │   ├── docs/               # Project documentation website
-│   └── e2e-tests/          # End-to-end integration tests
+│   ├── e2e-tests/          # End-to-end integration tests
+│   └── retina-local-fs/    # Local filesystem & Git predicate provider for smart-note condition checks
 ├── scripts/                # Local maintenance, release, and install scripts
 ├── docs/                   # Workspace design references for major subsystems
 ├── Cargo.toml              # Rust workspace configuration
@@ -38,7 +39,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **CLI Sibling Package (`packages/cli/`):**
 - Purpose: Provide the unified, harness-aware setup/doctor wizard for OpenCode and Pi.
 - Location: `packages/cli/src/` — published as `@cortexkit/magic-context`. Invoked as `npx @cortexkit/magic-context@latest <subcommand>`.
-- Contains: Command implementations (`packages/cli/src/commands/`), per-harness adapters (`packages/cli/src/adapters/`), shared prompt/path utilities (`packages/cli/src/lib/`).
+- Contains: Command implementations (`packages/cli/src/commands/` including `migrate.ts` and `migrate-session.ts`), per-harness adapters (`packages/cli/src/adapters/`), shared prompt/path utilities (`packages/cli/src/lib/`).
 - History: prior to v0.16.1 each plugin shipped its own `opencode-magic-context` / `pi-magic-context` bin. Those were collapsed into the unified `magic-context` bin; this `packages/plugin/` tree no longer contains a `src/cli/` directory.
 
 **`src/agents/`:**
@@ -59,7 +60,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **`src/hooks/`:**
 - Purpose: Hold hook implementations and hook-specific helpers.
 - Contains: The `magic-context` runtime, the auto-update checker, and the Rust-mode execution adapter.
-- Key files: `src/hooks/magic-context/hook.ts`, `src/hooks/magic-context/transform.ts`, `src/hooks/magic-context/transform-postprocess-phase.ts`, `src/hooks/magic-context/strip-content.ts`, `src/hooks/auto-update-checker/checker.ts`, `src/hooks/magic-context/rust-mode-transform.ts`, `src/hooks/magic-context/module-state-sync.ts`, `src/hooks/magic-context/module-wire.ts`, `src/hooks/magic-context/compaction-off-transition.ts`, `src/hooks/magic-context/child-session-spawn.ts`
+- Key files: `src/hooks/magic-context/hook.ts`, `src/hooks/magic-context/transform.ts`, `src/hooks/magic-context/transform-postprocess-phase.ts`, `src/hooks/magic-context/strip-content.ts`, `src/hooks/magic-context/tail-hygiene-walk.ts`, `src/hooks/magic-context/ctx-reduce-nudge.ts`, `src/hooks/magic-context/channel2-delivery.ts`, `src/hooks/auto-update-checker/checker.ts`, `src/hooks/magic-context/rust-mode-transform.ts`, `src/hooks/magic-context/module-state-sync.ts`, `src/hooks/magic-context/module-wire.ts`, `src/hooks/magic-context/compaction-off-transition.ts`, `src/hooks/magic-context/child-session-spawn.ts`
 
 **`src/tui/`:**
 - Purpose: Render Magic Context sidebar and `/ctx-status` / `/ctx-recomp` dialogs inside OpenCode's TUI.
@@ -71,7 +72,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 - Purpose: Group reusable subsystem logic by feature.
 - Contains: Magic-context services (storage, scheduler, tagger, search, message-index, overflow detection, compaction markers, session-project storage and backfill, clone-state copying), dreamer runtime, sidekick support, memory system, user-memory pipeline, git-commit indexer, tool-definition token measurement, schema migrations, built-in commands, and the smart-notes evaluation engine.
 - Key subdirs: `src/features/magic-context/dreamer/`, `src/features/magic-context/memory/`, `src/features/magic-context/mural/`, `src/features/magic-context/sidekick/`, `src/features/magic-context/user-memory/`, `src/features/magic-context/git-commits/`, `src/features/magic-context/smart-notes/`, `src/features/builtin-commands/`
-- Key files: `src/features/magic-context/storage-db.ts`, `src/features/magic-context/fail-closed-block.ts`, `src/features/magic-context/storage-schema-helpers.ts`, `src/features/magic-context/storage-clone.ts`, `src/features/magic-context/storage.ts` (barrel), `src/features/magic-context/migrations.ts`, `src/features/magic-context/message-index.ts`, `src/features/magic-context/search.ts`, `src/features/magic-context/session-project-storage.ts`, `src/features/magic-context/session-project-backfill.ts`, `src/features/magic-context/overflow-detection.ts`, `src/features/magic-context/context-authority.ts`, `src/features/magic-context/storage-identity-merge.ts`, `src/features/magic-context/schema-fence-probe.ts`, `src/features/magic-context/dreamer/task-executor.ts`, `src/features/magic-context/dreamer/lease.ts`, `src/features/magic-context/dreamer/manifest-parser.ts`, `src/features/magic-context/dreamer/provider-output-failure.ts`, `src/features/magic-context/memory/project-identity.ts`, `src/features/magic-context/memory/storage-memory.ts`, `src/features/magic-context/memory/embedding-synapse.ts`, `src/features/magic-context/mural/render-mural.ts`, `src/features/magic-context/user-memory/storage-user-memory.ts`, `src/features/builtin-commands/commands.ts`
+- Key files: `src/features/magic-context/storage-db.ts`, `src/features/magic-context/fail-closed-block.ts`, `src/features/magic-context/storage-schema-helpers.ts`, `src/features/magic-context/storage-clone.ts`, `src/features/magic-context/storage.ts` (barrel), `src/features/magic-context/migrations.ts`, `src/features/magic-context/reclaim-protection.ts`, `src/features/magic-context/message-index.ts`, `src/features/magic-context/search.ts`, `src/features/magic-context/session-project-storage.ts`, `src/features/magic-context/session-project-backfill.ts`, `src/features/magic-context/overflow-detection.ts`, `src/features/magic-context/context-authority.ts`, `src/features/magic-context/storage-identity-merge.ts`, `src/features/magic-context/schema-fence-probe.ts`, `src/features/magic-context/dreamer/task-executor.ts`, `src/features/magic-context/dreamer/lease.ts`, `src/features/magic-context/dreamer/manifest-parser.ts`, `src/features/magic-context/dreamer/provider-output-failure.ts`, `src/features/magic-context/memory/project-identity.ts`, `src/features/magic-context/memory/storage-memory.ts`, `src/features/magic-context/memory/embedding-synapse.ts`, `src/features/magic-context/mural/render-mural.ts`, `src/features/magic-context/user-memory/storage-user-memory.ts`, `src/features/magic-context/smart-notes/wake-plane.ts`, `src/features/builtin-commands/commands.ts`
 
 **`src/tools/`:**
 - Purpose: Define the agent-facing tool surface.
@@ -81,7 +82,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **`src/shared/`:**
 - Purpose: Keep cross-feature utilities small and dependency-light.
 - Contains: Logging, path helpers, JSONC parsing, model helpers, runtime-detected SQLite backend (`bun:sqlite` / `node:sqlite`), harness identification, RPC server/client/types/utils/notifications, conflict detection & fixer, fallback chain resolver, models.dev cache, tag-transcript primitive shared with Pi, model-suggestion-retry helper, subagent runner (Pi-only), the commit-detection utility, harness-specific provider translation, process-wide exit-abort coordination, diagnostics numeric redaction, prompt surface preset resolution, and export-aware TUI runtime import specifiers mapping.
-- Key files: `src/shared/logger.ts`, `src/shared/data-path.ts`, `src/shared/jsonc-parser.ts`, `src/shared/sqlite.ts`, `src/shared/rpc-server.ts`, `src/shared/rpc-client.ts`, `src/shared/conflict-detector.ts`, `src/shared/model-suggestion-retry.ts`, `src/shared/resolve-fallbacks.ts`, `src/shared/harness.ts`, `src/shared/tag-transcript.ts`, `src/shared/commit-detection.ts`, `src/shared/harness-provider-map.ts`, `src/shared/exit-abort-registry.ts`, `src/shared/redaction.ts`, `src/shared/escalation-bands.ts`, `src/shared/context-limit-provenance.ts`, `src/shared/storage-permissions.ts`, `src/shared/tui-runtime-specifiers.ts`, `src/shared/prompt-surface.ts`, `src/shared/prompt-surface-runtime.ts`, `src/shared/prompt-surface-a1-golden.ts`
+- Key files: `src/shared/logger.ts`, `src/shared/data-path.ts`, `src/shared/jsonc-parser.ts`, `src/shared/sqlite.ts`, `src/shared/rpc-server.ts`, `src/shared/rpc-client.ts`, `src/shared/conflict-detector.ts`, `src/shared/model-suggestion-retry.ts`, `src/shared/resolve-fallbacks.ts`, `src/shared/models-dev-cache.ts`, `src/shared/window-geometry.ts`, `src/shared/harness.ts`, `src/shared/tag-transcript.ts`, `src/shared/commit-detection.ts`, `src/shared/harness-provider-map.ts`, `src/shared/exit-abort-registry.ts`, `src/shared/redaction.ts`, `src/shared/escalation-bands.ts`, `src/shared/context-limit-provenance.ts`, `src/shared/storage-permissions.ts`, `src/shared/tui-runtime-specifiers.ts`, `src/shared/prompt-surface.ts`, `src/shared/prompt-surface-runtime.ts`, `src/shared/prompt-surface-a1-golden.ts`
 
 **`scripts/`:**
 - Purpose: Support local inspection and maintenance outside the plugin runtime.
@@ -113,6 +114,8 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/index.ts`: Register the plugin, hidden agents (`historian`, `historian-editor`, `dreamer`, `sidekick`), hooks, commands, tools, RPC server, dream-schedule timer, and the auto-update checker.
 - `src/tui/index.tsx`: Register TUI command-palette entries and the sidebar slot for OpenCode TUI.
 - `packages/cli/src/index.ts`: Unified setup/doctor/migrate entry for the separate `@cortexkit/magic-context` package.
+- `packages/cli/src/commands/migrate-session.ts`: Re-home OpenCode sessions across working directories/projects and database boundaries with domain authority verification.
+- `packages/cli/src/commands/migrate.ts`: Migrate OpenCode sessions to Pi or OMP format with phase-tracked `migration_pending` recovery journaling.
 - `packages/cli/src/lib/embedding-runtime.ts`: Probe the presence of the `onnxruntime-node` package and native platform binaries to verify local embedding runtime health.
 - `packages/pi-plugin/src/index.ts`: Entry point for the Pi-specific plugin registering context handlers and hooks.
 - `crates/mc-module/src/main.rs`: Entry point for the `subc` daemon module.
@@ -135,6 +138,10 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/supersession-reclaim.ts`: Select superseded spent control-plane tool outputs (oldest todowrite, ctx_reduce, zero-value meta calls) and older edit/write calls for the same file under the `smart_drops` configuration flag.
 - `src/hooks/magic-context/tool-drop-target.ts`: Candidate selection for tool output reduction, protecting open tool arcs via `partHasCompletedResult` while reclaiming completed or errored arcs.
 - `src/hooks/magic-context/sentinel.ts`: Decide provider predicates (such as `modelAcceptsEmptyContent` and `variantChangeBustsProviderCache`) controlling strip/flush behavior.
+- `src/hooks/magic-context/tail-hygiene-walk.ts`: Single-walk tail hygiene measurement instrument (`{U, T}` baseline), tracking active vs protected mass and computing baseline deltas.
+- `src/hooks/magic-context/ctx-reduce-nudge.ts`: Evaluate Channel 1 and Channel 2 nudges over the tail hygiene baseline with hygiene ratio bands (0.20/0.40/0.60 for Channel 1, 0.75 for Channel 2).
+- `src/hooks/magic-context/channel2-delivery.ts`: Coordinate CAS-leased synthetic user message delivery for Channel 2 nudges.
+- `src/features/magic-context/reclaim-protection.ts`: Protect the newest `K=3` `ctx_reduce` tool exemplars across supersession, age-based, and emergency drop reclaim lanes.
 - `src/hooks/magic-context/hook-handlers.ts`: Prompt hook event handlers, provider-aware reasoning-variant flushes, and tool execution lifecycle hooks.
 - `src/hooks/magic-context/edit-marker.ts`: Implement `edit_marker` mode to compress superseded edits, keeping the `filePath` and a region-hint prefix while dropping the bulky output content.
 - `src/hooks/magic-context/module-transport.ts`: Send live Rust transform, authority, and tool requests over the subc protocol using `SubcClient` and `RouteHandle`, with bounded serialized request handling.
@@ -161,21 +168,26 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/features/magic-context/storage-clone.ts`: Implement transaction-locked session state copy helpers for clone forks.
 - `src/features/magic-context/storage-schema-helpers.ts`: Implement schema-mutation and NULL-healing helpers to avoid dependency cycles between database creation and migrations.
 - `src/features/magic-context/storage-meta-persisted.ts`: Read and write per-session persisted scalars and JSON blobs.
-- `src/features/magic-context/fail-closed-block.ts`: Implement loud fail-closed blocking when Magic Context cannot operate on a session.
+- `src/features/magic-context/fail-closed-block.ts`: Implement loud fail-closed blocking when Magic Context cannot operate on a session, classifying active blocking processes across server, CLI/TUI, and Pi process kinds.
 - `src/features/magic-context/schema-fence-probe.ts`: Probe schema version fence for child session spawns.
 - `src/hooks/magic-context/compaction-off-transition.ts`: Reconcile per-session compaction mode records and process off/on mode transitions.
 - `src/hooks/magic-context/child-session-spawn.ts`: Enforce child session spawn choke point with schema fence validation.
 - `src/shared/escalation-bands.ts`: Derive context limit escalation bands and threshold bounds.
-- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v74 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
+- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v78 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
 - `src/features/magic-context/message-index.ts`: FTS-backed raw-message index for `ctx_search`.
 - `src/features/magic-context/search.ts`: Unified retrieval over memories, raw messages, git commits, and session/smart notes.
 - `src/features/magic-context/session-project-storage.ts`: Persist session-to-project bindings and repair mis-scoped compartment chunk embeddings.
 - `src/features/magic-context/session-project-backfill.ts`: Run the background session-project backfill task (gated on the plugin enabled state).
 - `src/features/magic-context/smart-notes/sandbox-runner.ts`: Run smart-note JS check expressions within a serialized process-wide QuickJS WASM sandbox.
+- `src/features/magic-context/smart-notes/wake-plane.ts`: Discover fleet scheduled-wake plane capability (`wake.create`) via subc catalog probes and gate standalone smart-note condition evaluation.
 - `src/shared/commit-detection.ts`: Unified git commit hash and verb detection logic, shared across the historian trigger and note-nudge detectors.
 - `src/shared/harness-provider-map.ts`: Translate provider prefixes between canonical (OpenCode) and Pi configuration models.
+- `src/shared/window-geometry.ts`: Derives usable soft/hard context windows and reserve geometry across providers and harnesses, honoring user-configured `output_reserve` overrides.
+- `src/shared/models-dev-cache.ts`: Cache and resolve models.dev metadata and SDK window geometry.
 - `src/shared/exit-abort-registry.ts`: Provide a process-wide coordinator to abort active controllers without exceeding listener caps.
 - `packages/pi-plugin/src/context-handler.ts`: Core context transform and hook handler for the Pi plugin.
+- `packages/pi-plugin/src/tail-hygiene-walk-pi.ts`: Single-walk tail hygiene measurement and delta tracking for Pi sessions.
+- `packages/pi-plugin/src/ctx-reduce-nudge-pi.ts`: Evaluate Channel 1 and Channel 2 nudges for Pi sessions, queuing Channel 2 via `deliverAs: "nextTurn"`.
 - `packages/pi-plugin/src/clone-inheritance.ts`: Intercept Pi `session_start` fork events and inherit filtered session compartments, tags, and markers.
 - `packages/pi-plugin/src/subagent-runner.ts`: Win32/POSIX-safe subagent executor with command-line length cap mitigations.
 - `packages/pi-plugin/src/commands/ctx-wrapup.ts`: Implement the `/ctx-wrapup` command and orchestrator for Pi sessions.
@@ -188,12 +200,14 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/session_resolver.rs`: Resolves incoming MCP facade requests to their backing project and session.
 - `crates/mc-module/src/lib.rs`: Route subc client requests, implement MCP tool facade routing (supporting `agent_drops.append` queue drops with server-side range parsing and command-id idempotency checks), serve prompt guidance, manage durable pass tracing for transform passes, orchestrate `session.status`, `session.wrapup`, and `session.delete` operations (utilizing structured status fields, machine-readable dispositions, and process-local per-session latches under a `MAX_WRAPUP_REQUEST_BUDGET` deadline, with `session.delete` atomically removing session-owned rows from SQLite tables), track transform dispatch health metrics and heartbeat reporting, manage LRU-bounded `InFlight` snapshot caching, and coordinate bootstrap state imports using `StateImportCoordinator`.
 - `crates/mc-module/src/historian_producer.rs`: Implement the Rust subc historian producer client using the wire v2 protocol with `OpenedRoute` targeting (channel and epoch routing).
-- `crates/mc-store/src/lib.rs`: Define durable session schemas and migrations (including the `mc_reduce_command_ledger` table in migration 16 for idempotency), handle metadata, and run CAS transitions.
+- `crates/mc-store/src/lib.rs`: Define durable session schemas and migrations (including the `mc_reduce_command_ledger` table in migration 16 for idempotency, `mc_project_mural_artifacts` in migration 49 for project mural artifacts, and `raw_messages_deflate` in migration 50 on `mc_chunk_transcripts` for durable `ctx_expand` recovery), handle metadata, and run CAS transitions.
 - `crates/mc-module/src/codec/`: Decode harness-specific JSON messages (OpenCode, Pi) into canonical `CkIngressMessage` values and encode them back using harness model codecs.
 - `crates/mc-module/src/caveman.rs`: Age-tier caveman text compression ported to Rust.
 - `crates/mc-module/src/divergence.rs`: Per-pass transform output divergence tracking and attribution.
+- `crates/mc-module/src/tail_hygiene.rs`: Implements tail hygiene ratio calculation, band classification (Quiet, Gentle, Firm, Urgent, Channel2), and exclusion logic in Rust.
 - `crates/mc-module/src/healing.rs`: Define serializer healing profiles and gate tail mutations for verbatim-tail consumers to prevent phantom reclaims.
 - `crates/mc-module/src/selection.rs`: Implement tail-reduction selection to decide which tail items to reduce and produce their `ReductionDecision`s.
+- `crates/mc-module/src/retained_size.rs`: Calculate allocator-oriented retained-size estimates for memory-budgeted module holders.
 - `crates/mc-module/src/differential_goldens.rs`: Validate in-process Rust transform outputs against TS-generated wire fixtures (DG-1..3 goldens).
 
 **Tests:** Co-locate tests with source as `src/**/*.test.ts`, for example `src/hooks/magic-context/hook.test.ts`, `src/tools/ctx-memory/tools.test.ts`, and `src/features/magic-context/migrations-v11.test.ts`. End-to-end coverage lives in the separate `packages/e2e-tests/` workspace.

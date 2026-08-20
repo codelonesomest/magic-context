@@ -1,4 +1,5 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
+
 import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import { getLastIndexedOrdinal } from "../../features/magic-context/message-index";
 import {
@@ -6,6 +7,7 @@ import {
     conditionCompileReplySuffix,
     conditionCompileStorageFields,
 } from "../../features/magic-context/smart-notes/condition-compiler";
+import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
 import {
     addNote,
     dismissNote,
@@ -176,13 +178,25 @@ function buildReadSections(args: {
     return sections;
 }
 
-function moduleNoteText(response: unknown): string | null {
+function noteAuthorityRefusal(args: CtxNoteArgs, action: RustNoteToolRequest["action"]): string {
+    const readiness = "Rust notes authority is not ready.";
+    if ((action === "write" || action === "update") && typeof args.content === "string") {
+        return `Error: ${readiness} Write REFUSED and NOT saved; RESEND after authority is ready.\nContent to resend:\n${args.content}`;
+    }
+    return `Error: ${readiness} Request REFUSED and NOT applied; RESEND after authority is ready.`;
+}
+
+function moduleNoteText(
+    response: unknown,
+    args: CtxNoteArgs,
+    action: RustNoteToolRequest["action"],
+): string | null {
     let value = response;
     if (value !== null && typeof value === "object" && "result" in value) {
         value = (value as { result?: unknown }).result;
     }
     if (isRustAuthorityDrainingError(value)) {
-        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+        return noteAuthorityRefusal(args, action);
     }
     if (typeof value === "string") return value;
     if (value !== null && typeof value === "object") {
@@ -275,6 +289,11 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             // optional param (content:"" for a read), so a bare `typeof === "string"`
             // check would mis-infer `write` and then reject the empty content.
             const action = args.action ?? (args.content?.trim() ? "write" : "read");
+            const wakePlaneActive =
+                action === "write" &&
+                Boolean(args.surface_condition?.trim()) &&
+                (await wakePlaneStatus()) === "present";
+            const surfaceCondition = wakePlaneActive ? undefined : args.surface_condition?.trim();
 
             // Resolve the session's actual project from `toolContext.directory`
             // each call. OpenCode's top-level `ctx.directory` (the launch dir)
@@ -304,7 +323,6 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 if (!rustNote || !projectIdentity) {
                     return "Error: Rust notes authority is active, but this module transport does not support ctx_note.";
                 }
-                const surfaceCondition = args.surface_condition?.trim();
                 let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
                 if ((action === "write" || action === "update") && surfaceCondition) {
                     if (
@@ -333,23 +351,25 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     noteId: args.note_id,
                 };
                 try {
-                    const text = moduleNoteText(await rustNote(request));
+                    const text = moduleNoteText(await rustNote(request), args, action);
                     if (text === null) {
                         return "Error: Rust module returned an invalid ctx_note response.";
                     }
-                    if (compilation && !text.startsWith("Error:")) {
-                        return text + conditionCompileReplySuffix(compilation);
+                    if (text.startsWith("Error:")) return text;
+                    if (wakePlaneActive) {
+                        return `${text}\nwake plane active — create a scheduled wake instead; stored as a plain note.`;
                     }
+                    if (compilation) return text + conditionCompileReplySuffix(compilation);
                     return text;
                 } catch (error) {
                     if (isRustAuthorityDrainingError(error)) {
-                        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                        return noteAuthorityRefusal(args, action);
                     }
                     return `Error: Rust module ctx_note failed. ${error instanceof Error ? error.message : String(error)}`;
                 }
             }
             if (marker || notesAuthority === "PREPARING" || notesAuthority === "DRAINING") {
-                return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                return noteAuthorityRefusal(args, action);
             }
 
             if (action === "write") {
@@ -367,25 +387,33 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
 
                 // Smart note — project-scoped with condition evaluation by dreamer
                 if (args.surface_condition?.trim()) {
+                    if (wakePlaneActive) {
+                        const note = addNote(deps.db, "session", {
+                            sessionId,
+                            content,
+                            anchorOrdinal,
+                        });
+                        return `Saved session note #${note.id}.\nwake plane active — create a scheduled wake instead; stored as a plain note.`;
+                    }
                     if (!deps.dreamerEnabled) {
                         return "Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.";
                     }
                     if (!projectIdentity) {
                         return "Error: Could not resolve project identity for smart note.";
                     }
-                    const surfaceCondition = args.surface_condition.trim();
-                    const compilation = await compileSurfaceCondition(surfaceCondition, {
+                    const smartSurfaceCondition = args.surface_condition.trim();
+                    const compilation = await compileSurfaceCondition(smartSurfaceCondition, {
                         projectPath: toolContext.directory,
                     });
                     const note = addNote(deps.db, "smart", {
                         content,
                         projectPath: projectIdentity,
                         sessionId,
-                        surfaceCondition,
+                        surfaceCondition: smartSurfaceCondition,
                         anchorOrdinal,
                         ...conditionCompileStorageFields(compilation),
                     });
-                    return `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${surfaceCondition}${conditionCompileReplySuffix(compilation)}`;
+                    return `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${smartSurfaceCondition}${conditionCompileReplySuffix(compilation)}`;
                 }
 
                 // Simple session note

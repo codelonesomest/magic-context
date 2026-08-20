@@ -12,8 +12,10 @@ import { getNotes } from "@magic-context/core/features/magic-context/storage-not
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
 import { describeError } from "@magic-context/core/shared/error-message";
+import { resolveTailHygieneStatus } from "@magic-context/core/shared/tail-hygiene-status";
+import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { showStatusDialog } from "../dialogs/status-dialog";
-import { resolvePiUsableContextLimit } from "../pi-context-limit";
+import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
 export interface RegisterCtxStatusDeps {
@@ -112,11 +114,15 @@ export function registerCtxStatusCommand(
 				} catch {
 					// Status remains available when overflow metadata cannot be read.
 				}
-				const usableContextLimit = resolvePiUsableContextLimit({
+				const meta = getOrCreateSessionMeta(currentDeps.db, sessionId);
+				const windowGeometry = resolvePiWindowGeometry({
 					rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
 					model: ctx.model,
 					detectedContextLimit,
+					persistedInputTokens: meta.lastInputTokens,
+					persistedPercentage: meta.lastContextPercentage,
 				});
+				const usableContextLimit = windowGeometry?.usableSoft;
 				const statusText = executeStatus(
 					currentDeps.db,
 					sessionId,
@@ -134,6 +140,8 @@ export function registerCtxStatusCommand(
 							CANONICAL_DREAM_TASKS,
 						),
 					},
+					windowGeometry,
+					resolveTailHygieneStatus(getPiChannel1Baseline(sessionId)),
 				);
 				const details = buildStatusDetails(currentDeps, sessionId);
 				sendCtxStatusMessage(

@@ -4,12 +4,43 @@ import {
     loadPersistedUsage,
 } from "../../features/magic-context/storage-meta-persisted";
 import { escalationBands, MAX_EXECUTE_THRESHOLD } from "../../shared/escalation-bands";
+import { modelRefLookupOrder, piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
-import { getSdkContextLimit, isSaneLimit } from "../../shared/models-dev-cache";
+import {
+    getSdkContextLimit,
+    getSdkWindowGeometry,
+    isSaneLimit,
+} from "../../shared/models-dev-cache";
 import { resolveModelConfigOrDefault } from "../../shared/prompt-surface";
 
 export { escalationBands, MAX_EXECUTE_THRESHOLD };
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
+
+export function resolveContextWindowGeometry(
+    providerID: string | undefined,
+    modelID: string | undefined,
+    ctx?: { db?: ContextDatabase; sessionID?: string },
+) {
+    if (!providerID || !modelID) return undefined;
+    const modelKey = resolveModelKey(providerID, modelID);
+    let detected: number | undefined;
+    let detectedLimitProvenance: "prompt_only" | "combined" | "unknown" = "unknown";
+    if (ctx?.db && ctx.sessionID) {
+        try {
+            const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
+            if (overflow.detectedContextLimit > 0) {
+                detected = overflow.detectedContextLimit;
+                detectedLimitProvenance = overflow.detectedContextLimitProvenance;
+            }
+        } catch {
+            // Geometry resolution remains best-effort when session metadata is unavailable.
+        }
+    }
+    return getSdkWindowGeometry(providerID, modelID, detected, {
+        detectedLimitProvenance,
+        harness: "opencode",
+    });
+}
 
 type CacheTtlConfig = string | Record<string, string>;
 
@@ -112,7 +143,9 @@ export function resolveTrustedContextLimit(
         try {
             const persisted = loadPersistedUsage(ctx.db, ctx.sessionID);
             if (
-                persisted?.lastObservedModelKey === modelKey &&
+                persisted !== null &&
+                piModelRefToCanonical(persisted.lastObservedModelKey ?? "") ===
+                    piModelRefToCanonical(modelKey) &&
                 isSaneLimit(persisted.lastUsageContextLimit)
             ) {
                 return persisted.lastUsageContextLimit;
@@ -208,11 +241,14 @@ function isFinitePositive(v: unknown): v is number {
  */
 function* modelKeyLookupOrder(modelKey: string): Generator<string> {
     const slash = modelKey.indexOf("/");
-    const provider = slash >= 0 ? modelKey.slice(0, slash) : "";
+    const providerRefs = slash >= 0 ? modelRefLookupOrder(modelKey) : [];
     let modelId = slash >= 0 ? modelKey.slice(slash + 1) : modelKey;
 
     while (modelId.length > 0) {
-        if (provider) yield `${provider}/${modelId}`;
+        for (const providerRef of providerRefs) {
+            const providerSlash = providerRef.indexOf("/");
+            yield `${providerRef.slice(0, providerSlash)}/${modelId}`;
+        }
         yield modelId;
         const lastDash = modelId.lastIndexOf("-");
         if (lastDash <= 0) break;
@@ -389,7 +425,7 @@ export function resolveModelKey(
         return undefined;
     }
 
-    return `${providerID}/${modelID}`;
+    return piModelRefToCanonical(`${providerID}/${modelID}`);
 }
 
 export function resolveSessionId(

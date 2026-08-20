@@ -180,6 +180,33 @@ describe("event-resolvers", () => {
                 closeQuietly(db);
             }
         });
+        it("trusts a legacy native-spelling usage key for its canonical model", () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-usage-limit-native-alias";
+            try {
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 10,
+                    lastInputTokens: 100_000,
+                    lastUsageContextLimit: 1_048_576,
+                    lastObservedModelKey: "openai/gpt-alias-test",
+                });
+                // Simulate a legacy session row whose model key uses the old provider prefix.
+                db.prepare(
+                    "UPDATE session_meta SET last_observed_model_key = ? WHERE session_id = ?",
+                ).run("openai-codex/gpt-alias-test", sessionId);
+
+                expect(
+                    resolveTrustedContextLimit("openai", "gpt-alias-test", {
+                        db,
+                        sessionID: sessionId,
+                    }),
+                ).toBe(1_048_576);
+            } finally {
+                closeQuietly(db);
+            }
+        });
     });
 
     describe("resolveCacheTtl", () => {
@@ -189,6 +216,15 @@ describe("event-resolvers", () => {
 
             //#then
             expect(ttl).toBe("5m");
+        });
+
+        it("accepts Pi-native keys when the runtime model key is canonical", () => {
+            expect(
+                resolveCacheTtl(
+                    { default: "5m", "openai-codex/gpt-5.6-sol": "60m" },
+                    "openai/gpt-5.6-sol",
+                ),
+            ).toBe("60m");
         });
 
         it("resolves provider/model and bare-model overrides", () => {
@@ -220,6 +256,27 @@ describe("event-resolvers", () => {
             expect(
                 resolveExecuteThreshold({ default: 95, "openai/gpt-4o": 90 }, "openai/gpt-4o", 65),
             ).toBe(90);
+        });
+
+        it("accepts Pi-native threshold keys and keeps canonical precedence", () => {
+            expect(
+                resolveExecuteThreshold(
+                    { default: 65, "openai-codex/gpt-5.6-sol": 40 },
+                    "openai/gpt-5.6-sol",
+                    65,
+                ),
+            ).toBe(40);
+            expect(
+                resolveExecuteThreshold(
+                    {
+                        default: 65,
+                        "openai-codex/gpt-5.6-sol": 40,
+                        "openai/gpt-5.6-sol": 30,
+                    },
+                    "openai-codex/gpt-5.6-sol",
+                    65,
+                ),
+            ).toBe(30);
         });
 
         it("prefers exact provider/model key when present", () => {
@@ -610,8 +667,9 @@ describe("event-resolvers", () => {
     });
 
     describe("resolveModelKey", () => {
-        it("returns provider/model when both parts exist", () => {
+        it("returns the canonical provider/model key when both parts exist", () => {
             expect(resolveModelKey("openai", "gpt-4o")).toBe("openai/gpt-4o");
+            expect(resolveModelKey("openai-codex", "gpt-5.6-sol")).toBe("openai/gpt-5.6-sol");
         });
 
         it("returns undefined when either part is missing", () => {

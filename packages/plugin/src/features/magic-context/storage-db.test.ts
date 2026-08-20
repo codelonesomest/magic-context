@@ -31,6 +31,8 @@ import {
     closeDatabase,
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
+    formatInconclusiveOpenCodeMigrationWarning,
+    formatLiveProcessMigrationRefusal,
     getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
     getPersistedSchemaVersion,
@@ -439,6 +441,78 @@ describe("storage-db", () => {
             expect(getMigrationOnOpenRefusal()).toBeNull();
         });
 
+        for (const scenario of [
+            {
+                name: "a confirmed live OpenCode server",
+                pid: () => process.pid,
+                configure: () => setLinuxIdentityProbe(),
+                blocksMigration: true,
+            },
+            {
+                name: "a dead OpenCode server PID",
+                pid: () => 2_147_483_647,
+                configure: () => undefined,
+                blocksMigration: false,
+            },
+            {
+                name: "an OpenCode server probe that sandbox policy prevents from running",
+                pid: () => process.pid,
+                configure: () => {
+                    const permissionDenied = new Error(
+                        "sandbox denied process probe",
+                    ) as NodeJS.ErrnoException;
+                    permissionDenied.code = "EPERM";
+                    __setRpcIdentityTestHooks({
+                        platform: "linux",
+                        processKill: (() => {
+                            throw permissionDenied;
+                        }) as typeof process.kill,
+                        readFileSync: (() => {
+                            throw permissionDenied;
+                        }) as typeof readFileSync,
+                    });
+                },
+                blocksMigration: false,
+            },
+        ]) {
+            it(`#when RPC discovery finds ${scenario.name} #then only the confirmed server blocks migration`, () => {
+                const dataHome = useTempDataHome("storage-db-rpc-probe-matrix-");
+                const dbPath = seedPendingMigration(dataHome);
+                const portDir = join(dirname(dbPath), "rpc", "test-project");
+                mkdirSync(portDir, { recursive: true });
+                const pid = scenario.pid();
+                writeFileSync(
+                    join(portDir, `port-${pid}.json`),
+                    JSON.stringify({ port: 43123, pid, started_at: 1_200_000 }),
+                );
+                scenario.configure();
+
+                const opened = openDatabase();
+
+                expect(opened === null).toBe(scenario.blocksMigration);
+                expect(readPersistedVersion(dbPath)).toBe(
+                    scenario.blocksMigration
+                        ? LATEST_SUPPORTED_VERSION - 1
+                        : LATEST_SUPPORTED_VERSION,
+                );
+                if (!scenario.blocksMigration && pid === process.pid) {
+                    expect(inspectRpcServerDiscovery(dirname(dbPath))).toMatchObject({
+                        state: "inconclusive",
+                        serverPids: [],
+                        inconclusivePids: [process.pid],
+                    });
+                    // Sandbox uncertainty must not look like a real multi-instance
+                    // refusal: users need to know that migration continued safely.
+                    expect(
+                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
+                    ).toContain("continuing migration");
+                    expect(
+                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
+                    ).toContain("OS sandbox denied kill(0) or ps");
+                }
+            });
+        }
+
         it("#when an older Pi harness is live #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-pi-migration-");
             const dbPath = seedPendingMigration(dataHome);
@@ -452,11 +526,97 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [41001],
+                blockingProcesses: [{ kind: "Pi", pid: 41001 }],
             });
             expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { harness: "Pi harness", pid: 41001 },
+                { kind: "Pi", pid: 41001 },
             ]);
+            expect(
+                formatLiveProcessMigrationRefusal(
+                    dbPath,
+                    LATEST_SUPPORTED_VERSION - 1,
+                    LATEST_SUPPORTED_VERSION,
+                    [],
+                    [41001],
+                ),
+            ).toContain("confirmed Pi harness PID 41001");
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when an unrelated Pi harness is live #then opens a fresh explicit-path database", () => {
+            const isolatedRoot = makeTempDir("storage-db-isolated-live-pi-");
+            const dbPath = join(isolatedRoot, "profile", "context.db");
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
+            });
+
+            expect(openDatabase(dbPath)).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
+        it("#when an unrelated Pi harness is live #then opens a test-data-dir database", () => {
+            const savedXdg = process.env.XDG_DATA_HOME;
+            const savedTestDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+            const isolatedRoot = makeTempDir("storage-db-test-data-dir-live-pi-");
+            const dbPath = join(isolatedRoot, "cortexkit", "magic-context", "context.db");
+            mkdirSync(dirname(dbPath), { recursive: true });
+            closeQuietly(new Database(dbPath));
+            delete process.env.XDG_DATA_HOME;
+            process.env.MAGIC_CONTEXT_TEST_DATA_DIR = isolatedRoot;
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
+            });
+
+            try {
+                const db = openDatabase();
+                expect(db).not.toBeNull();
+                expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+                expect(getMigrationOnOpenRefusal()).toBeNull();
+            } finally {
+                if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = savedXdg;
+                if (savedTestDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+                else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
+            }
+        });
+
+        it("#when an explicit-path database has same-directory live RPC evidence #then refuses migration", () => {
+            const isolatedRoot = makeTempDir("storage-db-isolated-same-dir-rpc-");
+            const dbPath = join(isolatedRoot, "profile", "context.db");
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            writeFileSync(
+                join(portDir, `port-${process.pid}.json`),
+                JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
+            );
+            setLinuxIdentityProbe();
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toMatchObject({
+                persistedVersion: 0,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+                serverPids: [process.pid],
+            });
+            expect(readPersistedVersion(dbPath)).toBe(0);
+        });
+
+        it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-inconclusive-pi-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() => {
+                    const error = new Error("sandbox denied ps") as NodeJS.ErrnoException;
+                    error.code = "EPERM";
+                    throw error;
+                }) as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
         });
 
         it("#when every advertised PID is stale #then deletes stale files and allows migration", () => {
@@ -490,6 +650,7 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [],
+                blockingProcesses: [],
                 unreadableFile: portFile,
                 unreadableArm: "parse",
             });
@@ -694,6 +855,37 @@ describe("storage-db", () => {
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
+        it("#when a discovery record provides a process kind #then it takes precedence over command probes", () => {
+            const dataHome = useTempDataHome("storage-db-record-kind-migration-");
+            const dbPath = resolveDbPath(dataHome);
+            mkdirSync(dirname(dbPath), { recursive: true });
+            const legacy = new Database(dbPath);
+            legacy.exec(`
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
+                INSERT INTO schema_migrations(version) VALUES (${FORK_MIGRATION_VERSION_FLOOR});
+            `);
+            legacy.close();
+
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            writeFileSync(
+                join(portDir, `port-${process.pid}.json`),
+                JSON.stringify({
+                    port: 43123,
+                    pid: process.pid,
+                    started_at: 1_200_000,
+                    kind: "Pi",
+                }),
+            );
+            setLinuxIdentityProbe();
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()?.blockingProcesses).toEqual([
+                { kind: "Pi", pid: process.pid },
+            ]);
+        });
+
         it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-server-migration-");
             const dbPath = resolveDbPath(dataHome);
@@ -742,9 +934,10 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [process.pid],
+                blockingProcesses: [{ kind: "process", pid: process.pid }],
             });
             expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { harness: "OpenCode server", pid: process.pid },
+                { kind: "process", pid: process.pid },
             ]);
             const unchanged = new Database(dbPath);
             expect(getPersistedSchemaVersion(unchanged)).toBe(LATEST_SUPPORTED_VERSION - 1);

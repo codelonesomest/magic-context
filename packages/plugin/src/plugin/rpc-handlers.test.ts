@@ -71,6 +71,11 @@ describe("buildStatusDetail — storage version probe", () => {
                 context_db_schema_version: LATEST_SUPPORTED_VERSION,
                 plugin_supported_version: LATEST_SUPPORTED_VERSION,
             });
+            expect(detail.loggerDiagnostics).toEqual({
+                swallowedWriteCount: 0,
+                lastErrorMessage: null,
+                lastErrorTime: null,
+            });
         } finally {
             closeQuietly(db);
         }
@@ -94,6 +99,81 @@ describe("buildSidebarSnapshot — stale build error state", () => {
             expect(snapshot.lastTransformError).toBe(
                 "Magic Context: plugin build is older than its database — restart OpenCode",
             );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildSidebarSnapshot — persisted tail hygiene", () => {
+    test("preserves zero-valued TypeScript baseline fields in the RPC payload", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-hygiene-zero";
+            const live = createLiveSessionState();
+            live.channel1StateBySession.set(sessionId, {
+                baselineU: 0,
+                baselineT: 0,
+                turnDeltaU: 0,
+                turnDeltaT: 0,
+                baselineGeneration: 0,
+                computedAt: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineParts: [],
+                contentSignature: "empty",
+                reducedSinceRefresh: false,
+                oldestReclaimableToolTags: [],
+            });
+
+            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), live);
+
+            expect(snapshot.tailHygiene).toEqual({
+                u: 0,
+                t: 0,
+                severity: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineGeneration: 0,
+                computedAt: 0,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("prefers the durable Rust baseline when module authority is active", () => {
+        const db = createTestDb();
+        try {
+            const snapshot = buildSidebarSnapshot(
+                db,
+                "ses-hygiene-rust",
+                process.cwd(),
+                createLiveSessionState(),
+                undefined,
+                undefined,
+                {
+                    tail_hygiene: {
+                        u: 65_100,
+                        t: 100_000,
+                        severity: 0.651,
+                        evaluable: true,
+                        generation_invalidated: false,
+                        baseline_generation: 7,
+                        computed_at_ms: 123,
+                    },
+                },
+            );
+
+            expect(snapshot.tailHygiene).toEqual({
+                u: 65_100,
+                t: 100_000,
+                severity: 0.651,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineGeneration: 7,
+                computedAt: 123,
+            });
         } finally {
             closeQuietly(db);
         }
