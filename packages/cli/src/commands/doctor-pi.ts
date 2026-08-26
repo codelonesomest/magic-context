@@ -8,6 +8,7 @@ import {
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
+import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
@@ -39,8 +40,14 @@ import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    formatLocalEmbeddingRuntimeWasmFallback,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
+import {
+    formatGithubIssueFallback,
+    type GhCommandResult,
+    submitGithubIssue,
+} from "../lib/github-issue";
 import { bundleIssueReport } from "../lib/logs-pi";
 import {
     getMagicContextLogPath,
@@ -218,7 +225,7 @@ function printResult(prompts: PromptIO, result: CheckResult): void {
     if (result.status === "pass") prompts.log.success(line);
     else if (result.status === "info") prompts.log.info(line);
     else if (result.status === "warn") prompts.log.warn(line);
-    else console.error(line);
+    else prompts.log.error(line);
 }
 
 function summarize(results: CheckResult[]): Pick<HealthReport, "pass" | "warn" | "fail"> {
@@ -237,6 +244,26 @@ function readJsonc(path: string): {
         return {
             value: parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>,
         };
+    } catch (error) {
+        return {
+            value: {},
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
+function readMagicContextJsonc(
+    path: string,
+    tier: "user" | "project",
+): {
+    value: Record<string, unknown>;
+    error?: string;
+} {
+    try {
+        const raw = loadRawConfigFile({ configPath: path, tier });
+        if (!raw)
+            return { value: {}, error: "config file disappeared while doctor was reading it" };
+        return { value: parseJsonc(raw.text) as Record<string, unknown> };
     } catch (error) {
         return {
             value: {},
@@ -288,13 +315,17 @@ function readConfigForEmbedding(
 ): Record<string, unknown> | null {
     if (!existsSync(path)) return null;
     try {
-        const rawText = readFileSync(path, "utf-8");
+        const raw = loadRawConfigFile({
+            configPath: path,
+            tier: isProjectConfig ? "project" : "user",
+        });
+        if (!raw) return null;
         // SECURITY: project-level config must NOT expand {env:}/{file:} tokens —
         // a malicious repo could otherwise resolve {env:ANTHROPIC_API_KEY} into a
         // field we then send to a repo-chosen endpoint. Mirror the runtime loader
         // (isProjectConfig leaves tokens literal for project config).
         const substituted = substituteConfigVariables({
-            text: rawText,
+            text: raw.text,
             configPath: path,
             isProjectConfig,
         });
@@ -540,7 +571,7 @@ async function runHealthChecks(options: {
             }
             continue;
         }
-        const parsed = readJsonc(path);
+        const parsed = readMagicContextJsonc(path, label);
         if (parsed.error)
             add(results, "fail", `${label} magic-context.jsonc is invalid JSONC: ${parsed.error}`);
         else add(results, "pass", `${label} magic-context.jsonc is valid JSONC: ${path}`);
@@ -564,8 +595,18 @@ async function runHealthChecks(options: {
     // known to apply bad default reasoning_effort values (currently GitHub Copilot).
     // Without an explicit `thinking_level`, Pi leaves the level unset and Copilot
     // injects "minimal" — which it then rejects with a 400 error.
-    const historianModel = loadedConfig.config.historian?.model?.trim() ?? "";
-    const historianThinkingLevel = loadedConfig.config.historian?.thinking_level;
+    // Per-harness config shape: Pi's historian model resolution reads only the
+    // pi harness block, so the Copilot check must look there too. Entries may be
+    // strings or { model, thinking_level } objects.
+    const piHistorian = loadedConfig.config.historian?.pi;
+    const piHistorianEntry = piHistorian?.model;
+    const historianModel = (
+        typeof piHistorianEntry === "string" ? piHistorianEntry : (piHistorianEntry?.model ?? "")
+    ).trim();
+    const historianThinkingLevel =
+        (typeof piHistorianEntry === "object" && piHistorianEntry !== null
+            ? piHistorianEntry.thinking_level
+            : undefined) ?? piHistorian?.thinking_level;
     if (historianModel.startsWith("github-copilot/") && !historianThinkingLevel) {
         add(
             results,
@@ -743,8 +784,13 @@ async function runHealthChecks(options: {
                 add(
                     results,
                     "pass",
-                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime present)`,
+                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime OK)`,
                 );
+                runtimeReported = true;
+                break;
+            }
+            if (runtime.state === "wasm-fallback") {
+                add(results, "warn", formatLocalEmbeddingRuntimeWasmFallback(runtime));
                 runtimeReported = true;
                 break;
             }
@@ -929,17 +975,32 @@ function repair(plan: RepairPlan, prompts: PromptIO): number {
     return fixed;
 }
 
-function ghAvailableAndAuthed(deps: DoctorDeps): boolean {
+function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
+    if (args[0] === "issue") {
+        const result = deps.spawnSync("gh", args, {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        return {
+            status: result.status,
+            stdout: String(result.stdout ?? ""),
+            stderr: String(result.stderr ?? ""),
+        };
+    }
+
     try {
-        deps.execFileSync("gh", ["--version"], {
-            stdio: ["ignore", "pipe", "ignore"],
+        const output = deps.execFileSync("gh", args, {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "pipe"],
         });
-        deps.execFileSync("gh", ["auth", "status"], {
-            stdio: ["ignore", "pipe", "ignore"],
-        });
-        return true;
-    } catch {
-        return false;
+        return { status: 0, stdout: String(output ?? ""), stderr: "" };
+    } catch (error) {
+        const result = error as { status?: number; stdout?: unknown; stderr?: unknown };
+        return {
+            status: typeof result.status === "number" ? result.status : 1,
+            stdout: String(result.stdout ?? ""),
+            stderr: String(result.stderr ?? ""),
+        };
     }
 }
 
@@ -988,44 +1049,38 @@ async function runIssueFlow(options: {
             now: options.deps.now(),
             sessionFilter,
         });
-        spinner.stop(`Report written to ${bundled.path}`);
+        spinner.stop(
+            bundled.fullPath
+                ? `Report written to ${bundled.path}; full bundle at ${bundled.fullPath}`
+                : `Report written to ${bundled.path}`,
+        );
 
-        if (ghAvailableAndAuthed(options.deps)) {
-            const shouldSubmit = await options.prompts.confirm(
-                "Submit this issue on GitHub now?",
-                false,
+        const shouldSubmit = await options.prompts.confirm(
+            "Submit this issue on GitHub now?",
+            false,
+        );
+        if (shouldSubmit) {
+            const result = submitGithubIssue(`[pi] ${title}`, bundled.path, (args) =>
+                runGhCommandWithDeps(options.deps, args),
             );
-            if (shouldSubmit) {
-                const result = options.deps.spawnSync(
-                    "gh",
-                    [
-                        "issue",
-                        "create",
-                        "-R",
-                        "cortexkit/magic-context",
-                        "--title",
-                        `[pi] ${title}`,
-                        "--body-file",
-                        bundled.path,
-                    ],
-                    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
-                );
-                if (result.status === 0) {
-                    options.prompts.log.success(String(result.stdout).trim());
-                    options.prompts.outro("Issue submitted — thanks for the report!");
-                    return 0;
+            if (result.ok) {
+                options.prompts.log.success(result.output);
+                if (bundled.fullPath) {
+                    options.prompts.log.info(
+                        `Full diagnostics bundle available to drag onto the issue: ${bundled.fullPath}`,
+                    );
                 }
-                options.prompts.log.warn(String(result.stderr).trim() || "gh issue create failed");
+                options.prompts.outro("Issue submitted — thanks for the report!");
+                return 0;
             }
-        } else {
             options.prompts.log.warn(
-                "gh CLI is unavailable or not authenticated; printing report for manual issue creation",
+                formatGithubIssueFallback(result, bundled.fullPath ?? bundled.path),
             );
         }
 
         console.log(bundled.bodyMarkdown);
         options.prompts.log.info(
-            `Open https://github.com/cortexkit/magic-context/issues/new and attach ${bundled.path}`,
+            `Open https://github.com/cortexkit/magic-context/issues/new and drag ${bundled.fullPath ?? bundled.path} into the issue`,
         );
         options.prompts.outro("Issue report ready");
         return 0;

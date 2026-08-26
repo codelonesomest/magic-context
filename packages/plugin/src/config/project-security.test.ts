@@ -7,6 +7,23 @@ import {
 } from "./project-security";
 
 describe("stripUnsafeProjectConfigFields", () => {
+    it("strips profile definitions from project config but leaves profile selection", () => {
+        const raw: Record<string, unknown> = {
+            profile: "work",
+            profiles: {
+                work: {
+                    historian: { opencode: { model: "attacker/model" } },
+                },
+            },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.profile).toBe("work");
+        expect(raw.profiles).toBeUndefined();
+        expect(warnings.join("\n")).toContain("Ignoring profiles from project config");
+    });
+
     it("strips auto_update from project config", () => {
         const raw: Record<string, unknown> = { auto_update: false, dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);
@@ -175,15 +192,34 @@ describe("stripUnsafeProjectConfigFields", () => {
     it("strips historian model selection from project config but keeps safe tuning fields", () => {
         const raw: Record<string, unknown> = {
             historian: {
-                model: "repo-model",
-                fallback_models: ["repo-fallback"],
+                model: "legacy/repo-model",
+                fallback_models: ["legacy/repo-fallback"],
+                opencode: {
+                    model: "opencode/repo-model",
+                    fallback_models: ["opencode/repo-fallback"],
+                    variant: "high",
+                },
+                pi: {
+                    model: "pi/repo-model",
+                    fallback_models: ["pi/repo-fallback"],
+                    thinking_level: "medium",
+                },
                 temperature: 0.2,
             },
         };
 
         const warnings = stripUnsafeProjectConfigFields(raw);
-        expect(raw.historian).toEqual({ temperature: 0.2 });
-        expect(warnings.some((w) => w.includes("historian.model/fallback_models"))).toBe(true);
+        expect(raw.historian).toEqual({
+            opencode: {},
+            pi: {},
+            temperature: 0.2,
+        });
+        const warning = warnings.join("\n");
+        expect(warning).toContain("historian.model");
+        expect(warning).toContain("historian.opencode.model");
+        expect(warning).toContain("historian.opencode.variant");
+        expect(warning).toContain("historian.pi.model");
+        expect(warning).toContain("historian.pi.thinking_level");
     });
 
     it("strips mural.model from project config but keeps the feature switch", () => {
@@ -237,7 +273,9 @@ describe("stripUnsafeProjectConfigFields", () => {
         const sidekick = raw.sidekick as Record<string, unknown>;
         expect(sidekick.permission).toBeUndefined();
 
-        expect(warnings.some((w) => w.includes("dreamer.prompt/permission/tools"))).toBe(true);
+        expect(warnings.some((w) => w.includes("dreamer.prompt"))).toBe(true);
+        expect(warnings.some((w) => w.includes("dreamer.permission"))).toBe(true);
+        expect(warnings.some((w) => w.includes("dreamer.tools"))).toBe(true);
         expect(warnings.some((w) => w.includes("historian.prompt"))).toBe(true);
         expect(warnings.some((w) => w.includes("sidekick.permission"))).toBe(true);
     });

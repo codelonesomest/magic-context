@@ -62,6 +62,7 @@ import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { log } from "./shared/logger";
+import { resolveHistorianModel, resolveOpenCodeAgentOverrides } from "./shared/model-resolution";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
 import { MagicContextRpcServer } from "./shared/rpc-server";
@@ -365,6 +366,7 @@ const server: Plugin = async (ctx) => {
             const timerRegistration = {
                 directory: ctx.directory,
                 projectIdentity: timerProjectIdentity,
+                harness: "opencode" as const,
                 client: ctx.client,
                 dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
                 language: pluginConfig.language,
@@ -372,6 +374,12 @@ const server: Plugin = async (ctx) => {
                 embeddingConfig: pluginConfig.embedding,
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
+                historianChildSweep: {
+                    timeoutMs: pluginConfig.historian_timeout_ms,
+                    fallbackModelCount: resolveHistorianModel(pluginConfig, "opencode").fallbacks
+                        .length,
+                    keepSubagents: pluginConfig.keep_subagents === true,
+                },
                 mural: pluginConfig.mural,
                 retinaHandoff: pluginConfig.smart_notes.retina_handoff,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
@@ -699,9 +707,8 @@ const server: Plugin = async (ctx) => {
                           const {
                               tasks: _tasks,
                               inject_docs: _injectDocs,
-                              thinking_level: _thinkingLevel,
                               ...agentOverrides
-                          } = pluginConfig.dreamer;
+                          } = resolveOpenCodeAgentOverrides(pluginConfig.dreamer);
                           return agentOverrides;
                       })()
                     : undefined;
@@ -728,9 +735,8 @@ const server: Plugin = async (ctx) => {
                           const {
                               two_pass: _twoPass,
                               disallowed_tools: _disallowedTools,
-                              thinking_level: _thinkingLevel,
                               ...agentOverrides
-                          } = pluginConfig.historian;
+                          } = resolveOpenCodeAgentOverrides(pluginConfig.historian);
                           return agentOverrides;
                       })()
                     : undefined;

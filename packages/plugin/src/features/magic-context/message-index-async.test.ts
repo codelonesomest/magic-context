@@ -66,6 +66,16 @@ function pagedReader(
     });
 }
 
+async function waitForCondition(condition: () => boolean, ceilingMs = 10_000): Promise<void> {
+    const start = Date.now();
+    while (!condition()) {
+        if (Date.now() - start > ceilingMs) {
+            throw new Error("waitForCondition ceiling exceeded");
+        }
+        await wait(10);
+    }
+}
+
 function wait(ms = 0): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -131,7 +141,11 @@ describe("message-index-async", () => {
             return messages;
         });
 
-        await wait(20);
+        // Poll for completion instead of a fixed wall-clock wait: the async
+        // reconciler's scheduling latency is unbounded under CI load, while the
+        // property under test (two schedules dedupe to ONE read) is load-independent
+        // once the work has actually run.
+        await waitForCondition(() => isSessionReconciled("ses-async"));
 
         expect(reads).toBe(1);
         expect(countRows(db, "ses-async")).toBe(1);
@@ -143,7 +157,10 @@ describe("message-index-async", () => {
         scheduleReconciliation(db, "ses-overlap", () => messages);
         scheduleIncrementalIndex(db, "ses-overlap", "m-1", () => messages[0] ?? null);
 
-        await wait(140);
+        await waitForCondition(() => countMessageRows(db, "ses-overlap", "m-1") >= 1);
+        // Settle briefly so a late double-insert would still be caught before the
+        // uniqueness assertion (the defect direction is MORE rows, not fewer).
+        await wait(40);
 
         expect(countMessageRows(db, "ses-overlap", "m-1")).toBe(1);
     });
@@ -372,7 +389,14 @@ describe("message-index-async", () => {
         scheduleClearAndReindex(db, sessionId, readSurviving);
         expect(isSessionReconciled(sessionId)).toBe(false);
 
-        await wait(80);
+        // Wait for the observable outcome rather than a fixed wall-clock budget.
+        // Both the boot-quiet reconciliation and the clear-and-reindex must have
+        // run (reads === 2) and the rebuild must have re-marked the session
+        // reconciled. A fixed `await wait(80)` made the verdict a function of
+        // how fast the runner closed two scheduling hops plus two DB cycles
+        // inside one window, which flips under CI load. Waiting for the state
+        // (with a generous ceiling) makes a slow runner slow rather than red.
+        await waitUntil(() => reads === 2 && isSessionReconciled(sessionId));
 
         expect(reads).toBe(2);
         expect(countMessageRows(db, sessionId, "m-survivor")).toBe(1);

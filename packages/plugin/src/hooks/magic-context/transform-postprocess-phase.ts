@@ -74,6 +74,7 @@ import {
     injectM0M1,
     type M0HardSignals,
     type M0M1State,
+    type MaterializeDecision,
     mustMaterialize,
     type PreparedCompartmentInjection,
     renderCompartmentInjection,
@@ -86,6 +87,7 @@ import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel
 import {
     applyFrozenTrailingBlankDecisions,
     clearOldReasoning,
+    findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripCandidateIds,
     findTrailingBlankDecisionCandidates,
     stripClearedReasoning,
@@ -99,6 +101,7 @@ import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./sup
 import { byteSize, prependTag } from "./tag-content-primitives";
 import {
     assertTailHygieneContentUnchanged,
+    countRealUserMessages,
     refreshTailHygieneBaseline,
     sameTailHygieneStructuralSignature,
     type TailHygieneStructuralSignature,
@@ -569,6 +572,8 @@ interface RunPostTransformPhaseArgs {
     activeAgent?: string;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
+    /** Usable tokens available for soft scheduling thresholds and usage-ratio calculation. */
+    usableWindow: number;
     schedulerDecision: "execute" | "defer";
     fullFeatureMode: boolean;
     /**
@@ -672,6 +677,12 @@ export interface PostTransformPhaseResult {
     /** True only when this pass consumed newly folded historian history. */
     historianFoldMaterializedThisPass: boolean;
     materializeReason: string | null;
+    systemHashPrev: string | null;
+    systemHashNew: string | null;
+    m0ModelKeyPrev: string | null;
+    m0ModelKeyNew: string | null;
+    m0ToolSetHashPrev: string | null;
+    m0ToolSetHashNew: string | null;
     droppedTokens: number;
     emergencyReclaimedTokens: number;
     droppedCount: number;
@@ -765,6 +776,7 @@ export function finalizeMessageRepresentation(
         prependedMessageCount?: number;
         reasoningMutatedMessages?: Iterable<MessageLike>;
         reasoningMutationExemptMessage?: MessageLike;
+        trailingBlankNewestAssistant?: MessageLike;
         mergedReasoningStrippedIds?: ReadonlySet<string>;
         trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
         skipMergedReasoningStrip?: boolean;
@@ -791,7 +803,7 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
-    let newestAssistant = options?.reasoningMutationExemptMessage;
+    let newestAssistant = options?.trailingBlankNewestAssistant;
     if (!newestAssistant) {
         for (let index = messages.length - 1; index >= 0; index -= 1) {
             const message = messages[index];
@@ -820,16 +832,19 @@ export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const compactionOff = args.compactionOff === true;
-    // Capture before todo/history synthesis can add assistant messages. Anthropic
-    // requires the signed reasoning blocks from the newest assistant to be replayed
-    // unchanged, and OpenCode serializes these same in-memory message objects.
-    let reasoningMutationExemptMessage: MessageLike | undefined;
+    // Capture before todo/history synthesis can add assistant messages. Reasoning replay skips a
+    // metadata-only OpenCode request shell, while trailing-blank freezing still tracks that newest
+    // host message because its shape can change before the next pass.
+    let trailingBlankNewestAssistant: MessageLike | undefined;
     for (let index = args.messages.length - 1; index >= 0; index -= 1) {
         const message = args.messages[index];
         if (message.info.role !== "assistant") continue;
-        reasoningMutationExemptMessage = message;
+        trailingBlankNewestAssistant = message;
         break;
     }
+    const reasoningMutationExemptMessage = findLatestAssistantReasoningMutationExemptMessage(
+        args.messages,
+    );
     // `isExplicitFlush` reads pendingMaterializationSessions — the persistent
     // "user wants pending ops + heuristics to run" signal. Survives across
     // blocked defer passes (compartmentRunning) so /ctx-flush intent is not
@@ -902,6 +917,10 @@ export async function runPostTransformPhase(
     const m0CoverageBeforeFold =
         args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
     let m0MaterializeReason: string | null = null;
+    // The preflight is the decision site that decides whether m[0] must fold.
+    // Keep its observational tool-set operands even when it correctly declines
+    // to materialize, so a separate cache-busting pass can be attributed later.
+    let m0ComparisonDecision: MaterializeDecision | null = foldDueDecision;
     if (foldDueDecision.value && args.m0M1) {
         try {
             // Persist the fold before opening mutation gates. Omitting messages
@@ -928,6 +947,9 @@ export async function runPostTransformPhase(
             );
             m0RematerializedThisPass = foldResult.m0RematerializedThisPass;
             m0MaterializeReason = foldResult.decision.reason;
+            if (foldResult.m0RematerializedThisPass) {
+                m0ComparisonDecision = foldResult.decision;
+            }
             try {
                 rearmChannel2AfterCoverageAdvancingHardFold({
                     db: args.db,
@@ -1534,6 +1556,9 @@ export async function runPostTransformPhase(
                 prependedMessageCount += result.prependedMessageCount;
                 m0RematerializedThisPass ||= result.m0RematerializedThisPass;
                 m0MaterializeReason = result.decision.reason ?? m0MaterializeReason;
+                if (result.m0RematerializedThisPass) {
+                    m0ComparisonDecision = result.decision;
+                }
                 sessionLog(
                     args.sessionId,
                     `transform: injected m[0]/m[1] (rematerialized=${result.m0RematerializedThisPass}, reason=${result.decision.reason ?? "cache_hit"})`,
@@ -2097,8 +2122,8 @@ export async function runPostTransformPhase(
     }
 
     const newestAssistantId =
-        typeof reasoningMutationExemptMessage?.info.id === "string"
-            ? reasoningMutationExemptMessage.info.id
+        typeof trailingBlankNewestAssistant?.info.id === "string"
+            ? trailingBlankNewestAssistant.info.id
             : undefined;
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
@@ -2108,6 +2133,7 @@ export async function runPostTransformPhase(
             prependedMessageCount,
             reasoningMutatedMessages,
             reasoningMutationExemptMessage,
+            trailingBlankNewestAssistant,
             mergedReasoningStrippedIds,
             trailingBlankDecisions,
             skipMergedReasoningStrip: compactionOff,
@@ -2196,21 +2222,32 @@ export async function runPostTransformPhase(
         if (args.ctxReduceAvailability.callable && !compactionOff) {
             try {
                 const tags = getTailHygieneTags(args.db, args.sessionId);
+                // A queued ctx_reduce drop is already actioned by the agent. Keep its
+                // still-rendered bytes in T, but exclude it from the actionable U backlog.
+                const pendingDropTagNumbers = new Set(
+                    getPendingOps(args.db, args.sessionId)
+                        .filter((operation) => operation.operation === "drop")
+                        .map((operation) => operation.tagId),
+                );
                 const previous = args.channel1StateBySession.get(args.sessionId);
                 const baseline = refreshTailHygieneBaseline({
                     messages: args.messages,
                     tags,
                     protectedTags: args.protectedTags,
+                    pendingDropTagNumbers,
                     cacheBusting: bustedThisPass,
                     previous,
                 });
                 const structuralSignature = tailHygieneStructuralSignature(args.messages);
                 args.channel1StateBySession.set(args.sessionId, {
                     ...baseline,
+                    usableWindow: args.usableWindow,
+                    realUserTurnCount: countRealUserMessages(args.messages),
                     reducedSinceRefresh:
                         baseline.baselineGeneration !== previous?.baselineGeneration
                             ? false
                             : (previous?.reducedSinceRefresh ?? false),
+                    agentDropsAppliedThisPass: pendingOpsDidMutate,
                     oldestReclaimableToolTags: getOldestActiveUnprotectedToolTags(
                         args.db,
                         args.sessionId,
@@ -2287,6 +2324,20 @@ export async function runPostTransformPhase(
         materialized,
         historianFoldMaterializedThisPass: historyWasConsumedThisPass,
         materializeReason,
+        systemHashPrev: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.systemHashPrev ?? null)
+            : null,
+        systemHashNew: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.systemHashNew ?? null)
+            : null,
+        m0ModelKeyPrev: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.m0ModelKeyPrev ?? null)
+            : null,
+        m0ModelKeyNew: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.m0ModelKeyNew ?? null)
+            : null,
+        m0ToolSetHashPrev: m0ComparisonDecision?.m0ToolSetHashPrev ?? null,
+        m0ToolSetHashNew: m0ComparisonDecision?.m0ToolSetHashNew ?? null,
         droppedTokens,
         emergencyReclaimedTokens,
         droppedCount,

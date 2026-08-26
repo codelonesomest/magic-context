@@ -1,10 +1,11 @@
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
+import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
@@ -34,8 +35,10 @@ import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    formatLocalEmbeddingRuntimeWasmFallback,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
+import { formatGithubIssueFallback, submitGithubIssue } from "../lib/github-issue";
 import { bundleIssueReport } from "../lib/logs-opencode";
 import { migrateDreamerV2ForDoctor } from "../lib/migrate-dreamer-v2-doctor";
 import { migrateExperimentalPinKeyFilesForDoctor } from "../lib/migrate-experimental-doctor";
@@ -261,15 +264,6 @@ function compareVersions(a: string, b: string): number {
 
 // ── Issue flow ──────────────────────────────────────────────────────
 
-function isGhInstalled(): boolean {
-    try {
-        execSync("gh --version", { stdio: "pipe" });
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 function openBrowser(url: string): void {
     try {
         if (process.platform === "darwin") {
@@ -321,8 +315,12 @@ async function runIssueFlow(): Promise<number> {
                             displayTitle.length > 50
                                 ? `${displayTitle.slice(0, 47)}...`
                                 : displayTitle;
+                        const childPrefix = session.parentSessionId ? "  ↳ " : "";
+                        const parentSuffix = session.parentSessionId
+                            ? ` (child of ${session.parentSessionId})`
+                            : "";
                         return {
-                            label: `${truncatedTitle} — ${session.sessionId}${index === 0 ? " (most recent)" : ""}`,
+                            label: `${childPrefix}${truncatedTitle} — ${session.sessionId}${parentSuffix}${index === 0 ? " (most recent)" : ""}`,
                             value: session.sessionId,
                         };
                     }),
@@ -337,39 +335,33 @@ async function runIssueFlow(): Promise<number> {
 
         s.start("Bundling issue report");
         const bundled = await bundleIssueReport(report, description, title, sessionFilter);
-        s.stop(`Report written to ${bundled.path}`);
+        s.stop(
+            bundled.fullPath
+                ? `Report written to ${bundled.path}; full bundle at ${bundled.fullPath}`
+                : `Report written to ${bundled.path}`,
+        );
 
         const shouldSubmit = await confirm("Submit this issue on GitHub now?", true);
-        if (shouldSubmit && isGhInstalled()) {
-            const result = spawnSync(
-                "gh",
-                [
-                    "issue",
-                    "create",
-                    "-R",
-                    "cortexkit/magic-context",
-                    "--title",
-                    title,
-                    "--body-file",
-                    bundled.path,
-                ],
-                { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
-            );
-
-            if (result.status === 0) {
-                log.success(result.stdout.trim());
+        if (shouldSubmit) {
+            const result = submitGithubIssue(title, bundled.path);
+            if (result.ok) {
+                log.success(result.output);
+                if (bundled.fullPath) {
+                    log.info(
+                        `Full diagnostics bundle available to drag onto the issue: ${bundled.fullPath}`,
+                    );
+                }
                 outro("Issue submitted — thanks for the report!");
                 return 0;
             }
 
-            log.warn(result.stderr.trim() || "gh issue create failed");
-        } else if (shouldSubmit && !isGhInstalled()) {
-            log.warn("gh CLI not found — falling back to browser");
+            const fallbackPath = bundled.fullPath ?? bundled.path;
+            log.warn(formatGithubIssueFallback(result, fallbackPath));
         }
 
         const url = `https://github.com/cortexkit/magic-context/issues/new?title=${encodeURIComponent(title)}&template=bug_report.yml`;
         log.info(
-            `Open this URL and paste the contents of ${bundled.path} into the Diagnostics field:`,
+            `Open this URL and drag ${bundled.fullPath ?? bundled.path} into the Diagnostics field:`,
         );
         log.info(url);
         openBrowser(url);
@@ -412,6 +404,10 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
     unverified?: boolean;
 } {
     const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
+    if (runtime.state === "wasm-fallback") {
+        log.warn(formatLocalEmbeddingRuntimeWasmFallback(runtime));
+        return { issues: 0 };
+    }
     if (isLocalEmbeddingRuntimeBroken(runtime)) {
         log.warn(formatLocalEmbeddingRuntimeDoctorWarning(runtime));
         return { issues: 1, localRuntimeBroken: true };
@@ -420,7 +416,7 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
         log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
         return { issues: 0, unverified: true };
     }
-    log.success("Embedding provider: local (Xenova/all-MiniLM-L6-v2 bundled)");
+    log.success("Embedding provider: local (native runtime OK; Xenova/all-MiniLM-L6-v2 bundled)");
     return { issues: 0 };
 }
 
@@ -436,7 +432,9 @@ async function checkEmbeddingConfig(
 
     let rawText: string;
     try {
-        rawText = readFileSync(magicContextConfigPath, "utf-8");
+        const raw = loadRawConfigFile({ configPath: magicContextConfigPath, tier: "user" });
+        if (!raw) return checkLocalEmbeddingRuntimeForDoctor();
+        rawText = raw.text;
     } catch {
         log.warn("Could not read magic-context.jsonc for embedding check");
         return { issues: 1 };
@@ -746,9 +744,11 @@ export async function runDoctor(
         pass(`Magic Context config: ${paths.magicContextConfig}`);
         // 3a. Validate JSONC parses (with config-variable substitution)
         try {
-            const raw = readFileSync(paths.magicContextConfig, "utf-8");
+            const raw = loadRawConfigFile({ configPath: paths.magicContextConfig, tier: "user" });
+            if (!raw)
+                throw new Error("Magic Context config disappeared while doctor was reading it");
             const substituted = substituteConfigVariables({
-                text: raw,
+                text: raw.text,
                 configPath: paths.magicContextConfig,
             }).text;
             parse(substituted);
@@ -785,8 +785,10 @@ export async function runDoctor(
     // 3b. Migrate deprecated experimental config keys in magic-context.jsonc
     if (existsSync(paths.magicContextConfig)) {
         try {
-            const mcRaw = readFileSync(paths.magicContextConfig, "utf-8");
-            const mcConfig = parse(mcRaw) as Record<string, unknown>;
+            const raw = loadRawConfigFile({ configPath: paths.magicContextConfig, tier: "user" });
+            if (!raw)
+                throw new Error("Magic Context config disappeared while doctor was reading it");
+            const mcConfig = parse(raw.text) as Record<string, unknown>;
             let mcChanged = false;
 
             // Remove deprecated compaction_markers config — always-on since v0.21.4.
@@ -1236,8 +1238,10 @@ export async function runDoctor(
     // so warn loudly when the combination is wrong.
     if (existsSync(paths.magicContextConfig)) {
         try {
-            const mcRaw = readFileSync(paths.magicContextConfig, "utf-8");
-            const mcConfig = parse(mcRaw) as Record<string, unknown>;
+            const raw = loadRawConfigFile({ configPath: paths.magicContextConfig, tier: "user" });
+            if (!raw)
+                throw new Error("Magic Context config disappeared while doctor was reading it");
+            const mcConfig = parse(raw.text) as Record<string, unknown>;
             const warning = checkUserMemoriesDreamerCompatibility(mcConfig);
             if (warning) {
                 log.warn(warning);

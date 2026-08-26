@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 
 import { detectConfigFile, isPrototypePollutionKey, parseJsonc } from "../shared/jsonc-parser";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
@@ -14,12 +14,14 @@ import {
 } from "./migrate-config-location";
 import { migrateDreamerV2 } from "./migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "./migrate-experimental";
+import { resolveConfigProfile } from "./profiles";
 import {
     constrainProjectThresholdOverrides,
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "./project-security";
 import { pruneNestedConfigLeaf } from "./prune-config-leaf";
+import { loadRawConfigFile } from "./raw-loader";
 import { type MagicContextConfig, MagicContextConfigSchema } from "./schema/magic-context";
 import { resolveTransformMode } from "./transform-mode";
 import { substituteConfigVariables } from "./variable";
@@ -109,8 +111,12 @@ function loadConfigFileDetailed(
     }
 
     let rawText: string;
+    let rawWarnings: string[];
     try {
-        rawText = readFileSync(configPath, "utf-8");
+        const raw = loadRawConfigFile({ configPath, tier: source });
+        if (!raw) return null;
+        rawText = raw.text;
+        rawWarnings = raw.warnings;
     } catch (error) {
         return {
             config: {},
@@ -138,7 +144,7 @@ function loadConfigFileDetailed(
         );
         return {
             config,
-            warnings: [...substituted.warnings, ...unsafeKeyWarnings].map(
+            warnings: [...rawWarnings, ...substituted.warnings, ...unsafeKeyWarnings].map(
                 (warning) => `${configPath}: ${warning}`,
             ),
             outcome:
@@ -285,8 +291,9 @@ function parsePluginConfig(
     }
 
     // Full parse failed — recover field-by-field using defaults for invalid fields.
-    // Agent configs (historian, dreamer, sidekick) are dropped on error rather than defaulted
-    // because wrong model config could run expensive models or fail silently.
+    // Invalid nested leaves are pruned from agent blocks; only root-level or
+    // unreachable agent errors drop the block, because guessing a model config
+    // could run an expensive unintended model or fail silently.
     const defaults = MagicContextConfigSchema.parse({});
     const warnings: string[] = [];
 
@@ -309,7 +316,13 @@ function parsePluginConfig(
             const key = String(topKey);
             errorPaths.add(key);
             const paths = issuePathsByKey.get(key) ?? [];
-            paths.push([...issue.path]);
+            if (issue.code === "unrecognized_keys") {
+                for (const unrecognizedKey of issue.keys) {
+                    paths.push([...issue.path, unrecognizedKey]);
+                }
+            } else {
+                paths.push([...issue.path]);
+            }
             issuePathsByKey.set(key, paths);
             const msg = issue.message;
             if (msg && !GENERIC_ZOD_PREFIXES.some((p) => msg.startsWith(p))) {
@@ -324,21 +337,12 @@ function parsePluginConfig(
     for (const key of errorPaths) {
         recoveredTopLevelKeys.push(key);
         const isAgentConfig = key === "historian" || key === "dreamer" || key === "sidekick";
-        if (isAgentConfig) {
-            // Drop agent configs entirely on error — don't default them
-            delete patched[key];
-            warnings.push(
-                `"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`,
-            );
-            continue;
-        }
 
-        // For object-valued keys (e.g. `memory`), prune ONLY the invalid nested
-        // leaves and keep valid siblings, so one bad nested field doesn't wipe the
-        // whole block — which would silently drop already-migrated graduated keys
-        // like memory.auto_search / memory.git_commit_indexing. Falls back to
-        // whole-key deletion when the issue is at the key itself or the value
-        // isn't a prunable object.
+        // For object-valued keys (including agent harness blocks), prune only invalid
+        // nested leaves and keep valid siblings, so one bad field does not remove
+        // already-migrated keys such as memory.auto_search and
+        // memory.git_commit_indexing. Fall back to whole-key deletion when the issue
+        // is at the key itself or the value is not a prunable object.
         const issuePaths = issuePathsByKey.get(key) ?? [];
         const rawValue = rawConfig[key];
         const allNested =
@@ -364,10 +368,22 @@ function parsePluginConfig(
                     prunedLeaves.push(result.removed);
                 }
             }
-            patched[key] = prunedBlock;
-            const reason = customMessagesByKey.get(key);
+            if (prunedLeaves.length === issuePaths.length) {
+                patched[key] = prunedBlock;
+                const reason = customMessagesByKey.get(key);
+                warnings.push(
+                    `"${key}": invalid nested field(s) ${prunedLeaves.map((leaf) => `"${key}.${leaf}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`,
+                );
+                continue;
+            }
+        }
+
+        // Root-level or unreachable agent errors cannot be repaired safely because
+        // guessing a model configuration could select an expensive unintended model.
+        if (isAgentConfig) {
+            delete patched[key];
             warnings.push(
-                `"${key}": invalid nested field(s) ${prunedLeaves.map((l) => `"${l}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`,
+                `"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`,
             );
             continue;
         }
@@ -533,11 +549,6 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
               : null;
 
     const allWarnings: string[] = [];
-    let mergedRaw: Record<string, unknown> = {};
-    // Threshold trust boundary is relative to the USER/default effective config:
-    // a cloned repo may delay compaction, but it may not lower thresholds in a
-    // way that forces extra historian work on the user's account.
-    const trustedBaseConfig = parsePluginConfig(userLoaded?.config ?? {});
 
     if (userLegacyFallback.source) {
         allWarnings.push(
@@ -561,26 +572,48 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
 
     if (userLoaded) {
         allWarnings.push(...userLoaded.warnings.map((w) => `[user config] ${w}`));
-        mergedRaw = deepMergeRawConfig(mergedRaw, userLoaded.config);
     }
 
+    let projectRaw: Record<string, unknown> = {};
     if (projectLoaded) {
         allWarnings.push(...projectLoaded.warnings.map((w) => `[project config] ${w}`));
-        const projectRaw = { ...projectLoaded.config };
+        projectRaw = { ...projectLoaded.config };
         for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
             allWarnings.push(`[project config] ${warning}`);
         }
-        mergedRaw = deepMergeRawConfig(mergedRaw, projectRaw);
+    }
+
+    // Resolve profiles at the single user→project merge choke point. The profile
+    // definition is parsed from the trusted user tier, then its validated model
+    // overlay is merged before the untrusted project config. The raw selector is
+    // consumed here; only the resolved name remains as status metadata.
+    const profileResolution = resolveConfigProfile({
+        userRaw: userLoaded?.config ?? {},
+        projectRaw,
+    });
+    allWarnings.push(...profileResolution.warnings.map((warning) => `[config] ${warning}`));
+    const trustedProfiledRaw = deepMergeRawConfig(
+        profileResolution.userBase,
+        profileResolution.overlay,
+    );
+    let mergedRaw = trustedProfiledRaw;
+    // Threshold trust boundary is relative to the USER/default effective config:
+    // a cloned repo may delay compaction, but it may not lower thresholds in a
+    // way that forces extra historian work on the user's account.
+    const trustedBaseConfig = parsePluginConfig(trustedProfiledRaw);
+
+    if (projectLoaded) {
+        mergedRaw = deepMergeRawConfig(mergedRaw, profileResolution.projectBase);
         for (const warning of dropInheritedEmbeddingKeyOnRedirect(
             projectRaw,
             mergedRaw,
-            userLoaded?.config,
+            profileResolution.userBase,
         )) {
             allWarnings.push(`[project config] ${warning}`);
         }
         for (const warning of constrainProjectThresholdOverrides({
             mergedRaw,
-            projectRaw,
+            projectRaw: profileResolution.projectBase,
             trustedBaseConfig,
         })) {
             allWarnings.push(`[project config] ${warning}`);
@@ -589,6 +622,7 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
 
     const recoveredTopLevelKeys: string[] = [];
     const config = parsePluginConfig(mergedRaw, recoveredTopLevelKeys);
+    if (profileResolution.activeProfile) config.profile = profileResolution.activeProfile;
     setOutputReserveConfig(config.output_reserve);
     setWindowOverlayPath(config.models?.window_overlay_path);
     if (config.configWarnings?.length) {

@@ -12,8 +12,8 @@ import {
 	acquireWrapupInProgress,
 	addNote,
 	appendNoteNudgeAnchor,
+	getChannel1NudgeState,
 	getHistorianFailureState,
-	getLastNudgeLevel,
 	getLastNudgeUndropped,
 	getNoteNudgeAnchors,
 	getOrCreateSessionMeta,
@@ -24,7 +24,7 @@ import {
 	incrementHistorianFailure,
 	insertTag,
 	queuePendingOp,
-	setLastNudgeLevel,
+	setChannel1NudgeState,
 	setLastNudgeUndropped,
 	setPendingPiCompactionMarkerState,
 	updateCavemanDepth,
@@ -1145,6 +1145,8 @@ describe("registerPiContextHandler", () => {
 			baselineT: 0,
 			turnDeltaU: 0,
 			turnDeltaT: 0,
+			usableWindow: 128_000,
+			realUserTurnCount: 1,
 			baselineGeneration: 1,
 			computedAt: 1,
 			evaluable: true,
@@ -1376,7 +1378,7 @@ describe("registerPiContextHandler", () => {
 		try {
 			const sessionId = "ses-pi-band-reset";
 			setLastNudgeUndropped(db, sessionId, 80_000);
-			setLastNudgeLevel(db, sessionId, "urgent");
+			setChannel1NudgeState(db, sessionId, { level: "urgent", ordinal: 12 });
 
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
@@ -1393,7 +1395,17 @@ describe("registerPiContextHandler", () => {
 			);
 
 			expect(getLastNudgeUndropped(db, sessionId)).toBe(0);
-			expect(getLastNudgeLevel(db, sessionId)).toBe("");
+			expect(getChannel1NudgeState(db, sessionId)).toEqual({
+				level: "",
+				ordinal: 0,
+			});
+			expect(
+				db
+					.prepare(
+						"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
+					)
+					.get(sessionId),
+			).toEqual({ last_nudge_level: '{"level":"","ordinal":0}' });
 		} finally {
 			closeQuietly(db);
 		}
@@ -1587,7 +1599,7 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
-	it("replays a queued-pending-op defer pass byte-identically without a pending-ops read", async () => {
+	it("replays a queued-pending-op defer pass byte-identically while reading queue state for U", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-pending-read-gate";
 		try {
@@ -1620,6 +1632,7 @@ describe("registerPiContextHandler", () => {
 			await runDeferPass();
 			const baseline = await runDeferPass();
 			const baselineBytes = JSON.stringify(baseline.messages);
+			const baselineHygiene = getPiChannel1Baseline(sessionId);
 			const pendingTag = getTagsBySession(db, sessionId).find(
 				(tag) => tag.type === "message" && tag.tagNumber === 2,
 			);
@@ -1644,7 +1657,12 @@ describe("registerPiContextHandler", () => {
 			}
 
 			expect(JSON.stringify(queued.messages)).toBe(baselineBytes);
-			expect(pendingOpsReads).toBe(0);
+			expect(pendingOpsReads).toBe(1);
+			const queuedHygiene = getPiChannel1Baseline(sessionId);
+			expect(queuedHygiene?.baselineU).toBe(baselineHygiene?.baselineU);
+			expect(queuedHygiene?.turnDeltaU).toBeLessThan(
+				baselineHygiene?.turnDeltaU ?? 0,
+			);
 			expect(getPendingOps(db, sessionId)).toHaveLength(1);
 		} finally {
 			clearContextHandlerSession(sessionId);
@@ -1703,6 +1721,22 @@ describe("registerPiContextHandler", () => {
 
 			expect(textOf(result.messages[1] as never)).toBe("[dropped §2§]");
 			expect(getPendingOps(db, "ses-context")).toEqual([]);
+			expect(
+				getPiChannel1Baseline("ses-context")?.agentDropsAppliedThisPass,
+			).toBe(true);
+
+			await handler(
+				{
+					messages: [
+						userMessage("keep user", 1),
+						assistantMessage("drop assistant", 2),
+					] as never[],
+				},
+				overThresholdCtx as never,
+			);
+			expect(
+				getPiChannel1Baseline("ses-context")?.agentDropsAppliedThisPass,
+			).toBe(false);
 		} finally {
 			closeQuietly(db);
 		}

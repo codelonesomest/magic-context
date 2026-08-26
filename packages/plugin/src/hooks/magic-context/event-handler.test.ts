@@ -179,6 +179,10 @@ describe("createEventHandler", () => {
             decision: "defer",
             materialized: false,
             materializeReason: null,
+            systemHashPrev: null,
+            systemHashNew: null,
+            m0ModelKeyPrev: null,
+            m0ModelKeyNew: null,
             emergency: false,
             droppedTokens: 0,
             droppedCount: 0,
@@ -192,6 +196,10 @@ describe("createEventHandler", () => {
             decision: "execute",
             materialized: true,
             materializeReason: "ttl_idle",
+            systemHashPrev: null,
+            systemHashNew: null,
+            m0ModelKeyPrev: null,
+            m0ModelKeyNew: null,
             emergency: false,
             droppedTokens: 0,
             droppedCount: 1,
@@ -207,6 +215,10 @@ describe("createEventHandler", () => {
             decision: "defer",
             materialized: false,
             materializeReason: null,
+            systemHashPrev: null,
+            systemHashNew: null,
+            m0ModelKeyPrev: null,
+            m0ModelKeyNew: null,
             emergency: false,
             droppedTokens: 0,
             droppedCount: 0,
@@ -225,6 +237,10 @@ describe("createEventHandler", () => {
             decision: "execute",
             materialized: true,
             materializeReason: "explicit_flush",
+            systemHashPrev: null,
+            systemHashNew: null,
+            m0ModelKeyPrev: null,
+            m0ModelKeyNew: null,
             emergency: false,
             droppedTokens: 0,
             droppedCount: 2,
@@ -272,6 +288,10 @@ describe("createEventHandler", () => {
             decision: "defer",
             materialized: false,
             materializeReason: null,
+            systemHashPrev: null,
+            systemHashNew: null,
+            m0ModelKeyPrev: null,
+            m0ModelKeyNew: null,
             emergency: false,
             droppedTokens: 0,
             droppedCount: 0,
@@ -348,6 +368,10 @@ describe("createEventHandler", () => {
                 decision: "execute",
                 materialized: true,
                 materializeReason: "pressure_refold",
+                systemHashPrev: null,
+                systemHashNew: null,
+                m0ModelKeyPrev: null,
+                m0ModelKeyNew: null,
                 emergency: false,
                 droppedTokens: 0,
                 droppedCount: 3,
@@ -887,7 +911,7 @@ describe("createEventHandler", () => {
         const originalPrepare = deps.db.prepare.bind(deps.db);
         let failCleanup = true;
         (deps.db as unknown as { prepare: typeof deps.db.prepare }).prepare = ((sql: string) => {
-            if (failCleanup && sql === "DELETE FROM source_contents WHERE session_id = ?") {
+            if (failCleanup && sql === "DELETE FROM source_contents WHERE session_id IN (?)") {
                 failCleanup = false;
                 throw new Error("synthetic session cleanup failure");
             }

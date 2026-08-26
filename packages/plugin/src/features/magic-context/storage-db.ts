@@ -20,18 +20,21 @@ import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
     classifyProcessKind,
-    discoverLivePiProcessIds,
     inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
-    readProcessCommand,
+    readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
-import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
+import {
+    attachFailClosedBlockingProcessEvidence,
+    type FailClosedBlockingProcess,
+    type FailClosedProcessKind,
+} from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -93,7 +96,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 78;
+export const LATEST_SUPPORTED_VERSION = 81;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -424,13 +427,21 @@ function classifyDiscoveryRecordKind(record: {
     return null;
 }
 
-function classifyRpcProcess(record: {
-    pid: number;
-    kind?: string;
-    harness?: string;
-}): FailClosedProcessKind {
+function classifyRpcProcess(
+    record: {
+        pid: number;
+        kind?: string;
+        harness?: string;
+    },
+    commandLine?: string | null,
+): FailClosedProcessKind {
     return (
-        classifyDiscoveryRecordKind(record) ?? classifyProcessKind(readProcessCommand(record.pid))
+        classifyDiscoveryRecordKind(record) ??
+        classifyProcessKind(
+            commandLine === undefined
+                ? readProcessProbeEvidence(record.pid).commandLine
+                : commandLine,
+        )
     );
 }
 
@@ -521,18 +532,26 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             continue;
         }
         const liveness = isPidAlive(record.pid);
-        const identity = liveness === "dead" ? "implausible" : isPidIdentityPlausible(record);
-        if (liveness === "alive" && identity === "plausible") {
+        if (liveness === "dead") {
+            staleFiles.push(portFile);
+            continue;
+        }
+        const evidence = readProcessProbeEvidence(record.pid);
+        const identity = isPidIdentityPlausible(record, evidence);
+        if (identity === "plausible") {
             pids.add(record.pid);
-            const detected = {
-                kind: classifyRpcProcess(record),
-                pid: record.pid,
-            } satisfies FailClosedBlockingProcess;
+            const detected = attachFailClosedBlockingProcessEvidence(
+                {
+                    kind: classifyRpcProcess(record, evidence.commandLine),
+                    pid: record.pid,
+                } satisfies FailClosedBlockingProcess,
+                evidence,
+            );
             const previous = processByPid.get(record.pid);
             if (!previous || (previous.kind === "process" && detected.kind !== "process")) {
                 processByPid.set(record.pid, detected);
             }
-        } else if (liveness === "dead" || identity === "implausible") {
+        } else if (identity === "implausible") {
             staleFiles.push(portFile);
         } else {
             inconclusivePids.add(record.pid);
@@ -573,11 +592,19 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
+function createPiBlockingProcess(pid: number): FailClosedBlockingProcess {
+    return attachFailClosedBlockingProcessEvidence(
+        { kind: "Pi", pid },
+        readProcessProbeEvidence(pid),
+    );
+}
+
 /** Return the live processes that would block an on-open migration. */
 export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
     const discovery = inspectRpcServerDiscovery(storageDir);
     const openCode = discovery.state === "live" ? (discovery.serverProcesses ?? []) : [];
-    const pi = discoverLivePiProcessIds().map((pid) => ({ kind: "Pi" as const, pid }));
+    const piDiscovery = inspectLivePiProcesses();
+    const pi = piDiscovery.processIds.map(createPiBlockingProcess);
     return [...openCode, ...pi];
 }
 
@@ -668,10 +695,7 @@ function enforceMigrationOnOpenGuard(
         (discovery.state === "live"
             ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
             : []);
-    const blockingProcesses = [
-        ...serverProcesses,
-        ...piPids.map((pid) => ({ kind: "Pi" as const, pid })),
-    ];
+    const blockingProcesses = [...serverProcesses, ...piPids.map(createPiBlockingProcess)];
     if (
         (discovery.state === "absent" ||
             discovery.state === "stale" ||
@@ -1354,8 +1378,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
-    CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
-      ON message_history_index(harness, session_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS message_history_source (
       session_id TEXT NOT NULL,
@@ -1569,6 +1591,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       decision           TEXT    NOT NULL,
       materialized       INTEGER NOT NULL DEFAULT 0,
       materialize_reason TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
       emergency          INTEGER NOT NULL DEFAULT 0,
       dropped_tokens     INTEGER NOT NULL DEFAULT 0,
       dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -2022,6 +2050,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         decision           TEXT    NOT NULL,
         materialized       INTEGER NOT NULL DEFAULT 0,
         materialize_reason TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
         emergency          INTEGER NOT NULL DEFAULT 0,
         dropped_tokens     INTEGER NOT NULL DEFAULT 0,
         dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -2031,6 +2065,15 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
         ON transform_decisions(session_id, harness);
     `);
+
+    // transform_decisions existed before comparison telemetry was introduced.
+    // Keep the boot-time backfill alongside the fresh CREATE definition so
+    // databases opened by a newer runtime before migration replay still accept
+    // the telemetry writer. NULL means no comparison ran on that pass.
+    ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
+    ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
+    ensureColumn(db, "transform_decisions", "m0_model_key_prev", "TEXT");
+    ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
 
     // NULL-column healing runs in migration v5 and again in v51 to repair
     // databases where the old v5 healer swallowed a transient write error.
@@ -2060,6 +2103,13 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "recomp_compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "recomp_facts", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "message_history_index", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+    // This index needs the harness column, which older persisted message-history
+    // tables lack. Create it only after the startup heal so legacy opens reach
+    // the migration runner instead of failing before it can repair the store.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
+        ON message_history_index(harness, session_id, updated_at);
+    `);
     ensureColumn(db, "workspaces", "share_categories", `TEXT NOT NULL DEFAULT '["CONSTRAINTS"]'`);
     // notes table is created by migration v1 (not initializeDatabase). It
     // exists by the time runMigrations() returns, but ensureColumn's PRAGMA

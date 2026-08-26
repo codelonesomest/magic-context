@@ -4,6 +4,7 @@ import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getModuleNoteEvaluationBridge } from "../context-authority";
@@ -38,9 +39,15 @@ export interface EvaluateSmartNotesArgs {
     /** Keyed lease this task holds (Dreamer v2: per-project evaluate-smart-notes domain). */
     leaseKey: string;
     deadline: number;
+    /**
+     * Wall-clock budget for one due-check sweep. Defaults to 10s in production;
+     * tests lower it so a sweep queued behind slow sandbox infrastructure cancels
+     * fast instead of eating the whole test timeout.
+     */
+    sweepBudgetMs?: number;
     leaseAcquisition?: LeaseAcquisition;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     /** When true, authoring-compiled provider conditions are owned by retina. */
     retinaHandoff?: boolean;
     onLeaseLost?: (phase: string, error?: unknown) => void;
@@ -171,7 +178,7 @@ export async function evaluateSmartNotes(
             projectIdentity: args.projectIdentity,
             projectRoot,
             maxChecks: 10,
-            sweepBudgetMs: 10_000,
+            sweepBudgetMs: args.sweepBudgetMs ?? 10_000,
             leaseHeld,
             signal: leaseAbortController.signal,
             retinaHandoff: args.retinaHandoff,

@@ -436,6 +436,107 @@ describe("SubcModuleTransport", () => {
         expect(requestCount).toBe(2);
     });
 
+    it("uses a cold-start deadline only for a completed transform page series", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 8, epoch: 88 } as RouteHandle;
+        const observedTimeouts: number[] = [];
+        const client = {
+            request: async (
+                _route: RouteHandle,
+                _body: unknown,
+                options: { timeoutMs: number },
+            ) => {
+                observedTimeouts.push(options.timeoutMs);
+                return { result: { ok: true } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "session-attempt-class\0/workspace/project",
+            generation: 0,
+        });
+        const base = {
+            sessionId: "session-attempt-class",
+            projectRoot: "/workspace/project",
+            method: "transform" as const,
+        };
+
+        await transport.call({
+            ...base,
+            body: { method: "transform", transform_page_complete: false },
+            attemptClass: "transform_page_upload",
+        });
+        await transport.call({
+            ...base,
+            body: { method: "transform", transform_page_complete: true },
+            attemptClass: "transform_series_execute",
+        });
+
+        expect(observedTimeouts).toHaveLength(2);
+        expect(observedTimeouts[0]).toBeGreaterThan(4_500);
+        expect(observedTimeouts[0]).toBeLessThanOrEqual(5_000);
+        expect(observedTimeouts[1]).toBeGreaterThan(29_000);
+        expect(observedTimeouts[1]).toBeLessThanOrEqual(30_000);
+    });
+
+    it("fails a completed-series deadline without reconnecting or retrying", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const route = { channel: 8, epoch: 88 } as RouteHandle;
+        let requestCount = 0;
+        let closeCount = 0;
+        const client = {
+            request: () => {
+                requestCount += 1;
+                return new Promise<never>(() => undefined);
+            },
+            close: () => {
+                closeCount += 1;
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "session-execute-timeout\0/workspace/project",
+            generation: 0,
+        });
+
+        await expect(
+            transport.call({
+                sessionId: "session-execute-timeout",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", transform_page_complete: true },
+                generationSensitive: true,
+                attemptClass: "transform_series_execute",
+                timeoutMs: 25,
+            }),
+        ).rejects.toMatchObject({ code: "ETIMEDOUT" });
+        expect(requestCount).toBe(1);
+        expect(closeCount).toBe(0);
+        expect(internals.client).toBe(client);
+    });
+
     it("reopens a route and retries when a restarted module leaves a stale route token", async () => {
         const tempDir = mkdtempSync(join(tmpdir(), "module-subc-restart-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
@@ -973,6 +1074,128 @@ describe("SubcModuleTransport", () => {
         expect(ensured.route).toBe(newRoute);
         expect(ensured.generation).toBe(1);
         expect(internals.routes.get(routeKey)).toEqual({ route: newRoute, generation: 1 });
+    });
+});
+
+describe("connection backoff in-pass wait", () => {
+    function makeBackoffTransport(): {
+        transport: SubcModuleTransport;
+        internals: {
+            nextProbeMs: number;
+            connectClient(): Promise<SubcClient>;
+        };
+        client: SubcClient;
+        connectCount: () => number;
+    } {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let connects = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async (_route: RouteHandle, body: unknown) => ({
+                result: { sessionId: (body as { session_id?: string }).session_id ?? "ok" },
+            }),
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            nextProbeMs: number;
+            connectClient(): Promise<SubcClient>;
+        };
+        internals.connectClient = async () => {
+            connects += 1;
+            return client;
+        };
+        return { transport, internals, client, connectCount: () => connects };
+    }
+
+    it("waits out an under-budget backoff remainder and serves the pass", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        // A latch armed by an earlier failure with only 300ms left — far under
+        // the wait budget. The pass must wait and connect, not fail.
+        internals.nextProbeMs = Date.now() + 300;
+        const startedAt = performance.now();
+
+        await expect(
+            transport.call({
+                sessionId: "session-backoff-wait",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-wait" },
+            }),
+        ).resolves.toEqual({ result: { sessionId: "session-backoff-wait" } });
+
+        const elapsedMs = performance.now() - startedAt;
+        expect(elapsedMs).toBeGreaterThanOrEqual(280);
+        // Remainder plus jitter only — no retry ladder, no budget overrun.
+        expect(elapsedMs).toBeLessThan(1_000);
+        expect(connectCount()).toBe(1);
+    });
+
+    it("fails fast when the backoff remainder exceeds the wait budget", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 20_000;
+        const startedAt = performance.now();
+
+        await expect(
+            transport.call({
+                sessionId: "session-backoff-over-budget",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        ).rejects.toMatchObject({ code: "SUBC_CONNECTION_BACKOFF" });
+
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectCount()).toBe(0);
+    });
+
+    it("does not serialize sibling sessions behind one session's backoff wait", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 500;
+        const startedAt = performance.now();
+
+        const [responseA, responseB] = await Promise.all([
+            transport.call({
+                sessionId: "session-backoff-a",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-a" },
+            }),
+            transport.call({
+                sessionId: "session-backoff-b",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-b" },
+            }),
+        ]);
+
+        const wallMs = performance.now() - startedAt;
+        expect(responseA).toEqual({ result: { sessionId: "session-backoff-a" } });
+        expect(responseB).toEqual({ result: { sessionId: "session-backoff-b" } });
+        // Each pass waits on its own timer; a serialized (global) wait would pay
+        // the ~500ms remainder twice. The connection itself coalesces once.
+        expect(wallMs).toBeGreaterThanOrEqual(450);
+        expect(wallMs).toBeLessThan(900);
+        expect(connectCount()).toBe(1);
+    });
+
+    it("stops waiting when the pass is aborted mid-backoff", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 2_000;
+        const controller = new AbortController();
+        const startedAt = performance.now();
+        const call = transport.call({
+            sessionId: "session-backoff-abort",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+            signal: controller.signal,
+        });
+        setTimeout(() => controller.abort(new Error("turn cancelled")), 50);
+
+        await expect(call).rejects.toThrow("turn cancelled");
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectCount()).toBe(0);
     });
 });
 

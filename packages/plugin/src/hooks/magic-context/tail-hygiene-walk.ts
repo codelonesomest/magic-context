@@ -24,6 +24,8 @@ export interface TailHygienePartMeasurement {
     tagNumber: number | null;
     tagStatus: TagEntry["status"] | null;
     protected: boolean;
+    /** The agent already requested this drop; it remains in the rendered token total until the next cache-busting render applies it. */
+    queuedForDrop: boolean;
 }
 
 export interface TailHygieneMeasurement {
@@ -205,19 +207,46 @@ function collectToolPartIdentities(
     return identities;
 }
 
-function isSyntheticMessage(message: MessageLike): boolean {
-    const structuralHead =
-        message.info.id === undefined &&
-        message.info.role === "user" &&
-        message.parts.length > 0 &&
-        message.parts.every((part) => isRecord(part) && part.synthetic === true);
+function isMachineGeneratedUserPart(part: unknown): boolean {
+    if (!isRecord(part)) return false;
+    const metadata = isRecord(part.metadata) ? part.metadata : null;
+    const marker = metadata && isRecord(metadata.marker) ? metadata.marker : null;
+    // Keep the all-parts predicate aligned with hasNewerRealUserMessage: a
+    // row is synthetic only when every part is machine-generated. A real
+    // prompt can carry one synthetic @mention part without becoming injected.
     return (
-        structuralHead || message.info.summary === true || message.info.id === TODO_HEAD_ANCHOR_ID
+        part.synthetic === true ||
+        part.ignored === true ||
+        marker?.kind != null ||
+        isSyntheticTodoPart(part)
     );
 }
 
+export function isSyntheticMessage(message: MessageLike): boolean {
+    const syntheticUserRow =
+        message.info.role === "user" &&
+        message.parts.length > 0 &&
+        message.parts.every(isMachineGeneratedUserPart);
+    return (
+        syntheticUserRow || message.info.summary === true || message.info.id === TODO_HEAD_ANCHOR_ID
+    );
+}
+
+/**
+ * Counts user turns with the same all-parts synthetic predicate used by the
+ * mid-turn release valve. MC's reminder, Channel-2, and m0/m1 rows are
+ * injected user-shaped messages and must not advance a user-turn cadence.
+ */
+export function countRealUserMessages(messages: readonly MessageLike[]): number {
+    let count = 0;
+    for (const message of messages) {
+        if (message.info.role === "user" && !isSyntheticMessage(message)) count += 1;
+    }
+    return count;
+}
+
 function isSyntheticPart(part: unknown): boolean {
-    return (isRecord(part) && part.synthetic === true) || isSyntheticTodoPart(part);
+    return isMachineGeneratedUserPart(part);
 }
 
 export function stripChannel1ReminderSpans(output: string): string {
@@ -397,12 +426,16 @@ function snapshot(args: {
     tokens: number;
     tag: TagEntry | undefined;
     protectedNumbers: ReadonlySet<number>;
+    pendingDropTagNumbers: ReadonlySet<number>;
 }): TailHygienePartMeasurement {
     const memo = memoizedContent(args.kind, args.content);
     const tag = args.tag;
     const isProtected = tag ? args.protectedNumbers.has(tag.tagNumber) : false;
+    const queuedForDrop = tag ? args.pendingDropTagNumbers.has(tag.tagNumber) : false;
     const uTokens =
-        tag?.status === "active" && !isProtected && args.kind !== "excluded" ? args.tokens : 0;
+        tag?.status === "active" && !isProtected && !queuedForDrop && args.kind !== "excluded"
+            ? args.tokens
+            : 0;
     return {
         key: args.key,
         contentHash: memo.hash,
@@ -412,6 +445,7 @@ function snapshot(args: {
         tagNumber: tag?.tagNumber ?? null,
         tagStatus: tag?.status ?? null,
         protected: isProtected,
+        queuedForDrop,
     };
 }
 
@@ -424,6 +458,7 @@ function excludedSnapshot(key: string, part: unknown): TailHygienePartMeasuremen
         tokens: 0,
         tag: undefined,
         protectedNumbers: new Set(),
+        pendingDropTagNumbers: new Set(),
     });
 }
 
@@ -481,7 +516,10 @@ export function measureTailHygiene(input: {
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
     protectedTags: number;
+    /** Active tags whose drop is queued but not yet materialized into the rendered tail. */
+    pendingDropTagNumbers?: ReadonlySet<number>;
 }): TailHygieneMeasurement {
+    const pendingDropTagNumbers = input.pendingDropTagNumbers ?? new Set<number>();
     const toolIdentities = collectToolPartIdentities(input.messages);
     const attribution = buildTagAttribution({
         messages: input.messages,
@@ -537,6 +575,7 @@ export function measureTailHygiene(input: {
                     tokens: memo.tokens,
                     tag,
                     protectedNumbers: attribution.protectedNumbers,
+                    pendingDropTagNumbers,
                 });
                 parts.push(measured);
                 t += measured.tokens;
@@ -557,6 +596,7 @@ export function measureTailHygiene(input: {
                     tokens: file.tokens,
                     tag,
                     protectedNumbers: attribution.protectedNumbers,
+                    pendingDropTagNumbers,
                 });
                 parts.push(measured);
                 t += measured.tokens;
@@ -581,6 +621,7 @@ export function measureTailHygiene(input: {
                         tokens: memo.tokens,
                         tag,
                         protectedNumbers: attribution.protectedNumbers,
+                        pendingDropTagNumbers,
                     });
                     parts.push(measured);
                     t += measured.tokens;
@@ -600,6 +641,7 @@ export function measureTailHygiene(input: {
                             tokens: memo.tokens,
                             tag,
                             protectedNumbers: attribution.protectedNumbers,
+                            pendingDropTagNumbers,
                         });
                         parts.push(measured);
                         t += measured.tokens;
@@ -626,9 +668,12 @@ export function measureTailHygiene(input: {
 function sameMeasuredPrefix(
     baseline: readonly TailHygienePartMeasurement[],
     current: readonly TailHygienePartMeasurement[],
-): { valid: boolean; boundaryAdvanceU: number } {
-    if (current.length < baseline.length) return { valid: false, boundaryAdvanceU: 0 };
+): { valid: boolean; boundaryAdvanceU: number; queuedDropDeltaU: number } {
+    if (current.length < baseline.length) {
+        return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
+    }
     let boundaryAdvanceU = 0;
+    let queuedDropDeltaU = 0;
     for (let index = 0; index < baseline.length; index += 1) {
         const before = baseline[index];
         const after = current[index];
@@ -640,23 +685,33 @@ function sameMeasuredPrefix(
             before.tagNumber !== after.tagNumber ||
             before.tagStatus !== after.tagStatus
         ) {
-            return { valid: false, boundaryAdvanceU: 0 };
+            return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
         }
-        if (!before.protected && after.protected) return { valid: false, boundaryAdvanceU: 0 };
+        if (!before.protected && after.protected) {
+            return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
+        }
         if (before.protected && !after.protected) {
-            if (after.tagStatus !== "active") return { valid: false, boundaryAdvanceU: 0 };
-            boundaryAdvanceU += after.tokens;
+            if (after.tagStatus !== "active") {
+                return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
+            }
+            boundaryAdvanceU += after.uTokens;
+        } else if (before.queuedForDrop !== after.queuedForDrop) {
+            if (before.tagStatus !== "active" || after.tagStatus !== "active") {
+                return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
+            }
+            queuedDropDeltaU += after.uTokens - before.uTokens;
         } else if (before.uTokens !== after.uTokens) {
-            return { valid: false, boundaryAdvanceU: 0 };
+            return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
         }
     }
-    return { valid: true, boundaryAdvanceU };
+    return { valid: true, boundaryAdvanceU, queuedDropDeltaU };
 }
 
 export function refreshTailHygieneBaseline(input: {
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
     protectedTags: number;
+    pendingDropTagNumbers?: ReadonlySet<number>;
     cacheBusting: boolean;
     previous?: TailHygieneBaseline;
     now?: number;
@@ -691,7 +746,9 @@ export function refreshTailHygieneBaseline(input: {
         };
     }
     let turnDeltaT = 0;
-    let turnDeltaU = prefix.boundaryAdvanceU;
+    // Queue membership is an action-state delta: it reduces the actionable token
+    // backlog without changing the frozen baseline or still-rendered token total.
+    let turnDeltaU = prefix.boundaryAdvanceU + prefix.queuedDropDeltaU;
     for (
         let index = input.previous.baselineParts.length;
         index < measured.parts.length;

@@ -18,6 +18,9 @@ export interface Channel1State {
     baselineT: number;
     turnDeltaU: number;
     turnDeltaT: number;
+    usableWindow: number;
+    /** Monotonic count of real (not Magic Context-injected) user turns in this pass. */
+    realUserTurnCount: number;
     baselineGeneration: number;
     computedAt: number;
     evaluable: boolean;
@@ -25,6 +28,8 @@ export interface Channel1State {
     baselineParts: TailHygienePartMeasurement[];
     contentSignature: string;
     reducedSinceRefresh: boolean;
+    /** Do not trigger a reduction nudge on the pass that applied queued agent drops. */
+    agentDropsAppliedThisPass?: boolean;
     oldestReclaimableToolTags: ToolReclaimHint[];
 }
 
@@ -201,42 +206,71 @@ function formatOldestReclaimableHint(hint?: readonly ToolReclaimHint[]): string 
 
 export function buildChannel2Reminder(
     undroppedTokens: number,
+    usableWindowTokens: number,
     hint?: readonly ToolReclaimHint[],
 ): string {
     const amount = approxThousands(undroppedTokens);
+    const usableWindow = approxThousands(usableWindowTokens);
     const hintText = formatOldestReclaimableHint(hint);
     return (
         `<system-reminder>\n` +
-        `Routine context housekeeping is near: a large span of this session will be comparted soon, ` +
-        `and ~${amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce ` +
-        `first so the archived span is the part that matters.${hintText}\n` +
+        `Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. ` +
+        `Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~${amount} of ~${usableWindow} reclaimable).${hintText}\n` +
         `</system-reminder>`
     );
+}
+
+export const CHANNEL1_STICKY_REAL_USER_TURN_GAP = 3;
+
+export function shouldUseStickyChannel1Reminder(input: {
+    lastLevel: Channel1Level | "";
+    lastOrdinal: number;
+    level: Channel1Level;
+    currentRealUserTurnCount: number;
+}): boolean {
+    // Never-fired is encoded by an empty lastLevel, never by ordinal zero: a
+    // conversation whose window holds no real user rows (a pure tool stream)
+    // legitimately fires at count 0 and must still dampen its re-fires.
+    if (input.lastLevel !== input.level) return false;
+    // Older persisted blobs wrote a raw message ordinal. That value is larger
+    // than the real-user counter whenever synthetic rows intervened, so expire
+    // the incomparable state once and overwrite it on this fire.
+    if (input.lastOrdinal > input.currentRealUserTurnCount) return false;
+    const gap = input.currentRealUserTurnCount - input.lastOrdinal;
+    return gap >= 0 && gap < CHANNEL1_STICKY_REAL_USER_TURN_GAP;
 }
 
 export function buildChannel1Reminder(
     level: Channel1Level,
     undroppedTokens: number,
+    usableWindowTokens: number,
     hint?: readonly ToolReclaimHint[],
+    sticky = false,
 ): string {
-    const amount = approxThousands(undroppedTokens);
     const hintText = formatOldestReclaimableHint(hint);
+    if (sticky) {
+        return `\n\n<system-reminder>\nReminder: ctx_reduce housekeeping still pending —${hintText}\n</system-reminder>`;
+    }
+
+    const amount = approxThousands(undroppedTokens);
+    const usableWindow = approxThousands(usableWindowTokens);
     let body: string;
     switch (level) {
         case "gentle":
             body =
-                `You have ~${amount} tokens of content you have not reduced. ` +
-                `When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean.`;
+                `Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. ` +
+                `Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.`;
             break;
         case "firm":
             body =
-                `~${amount} tokens of unreduced content has built up. ` +
-                `At your next natural stopping point, consider dropping what you have already processed with ctx_reduce.`;
+                `Housekeeping: ~${amount} of this session's ~${usableWindow} window is spent tool output. ` +
+                `Drop what you have already processed with ctx_reduce at a natural stopping point. ` +
+                `Not a limit — nothing is lost either way.`;
             break;
         case "urgent":
             body =
-                `~${amount} tokens of unreduced content remain across most of the live tail. ` +
-                `Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters.`;
+                `Housekeeping backlog: ~${amount} of this session's ~${usableWindow} window is spent tool output — worth a ctx_reduce pass now. ` +
+                `This is routine and lossless; it is never a reason to change scope.`;
             break;
     }
     return `\n\n<system-reminder>\n${body}${hintText}\n</system-reminder>`;

@@ -1,5 +1,6 @@
 import type { PiThinkingLevel } from "../../../config/schema/magic-context";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
 import { nextDueAtMs } from "./cron";
 import {
@@ -34,8 +35,8 @@ export interface DreamTaskRuntimeConfig {
     task: DreamTaskName;
     /** Cron string; `""` = disabled (never due). */
     schedule: string;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     thinkingLevel?: PiThinkingLevel;
     language?: string;
     timeoutMinutes: number;

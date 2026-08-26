@@ -24,12 +24,12 @@ import {
 	casChannel2NudgeClaim,
 	casChannel2NudgeState,
 	claimChannel2NudgeState,
+	getChannel1NudgeState,
 	getChannel2NudgeClaim,
 	getChannel2NudgeState,
-	getLastNudgeLevel,
 	getLastNudgeUndropped,
 	resetLastNudgeCycle,
-	setLastNudgeLevel,
+	setChannel1NudgeState,
 	setLastNudgeUndropped,
 } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -39,9 +39,11 @@ import {
 	decideChannel1,
 	evaluateChannel2,
 	type Channel1State as SharedChannel1State,
+	shouldUseStickyChannel1Reminder,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+
 import { measurePiToolResultDelta } from "./tail-hygiene-walk-pi";
 
 export type Channel1State = SharedChannel1State;
@@ -139,25 +141,46 @@ export function maybeChannel1ReminderForToolResult(args: {
 	if (deltaTokens === 0) return null;
 	state.turnDeltaT += deltaTokens;
 
+	if (state.agentDropsAppliedThisPass) return null;
+
+	const nudgeState = getChannel1NudgeState(db, sessionId);
 	const decision = decideChannel1({
 		...state,
 		lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
-		lastNudgeLevel: getLastNudgeLevel(db, sessionId),
+		lastNudgeLevel: nudgeState.level,
 		hasRecentReduce: state.reducedSinceRefresh,
 	});
 
 	setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
-	setLastNudgeLevel(db, sessionId, decision.nextLastNudgeLevel);
-	if (!decision.fire) return null;
+	if (!decision.fire) {
+		setChannel1NudgeState(db, sessionId, {
+			level: decision.nextLastNudgeLevel,
+			ordinal: decision.nextLastNudgeLevel === "" ? 0 : nudgeState.ordinal,
+		});
+		return null;
+	}
 
-	return {
-		type: "text",
+	const sticky = shouldUseStickyChannel1Reminder({
+		lastLevel: nudgeState.level,
+		lastOrdinal: nudgeState.ordinal,
+		level: decision.level,
+		currentRealUserTurnCount: state.realUserTurnCount,
+	});
+	const block = {
+		type: "text" as const,
 		text: buildChannel1Reminder(
 			decision.level,
 			decision.undroppedTokens,
+			state.usableWindow,
 			state.oldestReclaimableToolTags,
+			sticky,
 		),
 	};
+	setChannel1NudgeState(db, sessionId, {
+		level: decision.level,
+		ordinal: state.realUserTurnCount,
+	});
+	return block;
 }
 
 /**
@@ -243,6 +266,7 @@ export function maybeDeliverChannel2Pi(
 			customType: CHANNEL2_NUDGE_CUSTOM_TYPE,
 			content: buildChannel2Reminder(
 				undropped,
+				baseline.usableWindow,
 				baseline.oldestReclaimableToolTags,
 			),
 			display: false,

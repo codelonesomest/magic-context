@@ -118,7 +118,6 @@ export interface DreamTaskExecutorDeps {
     /** Resolved project transform mode; an explicit TS mode always stays on TS. */
     transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
-    dreamerModel?: string;
     mural?: { enabled: boolean; model?: string };
     memoryInjectionBudgetTokens?: number;
     retinaHandoff?: boolean;
@@ -391,8 +390,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
-                // Model ladder mirrors classify: task override → mural
-                // model (the cue COMPRESSOR model) → dreamer model → session model.
+                // `config.model` is already resolved by task-config using the
+                // executing harness's task-specific, mural/project-level,
+                // then default model settings.
                 const result = await runCompressCues({
                     db,
                     client: deps.client,
@@ -403,7 +403,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    model: config.model ?? deps.mural.model ?? deps.dreamerModel,
+                    model: config.model,
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
                     onProgress: (processed) => reportProgress(processed),
@@ -459,9 +459,27 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(
-                    `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`,
+                    `[dreamer] map-memories: committed=${result.mapped + result.independent} mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
                 );
                 if (!result.complete) {
+                    if (result.stopReason === "timeout-circuit-breaker") {
+                        // A repeated timeout is a model-capacity starvation signal, not
+                        // a normal deadline remainder. Keep its failed status loud so
+                        // /ctx-dream and dreamer history expose why it stopped.
+                        const error = `map-memories starvation: timeout circuit breaker stopped the run with ${result.remaining} remain`;
+                        recordRun("failed", error);
+                        return { status: "failed", transient: true, error };
+                    }
+                    const processed = result.mapped + result.independent;
+                    if (processed > 0) {
+                        // Mappings are persisted one completed host batch at a time.
+                        // Like a resumable verify-broad cycle, bank real progress as a
+                        // completed scheduled run so lastRunAt advances, while the
+                        // remaining gate set drives the next scheduled run.
+                        const progress = `map-memories: committed ${processed} mapping(s) (mapped ${result.mapped}, independent ${result.independent}); ${result.remaining} remain`;
+                        recordRun("completed", null, { progress });
+                        return { status: "completed" };
+                    }
                     const error = incompleteMessage(result.remaining);
                     recordRun("failed", error);
                     return { status: "failed", transient: true, error };

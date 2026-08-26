@@ -582,24 +582,33 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
                     .map_err(DispatchError::Command)?,
             )
         }
+        "get_log_paths" => {
+            parse_args::<NoArgs>(args)?;
+            json(
+                log_parser::resolve_log_paths()
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+            )
+        }
         "get_log_entries" => {
             let a: MaxLinesArgs = parse_args(args)?;
-            let log_path = log_parser::resolve_log_path();
-            json(log_parser::read_log_tail(
-                &log_path,
+            let log_paths = log_parser::resolve_log_paths();
+            json(log_parser::read_log_tails(
+                &log_paths,
                 a.max_lines.unwrap_or(500),
             ))
         }
         "get_cache_events" => {
             let a: MaxLinesArgs = parse_args(args)?;
-            let log_path = log_parser::resolve_log_path();
-            let entries = log_parser::read_log_tail(&log_path, a.max_lines.unwrap_or(2000));
+            let log_paths = log_parser::resolve_log_paths();
+            let entries = log_parser::read_log_tails(&log_paths, a.max_lines.unwrap_or(2000));
             json(log_parser::extract_cache_events(&entries))
         }
         "get_session_cache_stats" => {
             let a: CacheStatsArgs = parse_args(args)?;
-            let log_path = log_parser::resolve_log_path();
-            let entries = log_parser::read_log_tail(&log_path, a.max_lines.unwrap_or(5000));
+            let log_paths = log_parser::resolve_log_paths();
+            let entries = log_parser::read_log_tails(&log_paths, a.max_lines.unwrap_or(5000));
             let events = log_parser::extract_cache_events(&entries);
             json(log_parser::aggregate_session_cache_stats(
                 &events,
@@ -656,9 +665,8 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         }
         "save_project_config" => {
             let a: SaveProjectConfigArgs = parse_args(args)?;
-            let path = config::resolve_project_config_path(&a.project_path);
             json(
-                config::write_project_config(&a.project_path, &path, &a.content)
+                config::write_project_config(&a.project_path, &a.content)
                     .map_err(DispatchError::Command)?,
             )
         }
@@ -684,13 +692,9 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             parse_args::<NoArgs>(args)?;
             json(commands::get_opencode_install_state().await)
         }
-        "get_available_models" => {
+        "get_model_catalogs" => {
             parse_args::<NoArgs>(args)?;
-            json(commands::get_available_models().await)
-        }
-        "get_available_pi_models" => {
-            parse_args::<NoArgs>(args)?;
-            json(commands::get_available_pi_models().await)
+            json(commands::get_model_catalogs().await)
         }
         "test_embedding_endpoint" => {
             let a: TestEmbeddingEndpointArgs = parse_args(args)?;
@@ -763,10 +767,7 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
 pub fn uses_subprocess_or_network_probe(cmd: &str) -> bool {
     matches!(
         cmd,
-        "get_opencode_install_state"
-            | "get_available_models"
-            | "get_available_pi_models"
-            | "test_embedding_endpoint"
+        "get_opencode_install_state" | "get_model_catalogs" | "test_embedding_endpoint"
     )
 }
 
@@ -855,7 +856,7 @@ mod tests {
     async fn dispatch_rejects_extra_args_for_model_commands() {
         let err = dispatch(
             &state_without_db(),
-            "get_available_models",
+            "get_model_catalogs",
             serde_json::json!({ "program": "sh" }),
         )
         .await

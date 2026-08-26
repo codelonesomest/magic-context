@@ -2818,6 +2818,60 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 79,
+        description: "record m[0] system-hash and model-key comparison telemetry",
+        up(db: Database): void {
+            // These values are evidence for an already-made materialization
+            // comparison, not current cache state. Keep historical rows NULL:
+            // NULL means the pass made no comparison, while an empty string is a
+            // valid operand from a compared but uninitialized cached marker.
+            if (!tableExists(db, "transform_decisions")) return;
+            ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
+            ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
+            ensureColumn(db, "transform_decisions", "m0_model_key_prev", "TEXT");
+            ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
+        },
+    },
+    {
+        version: 80,
+        description: "record observed m[0] tool-set hash comparisons",
+        up(db: Database): void {
+            // Tool-set changes never trigger a fold, but the decision site can
+            // still compare their cached and live names. Preserve only those
+            // actual operands: NULL means no comparison ran on that pass, while
+            // an empty string remains a real compared cached baseline.
+            if (!tableExists(db, "transform_decisions")) return;
+            ensureColumn(db, "transform_decisions", "m0_tool_set_hash_prev", "TEXT");
+            ensureColumn(db, "transform_decisions", "m0_tool_set_hash_new", "TEXT");
+        },
+    },
+    {
+        version: 81,
+        description: "persist last-known-good transform snapshots across restarts",
+        up(db: Database): void {
+            // Durable home for the LKG replay slot. The in-memory slot dies with
+            // the process, so a plugin restart right after a module bounce left
+            // the recovery ladder with nothing to replay. One row per session;
+            // json_prefix stores the exact serialized prefix captured by the
+            // applied pass (never re-serialized on write or read).
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS lkg_slots (
+                    session_id TEXT PRIMARY KEY,
+                    json_prefix TEXT NOT NULL,
+                    input_id_seq TEXT NOT NULL,
+                    input_content_digests TEXT NOT NULL,
+                    input_content_signatures TEXT,
+                    last_input_message_id TEXT NOT NULL,
+                    model_key TEXT,
+                    provider_key TEXT,
+                    captured_at INTEGER NOT NULL,
+                    row_version INTEGER,
+                    capture_sequence INTEGER
+                );
+            `);
+        },
+    },
 ];
 
 /**

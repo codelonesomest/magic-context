@@ -203,6 +203,7 @@ function basePostTransformArgs(
         todowriteAvailability: { callable: true, frozen: true },
         batch: null,
         contextUsage: { percentage: 20, inputTokens: 1000 },
+        usableWindow: 128_000,
         schedulerDecision: "defer",
         fullFeatureMode: true,
         canRunCompartments: false,
@@ -298,6 +299,8 @@ describe("Channel-2 measured-collapse cycle reset", () => {
                     baselineT: 100_000,
                     turnDeltaU: 0,
                     turnDeltaT: 0,
+                    usableWindow: 128_000,
+                    realUserTurnCount: 1,
                     baselineGeneration: 1,
                     computedAt: 1,
                     evaluable: true,
@@ -1973,6 +1976,41 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(JSON.stringify(postprocessMessages.map((message) => message.parts))).toBe(
             JSON.stringify(directMessages.map((message) => message.parts)),
         );
+    });
+
+    it("observes a tool-set comparison without turning it into an m[0] fold", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-hardfold-tool-observation";
+        const baselineSignals = { ...BASE_HARD, toolSetHash: "tools-before" };
+        injectM0M1({
+            db,
+            sessionId,
+            state: getOrCreateSessionMeta(db, sessionId),
+            projectPath: FOLD_PROJECT,
+            projectDirectory: FOLD_PROJECT,
+            historyBudgetTokens: 98_000,
+            isCacheBustingPass: true,
+            hardSignals: baselineSignals,
+        });
+
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [], {
+                schedulerDecision: "defer",
+                contextUsage: { percentage: 40, inputTokens: 4000 },
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: { ...baselineSignals, toolSetHash: "tools-after" },
+                },
+            }),
+        );
+
+        expect(result.materialized).toBe(false);
+        expect(result.materializeReason).toBeNull();
+        expect(result.m0ToolSetHashPrev).toBe("tools-before");
+        expect(result.m0ToolSetHashNew).toBe("tools-after");
     });
 
     it("re-arms Channel 2 when a HARD fold advances m0 compartment coverage", async () => {

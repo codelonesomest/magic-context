@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+	getChannel1NudgeState,
 	getChannel2NudgeClaim,
 	getChannel2NudgeClaimedAt,
 	getChannel2NudgeState,
@@ -17,6 +18,7 @@ import {
 	maybeDeliverChannel2Pi,
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
+import { countRealPiUserMessages } from "./tail-hygiene-walk-pi";
 import { createTestDb } from "./test-utils.test";
 
 function channel2BaselineFields(baselineU: number, baselineT: number) {
@@ -25,6 +27,8 @@ function channel2BaselineFields(baselineU: number, baselineT: number) {
 		baselineT,
 		turnDeltaU: 0,
 		turnDeltaT: 0,
+		usableWindow: 128_000,
+		realUserTurnCount: 1,
 		baselineGeneration: 1,
 		computedAt: 1,
 		evaluable: true,
@@ -73,7 +77,9 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		expect(block).not.toBeNull();
 		expect(block?.type).toBe("text");
 		expect(block?.text).toContain("<system-reminder>");
-		expect(block?.text).toContain("ctx_reduce");
+		expect(block?.text).toContain(
+			"Housekeeping backlog: ~90k of this session's ~128k window is spent tool output",
+		);
 		clearPiChannel1State(SESSION);
 	});
 
@@ -195,6 +201,70 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		clearPiChannel1State(SESSION);
 	});
 
+	it("gives an applying drop pass one fire-free baseline before resuming", () => {
+		const db = createTestDb();
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(90_000, 120_000),
+			reducedSinceRefresh: false,
+			agentDropsAppliedThisPass: true,
+			oldestReclaimableToolTags: [],
+		});
+		const applyingPass = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "output on applying pass" }],
+		});
+		expect(applyingPass).toBeNull();
+
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(90_000, 120_000),
+			reducedSinceRefresh: false,
+			agentDropsAppliedThisPass: false,
+			oldestReclaimableToolTags: [],
+		});
+		const nextPass = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "output on next pass" }],
+		});
+		expect(nextPass?.text).toContain("Housekeeping backlog: ~90k");
+		clearPiChannel1State(SESSION);
+	});
+
+	it("clears both the persisted level and ordinal when a collapse resets the cycle", () => {
+		const db = createTestDb();
+		seedBaseline(90_000);
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "bash",
+				content: [{ type: "text", text: "first output" }],
+			}),
+		).not.toBeNull();
+		expect(getChannel1NudgeState(db, SESSION)).toEqual({
+			level: "urgent",
+			ordinal: 1,
+		});
+
+		seedBaseline(10_000);
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "bash",
+				content: [{ type: "text", text: "post-collapse output" }],
+			}),
+		).toBeNull();
+		expect(getChannel1NudgeState(db, SESSION)).toEqual({
+			level: "",
+			ordinal: 0,
+		});
+		clearPiChannel1State(SESSION);
+	});
+
 	it("suppresses on a ctx_reduce tool result and marks reduced", () => {
 		const db = createTestDb();
 		seedBaseline(90_000);
@@ -226,6 +296,154 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			content: [{ type: "text", text: "out <system-reminder> already here" }],
 		});
 		expect(block).toBeNull();
+		clearPiChannel1State(SESSION);
+	});
+
+	it("uses real user turns for sticky refires, expiration, and escalation", () => {
+		const db = createTestDb();
+		const baseline = (
+			baselineU: number,
+			baselineT: number,
+			realUserTurnCount: number,
+		) => ({
+			...channel2BaselineFields(baselineU, baselineT),
+			realUserTurnCount,
+			reducedSinceRefresh: false,
+			oldestReclaimableToolTags: [],
+		});
+		const realUserTurns = (
+			messages: readonly unknown[],
+			syntheticLeadingCount = 0,
+		) =>
+			countRealPiUserMessages({
+				messages,
+				tags: [],
+				protectedTags: 0,
+				syntheticLeadingCount,
+			});
+		const realTurn = { role: "user", content: "continue" };
+		const sameTurnWithSyntheticRows = [
+			{ role: "user", content: "m0 head" },
+			{ role: "user", content: "m1 head" },
+			realTurn,
+		];
+		const firstTurnCount = realUserTurns([realTurn]);
+		const sameTurnCount = realUserTurns(sameTurnWithSyntheticRows, 2);
+		expect(sameTurnCount).toBe(firstTurnCount);
+
+		setPiChannel1Baseline(SESSION, baseline(50_000, 120_000, firstTurnCount));
+		const first = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "first output" }],
+		});
+		expect(first?.text).toContain(
+			"Housekeeping: ~50k of this session's ~128k window",
+		);
+		expect(
+			db
+				.prepare(
+					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
+				)
+				.get(SESSION),
+		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":1}' });
+
+		// Live repro: m0/m1 are two synthetic user rows in the same real turn.
+		setPiChannel1Baseline(SESSION, baseline(80_000, 180_000, sameTurnCount));
+		const sticky = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "second output" }],
+		});
+		expect(sticky?.text).toContain(
+			"Reminder: ctx_reduce housekeeping still pending —",
+		);
+		expect(sticky?.text).not.toContain("Not a limit");
+
+		const threeRealTurnsLater = [
+			{ role: "user", content: "m0 head" },
+			{ role: "user", content: "m1 head" },
+			...Array.from({ length: 4 }, (_, index) => ({
+				role: "user",
+				content: `real turn ${index}`,
+			})),
+		];
+		setPiChannel1Baseline(
+			SESSION,
+			baseline(110_000, 240_000, realUserTurns(threeRealTurnsLater, 2)),
+		);
+		const expired = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "third output" }],
+		});
+		expect(expired?.text).toContain(
+			"Housekeeping: ~110k of this session's ~128k window",
+		);
+		expect(expired?.text).not.toContain(
+			"Reminder: ctx_reduce housekeeping still pending",
+		);
+
+		setPiChannel1Baseline(SESSION, baseline(120_000, 180_000, 4));
+		const escalation = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "fourth output" }],
+		});
+		expect(escalation?.text).toContain("Housekeeping backlog: ~120k");
+		expect(escalation?.text).not.toContain(
+			"Reminder: ctx_reduce housekeeping still pending",
+		);
+		clearPiChannel1State(SESSION);
+	});
+
+	it("expires a legacy raw ordinal before writing the real-user counter", () => {
+		const db = createTestDb();
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(80_000, 180_000),
+			realUserTurnCount: 1,
+			reducedSinceRefresh: false,
+			oldestReclaimableToolTags: [],
+		});
+		// The first delivery creates the session row; replace only the persisted
+		// ordinal with a legacy raw-message value before the re-evaluation.
+		maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "seed output" }],
+		});
+		db.prepare(
+			"UPDATE session_meta SET last_nudge_undropped = ?, last_nudge_level = ? WHERE session_id = ?",
+		).run(50_000, '{"level":"firm","ordinal":160750}', SESSION);
+		expect(getChannel1NudgeState(db, SESSION)).toEqual({
+			level: "firm",
+			ordinal: 160_750,
+		});
+
+		const block = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "legacy output" }],
+		});
+		expect(block?.text).toContain(
+			"Housekeeping: ~80k of this session's ~128k window",
+		);
+		expect(block?.text).not.toContain(
+			"Reminder: ctx_reduce housekeeping still pending",
+		);
+		expect(
+			db
+				.prepare(
+					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
+				)
+				.get(SESSION),
+		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":1}' });
 		clearPiChannel1State(SESSION);
 	});
 });
@@ -284,7 +502,9 @@ describe("maybeDeliverChannel2Pi", () => {
 		expect(capturedDisplay).toBe(false);
 		expect(capturedCustomType).toBe("magic-context:ceiling-nudge");
 		expect(capturedContent).toContain("<system-reminder>");
-		expect(capturedContent).toContain("ctx_reduce");
+		expect(capturedContent).toContain(
+			"Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~75k of ~128k reclaimable).",
+		);
 		expect(capturedContent).toContain("oldest reclaimable");
 		expect(getChannel2NudgeState(db, SESSION)).toBe("delivered");
 	});

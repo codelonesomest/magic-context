@@ -5,6 +5,8 @@ import type { ClassifyModuleClient } from "../features/magic-context/dreamer/cla
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
+    HISTORIAN_CHILD_TITLE_MATCHES,
+    historianOrphanStaleMs,
     PRIVACY_SENSITIVE_CHILD_TASKS,
     PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
     retrospectiveOrphanStaleMs,
@@ -54,6 +56,7 @@ import {
 import type { RawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
+import type { ModelHarness } from "../shared/model-resolution";
 import type { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./boot-quiet";
@@ -75,6 +78,8 @@ const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
 interface ProjectRegistration {
     directory: string;
     projectIdentity: string;
+    /** The runtime selecting models for this registration. */
+    harness: ModelHarness;
     client: PluginContext["client"];
     dreamerConfig?: DreamerConfig;
     language?: string;
@@ -85,6 +90,11 @@ interface ProjectRegistration {
     };
     memoryEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
+    historianChildSweep?: {
+        timeoutMs: number;
+        fallbackModelCount: number;
+        keepSubagents: boolean;
+    };
     mural?: { enabled: boolean; model?: string };
     retinaHandoff?: boolean;
     embeddingConfig?: { provider?: string };
@@ -333,7 +343,8 @@ async function runProjectMaintenance(
     const projectMaintenanceEnabled =
         Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
         reg.memoryEnabled === true ||
-        reg.gitCommitIndexing?.enabled === true;
+        reg.gitCommitIndexing?.enabled === true ||
+        reg.historianChildSweep !== undefined;
     if (!projectMaintenanceEnabled) return;
 
     await reg.ensureRegistered(reg.directory, db);
@@ -404,6 +415,8 @@ async function sweepProject(
         );
     }
 
+    await sweepOrphanedHistorianChildren(reg);
+
     const dreamerConfig = reg.dreamerConfig;
     const dreamingEnabled = Boolean(dreamerConfig && dreamerConfig.disable !== true);
     if (commitIndexingEnabled && reg.gitCommitIndexing) {
@@ -427,7 +440,12 @@ async function sweepProject(
         // runs due tasks grouped by conflict-domain under keyed leases. The
         // executor runs in THIS registration's own checkout (not a sibling
         // worktree the shared git:<sha> identity might resolve to).
-        const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreamerConfig, reg.language);
+        const runtimeConfigs = buildDreamTaskRuntimeConfigs(
+            dreamerConfig,
+            "opencode",
+            reg.language,
+            reg.mural?.model,
+        );
         const executor = createDreamTaskExecutor({
             client: reg.client,
             sessionDirectory: reg.directory,
@@ -445,7 +463,6 @@ async function sweepProject(
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
             ensureProjectRegistered: reg.ensureRegistered,
             language: reg.language,
-            dreamerModel: dreamerConfig.model,
             mural: reg.mural,
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             retinaHandoff: reg.retinaHandoff,
@@ -492,6 +509,30 @@ async function sweepProject(
         }
     } catch (error) {
         log(`[dreamer] timer-triggered task scheduling failed for ${reg.projectIdentity}:`, error);
+    }
+}
+
+async function sweepOrphanedHistorianChildren(reg: ProjectRegistration): Promise<void> {
+    const config = reg.historianChildSweep;
+    if (!config || config.keepSubagents) return;
+
+    const ocDb = openOpenCodeDb();
+    if (!ocDb) return;
+    try {
+        await sweepOrphanedRetrospectiveChildren({
+            opencodeDb: ocDb,
+            client: reg.client,
+            sessionDirectory: reg.directory,
+            staleMs: historianOrphanStaleMs(config.timeoutMs, config.fallbackModelCount),
+            titleMatches: HISTORIAN_CHILD_TITLE_MATCHES,
+        });
+    } catch (error) {
+        log(
+            `[magic-context] historian child orphan sweep failed for ${reg.projectIdentity}:`,
+            error,
+        );
+    } finally {
+        closeQuietly(ocDb);
     }
 }
 

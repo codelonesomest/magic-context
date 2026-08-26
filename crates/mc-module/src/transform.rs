@@ -45,9 +45,9 @@ use crate::selection::{
     SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
-    effective_tail_hygiene, hygiene_band, measure_tail_hygiene, refresh_tail_hygiene_baseline,
-    HygieneBand, CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS,
-    CHANNEL2_SEVERITY_THRESHOLD,
+    effective_tail_hygiene, hygiene_band, measure_tail_hygiene_with_pending_drops,
+    queued_tag_numbers, real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand,
+    CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -1731,6 +1731,7 @@ struct PendingOverlayDecisions {
     tag_mint_ms: f64,
     temporal_ms: f64,
     temporal_marks: Vec<TemporalMarkInput>,
+    rewrite_temporal_marks: bool,
     user_hint: Option<UserHintDecisionInput>,
     channel1_append: Option<Channel1AppendRow>,
 }
@@ -1746,6 +1747,7 @@ struct OverlayComputation<'a, 'ctx> {
     overlay_frontier: Option<u64>,
     tag_mint_enabled: bool,
     temporal_enabled: bool,
+    rewrite_temporal_marks: bool,
     mutation_exempt_mid: Option<&'a str>,
     lineage_anchor_mid: Option<&'a str>,
 }
@@ -1762,6 +1764,7 @@ impl PendingOverlayDecisions {
 
 struct Channel1NudgeInputs<'a, 'ctx> {
     ctx: &'a ProducerContext<'ctx>,
+    usable_window_tokens: i64,
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
@@ -1769,6 +1772,8 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     channel1_appends: &'a [Channel1AppendRow],
     mutation_exempt_mid: Option<&'a str>,
     protected_tags: usize,
+    pending_drop_target_ids: &'a HashSet<String>,
+    agent_drops_applied_this_pass: bool,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -1777,6 +1782,9 @@ struct Channel1NudgeInputs<'a, 'ctx> {
 #[derive(Debug)]
 pub enum TransformError {
     Store(McStoreError),
+    /// Anthropic cannot accept an assistant-terminal retry, and moving completed output
+    /// below its own prompt would rewrite conversational causality.
+    AssistantTerminalRetry,
     /// Live-source ordinals must be unique + strictly increasing.
     OrdinalViolation,
     /// A non-synthetic item used a reserved `mc_*` id.
@@ -1821,6 +1829,10 @@ impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransformError::Store(e) => write!(f, "store: {e}"),
+            TransformError::AssistantTerminalRetry => write!(
+                f,
+                "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue."
+            ),
             TransformError::OrdinalViolation => {
                 write!(f, "live-source ordinals not strictly increasing")
             }
@@ -3220,6 +3232,16 @@ fn apply_once(
     timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
+    // Legacy sessions stored the CC latch before the generic surface latch existed.
+    // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
+    let persisted_tagging_surface_active =
+        loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active;
+    let lineage_anchor_mid = loaded
+        .meta
+        .anchor_block_id
+        .as_deref()
+        .and_then(split_block_id)
+        .map(|(mid, _)| mid);
     let transition_detection_started_at = Instant::now();
     let transition_shapes = renderer_transition_shapes(
         &projection,
@@ -3231,18 +3253,30 @@ fn apply_once(
             .as_ref()
             .and_then(|pair| pair.anchor_mid.as_deref()),
     );
-    let detected_transition_classes = transition_shapes.classes();
+    let mut detected_transition_classes = transition_shapes.classes();
     let consumed_transition_classes = transition_consumed_classes(&loaded.core);
+    let temporal_parity_detected = !consumed_transition_classes
+        .contains(&RendererTransitionClass::TemporalParity)
+        && tagging_surface_requested
+        && (persisted_tagging_surface_active || !loaded.meta.initialized)
+        && ctx.temporal_awareness
+        && temporal_parity_transition_needed(
+            req,
+            &projection,
+            &transform_snapshot.temporal_marks,
+            overlay_frontier,
+            loaded.meta.initialized,
+            mutation_exempt_mid,
+            lineage_anchor_mid,
+        );
+    if temporal_parity_detected {
+        detected_transition_classes.insert(RendererTransitionClass::TemporalParity);
+    }
+    let rewrite_temporal_marks = temporal_parity_detected;
     let transition_due = loaded.meta.initialized
         && !req.is_subagent
         && !detected_transition_classes.is_subset(&consumed_transition_classes);
     timings.transition_detection = elapsed_ms(transition_detection_started_at);
-    let lineage_anchor_mid = loaded
-        .meta
-        .anchor_block_id
-        .as_deref()
-        .and_then(split_block_id)
-        .map(|(mid, _)| mid);
     if let Some(base) = loaded.meta.ordinal_continuation_base {
         let expected_boundary = base.checked_add(1).ok_or_else(|| {
             TransformError::LineageProtocol(
@@ -3280,10 +3314,6 @@ fn apply_once(
             req.session_id
         );
     }
-    // Legacy sessions stored the CC latch before the generic surface latch existed.
-    // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
-    let persisted_tagging_surface_active =
-        loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active;
     let surface_transition = persisted_tagging_surface_active != tagging_surface_requested;
     let surface_state = if surface_transition {
         SurfaceState::Transition
@@ -3635,6 +3665,7 @@ fn apply_once(
             overlay_frontier,
             tag_mint_enabled: tagging_active || caveman_tagging_requested,
             temporal_enabled: temporal_active,
+            rewrite_temporal_marks,
             mutation_exempt_mid,
             lineage_anchor_mid,
         })?;
@@ -3653,6 +3684,10 @@ fn apply_once(
     let planning_started_at = Instant::now();
     let pending_drops_started_at = Instant::now();
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
+    let pending_drop_target_ids = pending_agent_drops
+        .iter()
+        .map(|drop| drop.target_id.clone())
+        .collect::<HashSet<_>>();
     timings.pending_drops = elapsed_ms(pending_drops_started_at);
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
@@ -5127,13 +5162,14 @@ fn apply_once(
 
     let hygiene_tag_rows =
         tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
-    let hygiene_measurement = measure_tail_hygiene(
+    let hygiene_measurement = measure_tail_hygiene_with_pending_drops(
         &projection,
         &core,
         meta.coverage_ordinal,
         &hygiene_tag_rows,
         req.protected_tags,
         &protected_block_ids,
+        &pending_drop_target_ids,
     );
     let current_hygiene_baseline = if is_bust_pass {
         let refreshed = refresh_tail_hygiene_baseline(
@@ -5157,11 +5193,17 @@ fn apply_once(
         refreshed_coverage,
     );
     rearm_channel2_after_measured_collapse(&mut meta, is_bust_pass);
+    let agent_drops_applied_this_pass =
+        pending_agent_drops_applied_this_pass(&pending_agent_drops, &loaded.core, &core);
 
     if tagging_active {
         if let Some(row) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 ctx,
+                usable_window_tokens: effective_nudge_window_tokens(
+                    req.geometry.as_ref(),
+                    context_limit_tokens,
+                ),
                 core: &core,
                 projection: &projection,
                 tag_rows: &hygiene_tag_rows,
@@ -5169,6 +5211,8 @@ fn apply_once(
                 channel1_appends: &channel1_appends,
                 mutation_exempt_mid,
                 protected_tags: req.protected_tags,
+                pending_drop_target_ids: &pending_drop_target_ids,
+                agent_drops_applied_this_pass,
             },
             &mut meta,
         ) {
@@ -5311,7 +5355,10 @@ fn apply_once(
         timings: build_timings,
     } = built_output;
     #[cfg(test)]
-    assert_no_orphaned_tool_arcs(&ck_messages);
+    {
+        assert_no_orphaned_tool_arcs(&ck_messages);
+        assert_no_foreign_reduction_input_keys(ck_messages.iter().map(Deref::deref));
+    }
     timings.build_output = elapsed_ms(build_output_started_at);
     timings.blocks_by_mid = build_timings.blocks_by_mid;
     timings.build_frozen_unit_index = build_timings.frozen_unit_index;
@@ -5353,12 +5400,17 @@ fn apply_once(
         &req.channel2_nudge_state,
         ctx.now_ms,
         Channel2DirectiveInput {
+            usable_window_tokens: effective_nudge_window_tokens(
+                req.geometry.as_ref(),
+                context_limit_tokens,
+            ),
             core: &core,
             projection: &projection,
             tag_rows: &hygiene_tag_rows,
             baseline: current_hygiene_baseline.as_ref(),
             mutation_exempt_mid,
             protected_tags: req.protected_tags,
+            pending_drop_target_ids: &pending_drop_target_ids,
         },
         &mut meta,
     );
@@ -5418,6 +5470,7 @@ fn apply_once(
                     tag_mints: &tag_rows[pending_overlays.tag_mint_start
                         ..pending_overlays.tag_mint_start + pending_overlays.tag_mint_count],
                     temporal_marks: &pending_overlays.temporal_marks,
+                    rewrite_temporal_marks: pending_overlays.rewrite_temporal_marks,
                     user_hint: pending_overlays.user_hint.as_ref(),
                     channel1_append: pending_overlays.channel1_append.as_ref(),
                     created_at_ms: ctx.now_ms,
@@ -5590,7 +5643,7 @@ fn enforce_block_identity(
         // Accept it only when the stored strip/keep decision reconstructs the full
         // message identity that was previously served.
         if trailing_blank_identity_replays_stored(req, core, mid, stored) {
-            if latest_assistant_reasoning_mutation_exempt_mid(&req.messages) == Some(mid.as_str())
+            if latest_assistant_mid(&req.messages) == Some(mid.as_str())
                 && frozen_trailing_blank_decision(core, mid)
                     == Some(FrozenTrailingBlankDecision::Strip)
             {
@@ -5750,6 +5803,20 @@ fn effective_context_limit_tokens(
         }
     }
     200_000.0
+}
+
+fn effective_nudge_window_tokens(
+    geometry: Option<&TransformGeometry>,
+    scheduler_context_limit_tokens: f64,
+) -> i64 {
+    // Keep the usage-reported context limit for scheduler calculations. Reminder text describes
+    // context available after host reserves, so prefer the host's `usable_soft` geometry.
+    geometry
+        .filter(|geometry| geometry.usable_soft >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT)
+        .map_or(scheduler_context_limit_tokens, |geometry| {
+            geometry.usable_soft as f64
+        })
+        .round() as i64
 }
 
 fn effective_hard_context_limit_tokens(
@@ -6544,6 +6611,18 @@ fn log_reasoning_drop_seed_skips(core: &CoreState, live: &[&FlatBlock], session_
             }
         }
     }
+}
+
+fn pending_agent_drops_applied_this_pass(
+    pending: &[PendingAgentDrop],
+    loaded_core: &CoreState,
+    final_core: &CoreState,
+) -> bool {
+    let frozen_before = frozen_red_targets(loaded_core);
+    let frozen_after = frozen_red_targets(final_core);
+    pending.iter().any(|drop| {
+        !frozen_before.contains(&drop.target_id) && frozen_after.contains(&drop.target_id)
+    })
 }
 
 /// Commands whose first application froze at least one previously unfrozen target.
@@ -8038,6 +8117,77 @@ pub fn temporal_gap_prefix(gap_ms: i64) -> Option<String> {
     Some(format!("<!-- {marker} -->\n"))
 }
 
+/// Reproduce the TypeScript temporal walk from immutable message timestamps. Every message
+/// advances the time basis, while only authored users receive a decision on their first visible
+/// text block.
+fn timestamp_temporal_marks(
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+) -> Vec<TemporalMarkInput> {
+    let mut previous = None;
+    let mut marks = Vec::new();
+    for message in &req.messages {
+        if is_authored_user_message(message)
+            && mutation_exempt_mid != Some(message.mid.as_str())
+            && lineage_anchor_mid != Some(message.mid.as_str())
+        {
+            let marker_text = previous.and_then(|prior: &CkIngressMessage| {
+                let previous_created = prior.ck.meta.created_at_ms?;
+                let current_created = message.ck.meta.created_at_ms?;
+                let previous_end = prior.ck.meta.completed_at_ms.unwrap_or(previous_created);
+                Some(
+                    current_created
+                        .checked_sub(previous_end)
+                        .and_then(temporal_gap_prefix)
+                        .unwrap_or_default(),
+                )
+            });
+            if let Some(marker_text) = marker_text {
+                if let Some(block_id) = projection.blocks.iter().find_map(|block| {
+                    (block.mid == message.mid
+                        && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
+                    .then(|| block.id.clone())
+                }) {
+                    marks.push(TemporalMarkInput {
+                        ordinal: message.ordinal,
+                        block_id,
+                        marker_text,
+                    });
+                }
+            }
+        }
+        previous = Some(message);
+    }
+    marks
+}
+
+fn temporal_parity_transition_needed(
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    temporal_rows: &[TemporalMarkRow],
+    overlay_frontier: Option<u64>,
+    initialized: bool,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+) -> bool {
+    let stored = temporal_rows
+        .iter()
+        .map(|row| (row.block_id.as_str(), row.marker_text.as_str()))
+        .collect::<HashMap<_, _>>();
+    timestamp_temporal_marks(req, projection, mutation_exempt_mid, lineage_anchor_mid)
+        .into_iter()
+        .any(|mark| match stored.get(mark.block_id.as_str()) {
+            Some(marker_text) => *marker_text != mark.marker_text.as_str(),
+            None => {
+                !mark.marker_text.is_empty()
+                    && (overlay_frontier.is_some_and(|frontier| mark.ordinal <= frontier)
+                        || (initialized && overlay_frontier.is_none()))
+            }
+        })
+}
+
 fn apply_tag_overlay_to_message(
     message: &mut CkWireMessage,
     ingress: &CkIngressMessage,
@@ -8063,6 +8213,9 @@ fn apply_tag_overlay_to_message(
         if !is_reduced(block) {
             let target = &mut message.content[block.block_index];
             let mut block_changed = false;
+            if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
+                block_changed |= prepend_temporal_to_block(target, prefix);
+            }
             if let Some(kind) = taggable_kind(block) {
                 if let Some(tag_number) = overlay.tag_by_block_id.get(&block.id) {
                     block_changed |= apply_tag_prefix_to_block(
@@ -8075,9 +8228,6 @@ fn apply_tag_overlay_to_message(
                 // A boundary-lineage alarm forces raw pass-through, so only tags stored
                 // before this request are available. Newly seen blocks wait for a normal
                 // accepted pass rather than consuming tag numbers on rejected lineage.
-            }
-            if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
-                block_changed |= prepend_temporal_to_block(target, prefix);
             }
             if let Some(hint) = overlay.user_hint_by_block_id.get(&block.id) {
                 block_changed |= append_user_hint_to_block(target, hint);
@@ -8418,6 +8568,7 @@ fn compute_active_overlay_decisions(
         overlay_frontier: frontier,
         tag_mint_enabled,
         temporal_enabled,
+        rewrite_temporal_marks,
         mutation_exempt_mid,
         lineage_anchor_mid,
     } = input;
@@ -8464,13 +8615,48 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| (row.block_id.as_str(), row.created_at_ms))
         .collect::<HashMap<_, _>>();
+    let canonical_marks = if temporal_enabled {
+        timestamp_temporal_marks(req, projection, mutation_exempt_mid, lineage_anchor_mid)
+    } else {
+        Vec::new()
+    };
+    let canonical_ids = canonical_marks
+        .iter()
+        .map(|mark| mark.block_id.clone())
+        .collect::<HashSet<_>>();
     let mut decided_temporal = temporal_rows
         .iter()
         .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
+    let mut temporal_marks = Vec::new();
+    for mark in canonical_marks {
+        if let Some(existing) = temporal_rows
+            .iter_mut()
+            .find(|row| row.block_id == mark.block_id)
+        {
+            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                existing.marker_text = mark.marker_text.clone();
+                temporal_marks.push(mark);
+            }
+            continue;
+        }
+        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+        if !rewrite_temporal_marks && !is_new {
+            continue;
+        }
+        temporal_rows.push(TemporalMarkRow {
+            block_id: mark.block_id.clone(),
+            marker_text: mark.marker_text.clone(),
+            created_at: ctx.now_ms,
+        });
+        decided_temporal.insert(mark.block_id.clone());
+        temporal_marks.push(mark);
+    }
+
+    // Timestamp-free callers retain the legacy first-sight basis for the live tail. OpenCode
+    // supplies immutable per-message times, so its messages are already covered above.
     let authored_tail = eligible_authored_user_tail(req);
     let mut previous_new_user_mint = None;
-    let mut temporal_marks = Vec::new();
     for message in req.messages.iter().filter(|message| {
         !message.ck.meta.synthetic
             && message.ck.role != "system"
@@ -8502,7 +8688,8 @@ fn compute_active_overlay_decisions(
             previous_new_user_mint = None;
             continue;
         };
-        if decided_temporal.contains(block_id.as_str()) {
+        if canonical_ids.contains(block_id.as_str()) || decided_temporal.contains(block_id.as_str())
+        {
             previous_new_user_mint = Some(current_mint);
             continue;
         }
@@ -8512,10 +8699,8 @@ fn compute_active_overlay_decisions(
             continue;
         }
         let marker_text = if authored_tail.is_some_and(|tail| tail.mid == message.mid) {
-            // The gap pairs the proxy's INGRESS observation with its completion
-            // observation. Module-side now_ms would add queue plus blocking-arm
-            // latency to every gap, so a missing or invalid ingress time freezes
-            // the no-marker decision rather than guessing from a later clock.
+            // Timestamp-free harnesses pair the proxy's INGRESS observation with its completion
+            // observation. Module-side now_ms includes queue and blocking-arm latency.
             let observed_now = u64::try_from(ctx.now_ms).unwrap_or(0);
             req.request_observed_at_ms
                 .filter(|observed| *observed > 0 && *observed <= observed_now)
@@ -8531,8 +8716,6 @@ fn compute_active_overlay_decisions(
                 })
                 .unwrap_or_default()
         } else {
-            // Multiple newly observed consecutive user messages have no provider response
-            // boundary. Mint times are retained only for that rare between-users fallback.
             previous_new_user_mint
                 .and_then(|previous| current_mint.checked_sub(previous))
                 .and_then(temporal_gap_prefix)
@@ -8578,6 +8761,7 @@ fn compute_active_overlay_decisions(
     let max_seen_ordinal =
         decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
     let temporal_ms = elapsed_ms(temporal_started_at);
+    let rewrite_temporal_marks = rewrite_temporal_marks && !temporal_marks.is_empty();
 
     Ok(PendingOverlayDecisions {
         max_seen_ordinal,
@@ -8588,6 +8772,7 @@ fn compute_active_overlay_decisions(
         tag_mint_ms,
         temporal_ms,
         temporal_marks,
+        rewrite_temporal_marks,
         user_hint: None,
         channel1_append: None,
     })
@@ -9013,6 +9198,23 @@ fn maybe_append_channel1_nudge(
         input.tag_rows,
         input.mutation_exempt_mid,
     );
+    let queued_tag_numbers = queued_tag_numbers(input.tag_rows, input.pending_drop_target_ids);
+    let measured_reclaimable = input
+        .baseline
+        .map_or(0, |baseline| effective_tail_hygiene(baseline).0);
+    let cycle_reset = input.agent_drops_applied_this_pass
+        || meta.channel1_reduce_suppressed
+        || measured_reclaimable < meta.channel1_last_nudge_undropped.max(0);
+    if cycle_reset {
+        meta.channel1_last_fire_level.clear();
+        meta.channel1_last_fire_ordinal = 0;
+    }
+    if input.agent_drops_applied_this_pass {
+        meta.channel1_last_nudge_undropped = 0;
+        meta.channel1_last_nudge_level.clear();
+        meta.channel1_reduce_suppressed = false;
+        return None;
+    }
     let decision = decide_channel1(input.baseline, meta);
     meta.channel1_last_nudge_undropped = decision.next_last_nudge;
     meta.channel1_last_nudge_level = decision.next_last_level;
@@ -9033,8 +9235,23 @@ fn maybe_append_channel1_nudge(
         &existing_blocks,
         input.mutation_exempt_mid,
     )?;
-    let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags);
-    let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
+    let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags, &queued_tag_numbers);
+    let current_real_user_turn_count = real_user_turn_count(input.projection);
+    let sticky = should_use_sticky_channel1_reminder(
+        &meta.channel1_last_fire_level,
+        meta.channel1_last_fire_ordinal,
+        decision.level,
+        current_real_user_turn_count,
+    );
+    let reminder = build_channel1_reminder(
+        decision.level,
+        decision.reclaimable_tokens,
+        input.usable_window_tokens,
+        &hint,
+        sticky,
+    );
+    meta.channel1_last_fire_level = decision.level.as_str().to_string();
+    meta.channel1_last_fire_ordinal = current_real_user_turn_count;
     Some(Channel1AppendRow {
         block_id,
         reminder_text: reminder,
@@ -9183,13 +9400,16 @@ fn active_tags_for_channel2(
     derived
 }
 
+#[derive(Clone, Copy)]
 struct Channel2DirectiveInput<'a> {
+    usable_window_tokens: i64,
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
     baseline: Option<&'a TailHygieneBaseline>,
     mutation_exempt_mid: Option<&'a str>,
     protected_tags: usize,
+    pending_drop_target_ids: &'a HashSet<String>,
 }
 
 struct Channel2Pressure {
@@ -9225,6 +9445,7 @@ fn channel2_directives(
                     channel2_nudge: Some(Channel2NudgeDirective {
                         text: build_channel2_host_reminder(
                             pressure.reclaimable_tokens,
+                            input.usable_window_tokens,
                             &pressure.hint,
                         ),
                     }),
@@ -9264,7 +9485,8 @@ fn channel2_pressure(
             input.tag_rows,
             input.mutation_exempt_mid,
         );
-        oldest_channel2_hint(&active_tags, input.protected_tags)
+        let queued_tag_numbers = queued_tag_numbers(input.tag_rows, input.pending_drop_target_ids);
+        oldest_channel2_hint(&active_tags, input.protected_tags, &queued_tag_numbers)
     } else {
         Vec::new()
     };
@@ -9358,7 +9580,11 @@ fn claude_code_channel2_directive(
 
     let arming_watermark = meta.channel2_arming_watermark.saturating_add(1);
     let pending = PendingChannel2Directive {
-        text: build_channel2_reminder_text(pressure.reclaimable_tokens, &pressure.hint),
+        text: build_channel2_reminder_text(
+            pressure.reclaimable_tokens,
+            input.usable_window_tokens,
+            &pressure.hint,
+        ),
         directive_id: channel2_directive_id(session_id, arming_watermark),
         armed_at_ms: now_ms,
         arming_watermark,
@@ -9405,11 +9631,13 @@ fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i
 fn oldest_channel2_hint(
     active_tags: &[ActiveTagForNudge],
     protected_tags: usize,
+    queued_tag_numbers: &HashSet<i64>,
 ) -> Vec<(i64, String)> {
     let protected_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     active_tags
         .iter()
         .filter(|tag| tag.kind == "tool_result")
+        .filter(|tag| !queued_tag_numbers.contains(&tag.tag_number))
         .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
         .filter(|tag| tag.token_count >= 100)
         .take(4)
@@ -9417,16 +9645,25 @@ fn oldest_channel2_hint(
         .collect()
 }
 
-fn build_channel2_reminder_text(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
+fn build_channel2_reminder_text(
+    reclaimable_tokens: i64,
+    usable_window_tokens: i64,
+    hint: &[(i64, String)],
+) -> String {
     let amount = approx_thousands(reclaimable_tokens);
+    let usable_window = approx_thousands(usable_window_tokens);
     let hint_text = format_reclaimable_hint(hint);
     format!(
-        "Routine context housekeeping is near: a large span of this session will be comparted soon, and ~{amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce first so the archived span is the part that matters.{hint_text}"
+        "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~{amount} of ~{usable_window} reclaimable).{hint_text}"
     )
 }
 
-fn build_channel2_host_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
-    let text = build_channel2_reminder_text(reclaimable_tokens, hint);
+fn build_channel2_host_reminder(
+    reclaimable_tokens: i64,
+    usable_window_tokens: i64,
+    hint: &[(i64, String)],
+) -> String {
+    let text = build_channel2_reminder_text(reclaimable_tokens, usable_window_tokens, hint);
     format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
@@ -9578,6 +9815,7 @@ mod nudge_formula_tests {
                 tag(7, "read", 900),
             ],
             0,
+            &HashSet::new(),
         );
 
         assert_eq!(
@@ -9589,6 +9827,20 @@ mod nudge_formula_tests {
                 (7, "read".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn channel1_hint_excludes_queued_drops_but_keeps_unqueued_siblings() {
+        let tag = |tag_number: i64, tool_name: &str| ActiveTagForNudge {
+            tag_number,
+            kind: "tool_result".to_string(),
+            token_count: 900,
+            tool_name: tool_name.to_string(),
+        };
+        let queued = HashSet::from([1]);
+        let hint = oldest_reclaimable_hint(&[tag(1, "bash"), tag(2, "read")], 0, &queued);
+
+        assert_eq!(hint, vec![(2, "read".to_string())]);
     }
 
     #[test]
@@ -9615,10 +9867,69 @@ mod nudge_formula_tests {
                 },
             ],
             0,
+            &HashSet::new(),
         );
 
         assert!(hint.is_empty());
         assert!(format_reclaimable_hint(&hint).is_empty());
+    }
+
+    #[test]
+    fn reminder_wording_uses_the_usable_window_and_keeps_gentle_number_free() {
+        let gentle = build_channel1_reminder(Channel1Level::Gentle, 42_000, 128_000, &[], false);
+        assert!(gentle.contains("Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope."));
+        assert!(!gentle.chars().any(|character| character.is_ascii_digit()));
+
+        let firm = build_channel1_reminder(Channel1Level::Firm, 42_000, 128_000, &[], false);
+        assert!(firm.contains("Housekeeping: ~42k of this session's ~128k window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."));
+        let urgent = build_channel1_reminder(Channel1Level::Urgent, 61_000, 128_000, &[], false);
+        assert!(urgent.contains("Housekeeping backlog: ~61k of this session's ~128k window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."));
+
+        let channel2 = build_channel2_reminder_text(55_000, 128_000, &[]);
+        assert_eq!(channel2, "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~55k of ~128k reclaimable).");
+    }
+
+    #[test]
+    fn same_level_refires_dampen_by_real_user_turn_but_expire_and_escalate() {
+        // The synthetic-row regression uses a real turn count of one both
+        // before and after the injected rows, so the same-level refire sticks.
+        assert!(should_use_sticky_channel1_reminder(
+            "firm",
+            1,
+            Channel1Level::Firm,
+            1,
+        ));
+        assert!(should_use_sticky_channel1_reminder(
+            "firm",
+            1,
+            Channel1Level::Firm,
+            3,
+        ));
+        assert!(!should_use_sticky_channel1_reminder(
+            "firm",
+            1,
+            Channel1Level::Firm,
+            4,
+        ));
+        // A legacy raw message ordinal must not compare as a user-turn count.
+        assert!(!should_use_sticky_channel1_reminder(
+            "firm",
+            160_750,
+            Channel1Level::Firm,
+            1,
+        ));
+        assert!(!should_use_sticky_channel1_reminder(
+            "firm",
+            1,
+            Channel1Level::Urgent,
+            1,
+        ));
+        let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 128_000, &[], true);
+        assert!(sticky.contains("Reminder: ctx_reduce housekeeping still pending —"));
+        assert!(!sticky.contains("Not a limit"));
+        let escalation =
+            build_channel1_reminder(Channel1Level::Urgent, 80_000, 128_000, &[], false);
+        assert!(escalation.contains("Housekeeping backlog:"));
     }
 
     #[test]
@@ -9678,12 +9989,14 @@ mod nudge_formula_tests {
             None,
             10 + CHANNEL2_DIRECTIVE_LEASE_TTL_MS,
             Channel2DirectiveInput {
+                usable_window_tokens: 128_000,
                 core: &core,
                 projection: &projection,
                 tag_rows: &tags,
                 baseline: Some(&due_baseline),
                 mutation_exempt_mid: None,
                 protected_tags: 0,
+                pending_drop_target_ids: &HashSet::new(),
             },
             &mut stale,
         )
@@ -9697,12 +10010,14 @@ mod nudge_formula_tests {
             Some(&delivered_id),
             20,
             Channel2DirectiveInput {
+                usable_window_tokens: 128_000,
                 core: &core,
                 projection: &projection,
                 tag_rows: &tags,
                 baseline: Some(&due_baseline),
                 mutation_exempt_mid: None,
                 protected_tags: 0,
+                pending_drop_target_ids: &HashSet::new(),
             },
             &mut stale,
         );
@@ -9758,12 +10073,14 @@ fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
 fn oldest_reclaimable_hint(
     active_tags: &[ActiveTagForNudge],
     protected_tags: usize,
+    queued_tag_numbers: &HashSet<i64>,
 ) -> Vec<(i64, String)> {
     let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     let mut candidates = active_tags
         .iter()
         .filter(|tag| {
             tag.kind == "tool_result"
+                && !queued_tag_numbers.contains(&tag.tag_number)
                 && tag.token_count >= AGE_RECLAIM_MIN_TOKENS as i64
                 && !is_reclaim_hint_excluded_tool(&tag.tool_name)
                 && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)
@@ -9779,22 +10096,49 @@ fn oldest_reclaimable_hint(
     candidates
 }
 
+const CHANNEL1_STICKY_REAL_USER_TURN_GAP: u64 = 3;
+
+fn should_use_sticky_channel1_reminder(
+    last_level: &str,
+    last_ordinal: u64,
+    level: Channel1Level,
+    current_real_user_turn_count: u64,
+) -> bool {
+    // Never-fired is encoded by an empty last_level, never by ordinal zero: a
+    // window with no real user rows (a pure tool stream) legitimately fires at
+    // count 0 and must still dampen its re-fires. Older module metadata stored
+    // a raw message ordinal here; a raw ordinal greater than the real-user
+    // counter is an incompatible legacy unit, so let one full reminder replace
+    // it instead of damping accidentally.
+    last_level == level.as_str()
+        && current_real_user_turn_count >= last_ordinal
+        && current_real_user_turn_count - last_ordinal < CHANNEL1_STICKY_REAL_USER_TURN_GAP
+}
+
 fn build_channel1_reminder(
     level: Channel1Level,
     reclaimable_tokens: i64,
+    usable_window_tokens: i64,
     hint: &[(i64, String)],
+    sticky: bool,
 ) -> String {
-    let amount = approx_thousands(reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
+    if sticky {
+        return format!(
+            "\n\n<system-reminder>\nReminder: ctx_reduce housekeeping still pending —{hint_text}\n</system-reminder>"
+        );
+    }
+
+    let amount = approx_thousands(reclaimable_tokens);
+    let usable_window = approx_thousands(usable_window_tokens);
     let body = match level {
-        Channel1Level::Gentle => format!(
-            "You have ~{amount} tokens of tool output you have not reduced. When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean."
-        ),
+        Channel1Level::Gentle =>
+            "Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.".to_string(),
         Channel1Level::Firm => format!(
-            "~{amount} tokens of unreduced tool output has built up. At your next natural stopping point, consider dropping what you have already processed with ctx_reduce."
+            "Housekeeping: ~{amount} of this session's ~{usable_window} window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."
         ),
         Channel1Level::Urgent => format!(
-            "~{amount} tokens of unreduced tool output remain, and a large span of this session will be comparted before long. Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters."
+            "Housekeeping backlog: ~{amount} of this session's ~{usable_window} window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."
         ),
     };
     format!("\n\n<system-reminder>\n{body}{hint_text}\n</system-reminder>")
@@ -10593,6 +10937,8 @@ enum RendererTransitionClass {
     UnmatchedPair,
     SplitCoverage,
     SyntheticAnchorSplit,
+    ReductionEnvelope,
+    TemporalParity,
 }
 
 fn v1_transition_classes() -> BTreeSet<RendererTransitionClass> {
@@ -10610,6 +10956,7 @@ struct RendererTransitionShapes {
     unmatched_tool_pair_call_ids: Vec<String>,
     split_coverage_arc_ids: Vec<String>,
     synthetic_anchor_split_arc_ids: Vec<String>,
+    reduction_envelope_call_ids: Vec<String>,
 }
 
 impl RendererTransitionShapes {
@@ -10626,6 +10973,9 @@ impl RendererTransitionShapes {
         }
         if !self.synthetic_anchor_split_arc_ids.is_empty() {
             classes.insert(RendererTransitionClass::SyntheticAnchorSplit);
+        }
+        if !self.reduction_envelope_call_ids.is_empty() {
+            classes.insert(RendererTransitionClass::ReductionEnvelope);
         }
         classes
     }
@@ -10645,6 +10995,11 @@ fn renderer_transition_shapes(
         .iter()
         .filter_map(|unit| unit.key.strip_prefix(RED_KEY_PREFIX))
         .collect::<HashSet<_>>();
+    let reduced_call_targets = frozen_units
+        .iter()
+        .filter(|unit| matches!(unit.kind.as_str(), "skeleton" | "edit_marker"))
+        .filter_map(|unit| unit.key.strip_prefix(RED_KEY_PREFIX))
+        .collect::<HashSet<_>>();
     let split_coverage_arc_ids = split_coverage_tool_arcs(projection, coverage_ordinal)
         .into_iter()
         .map(|arc| arc.arc_id)
@@ -10654,10 +11009,18 @@ fn renderer_transition_shapes(
             .into_iter()
             .map(|arc| arc.arc_id)
             .collect();
+    let reduction_envelope_call_ids = projection
+        .blocks
+        .iter()
+        .filter(|block| reduced_call_targets.contains(block.id.as_str()))
+        .filter(|block| matches!(&block.wire.kind, ck_wire::CkKind::ToolCall { .. }))
+        .map(|block| block.id.clone())
+        .collect();
     if frozen_targets.is_empty() {
         return RendererTransitionShapes {
             split_coverage_arc_ids,
             synthetic_anchor_split_arc_ids,
+            reduction_envelope_call_ids,
             ..Default::default()
         };
     }
@@ -10709,6 +11072,7 @@ fn renderer_transition_shapes(
         unmatched_tool_pair_call_ids,
         split_coverage_arc_ids,
         synthetic_anchor_split_arc_ids,
+        reduction_envelope_call_ids,
     }
 }
 
@@ -11110,6 +11474,28 @@ fn duplicate_tool_use_locations(messages: &[ServedMessage]) -> Vec<(String, usiz
 }
 
 #[cfg(test)]
+fn assert_no_foreign_reduction_input_keys<'a>(
+    messages: impl IntoIterator<Item = &'a CkWireMessage>,
+) {
+    let foreign = messages
+        .into_iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match &block.kind {
+            ck_wire::CkKind::ToolCall { id, input, .. }
+                if input.get("reduced").is_some() || input.get("summary").is_some() =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        foreign.is_empty(),
+        "served tool inputs contain foreign reduction-envelope keys: {foreign:?}"
+    );
+}
+
+#[cfg(test)]
 fn assert_no_orphaned_tool_arcs(messages: &[ServedMessage]) {
     let external_calls = |message: &ServedMessage| {
         message
@@ -11298,6 +11684,102 @@ enum FrozenTrailingBlankDecision {
     Strip,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UserTerminatedTailDecision {
+    Unchanged,
+    Reanchor { user_mid: String },
+}
+
+fn assistant_has_completed_content(message: &CkIngressMessage) -> bool {
+    message.ck.content.iter().any(|block| match &block.kind {
+        ck_wire::CkKind::Text { text } => !text.trim().is_empty(),
+        _ => true,
+    })
+}
+
+/// OpenCode marks notice-triggered user prompts synthetic, the same flag used by stale
+/// injected history. Only the newest user owns the live request; historical synthetic rows
+/// remain excluded by the ordinary tail filters.
+pub(crate) fn is_newest_synthetic_user_prompt(
+    request: &TransformRequest,
+    message: &CkIngressMessage,
+) -> bool {
+    message.ck.meta.synthetic
+        && message.ck.role == "user"
+        && request
+            .messages
+            .last()
+            .is_some_and(|newest| newest.mid == message.mid)
+}
+
+pub(crate) fn user_terminated_tail_decision(
+    request: &TransformRequest,
+) -> UserTerminatedTailDecision {
+    if !request.serve_native
+        || SerializerProfile::parse(&request.serializer_profile)
+            != Some(SerializerProfile::OpencodeAiSdk)
+        || request.provider_id.as_deref() != Some("anthropic")
+        || request
+            .messages
+            .last()
+            .map(|message| message.ck.role.as_str())
+            != Some("assistant")
+    {
+        return UserTerminatedTailDecision::Unchanged;
+    }
+
+    let Some(user_index) = request
+        .messages
+        .iter()
+        .rposition(|message| message.ck.role == "user")
+    else {
+        return UserTerminatedTailDecision::Unchanged;
+    };
+    let trailing = &request.messages[user_index + 1..];
+    // A blank/error shell contains no provider-authored content, so moving the existing
+    // user boundary past it is lossless. Reasoning, tools, media, opaque blocks, and
+    // non-blank text are completed content and must never be reordered below their prompt.
+    if trailing
+        .iter()
+        .all(|message| message.ck.role == "assistant" && !assistant_has_completed_content(message))
+    {
+        UserTerminatedTailDecision::Reanchor {
+            user_mid: request.messages[user_index].mid.clone(),
+        }
+    } else {
+        // An assistant with real content at the array tail is the harness's NORMAL
+        // mid-turn continuation shape: completed tool steps ride the streaming
+        // assistant, and the provider serializer emits the user-terminated wire
+        // itself. A completion timestamp cannot discriminate a stale retry from a
+        // step boundary (the previous STEP's response also completed), so serve the
+        // array untouched — refusing here kills every tool-using turn.
+        UserTerminatedTailDecision::Unchanged
+    }
+}
+
+fn enforce_user_terminated_tail(
+    request: &TransformRequest,
+    output: &mut Vec<ServedMessage>,
+) -> Result<(), TransformError> {
+    match user_terminated_tail_decision(request) {
+        UserTerminatedTailDecision::Unchanged => Ok(()),
+        UserTerminatedTailDecision::Reanchor { user_mid } => {
+            let user = request
+                .messages
+                .iter()
+                .find(|message| message.mid == user_mid)
+                .expect("the tail decision's user comes from this request");
+            let served_user = output
+                .iter()
+                .position(|message| message.meta.harness_id.as_deref() == Some(user_mid.as_str()))
+                .map(|index| output.remove(index))
+                .unwrap_or_else(|| ServedMessage::from_message(user.ck.clone()));
+            output.push(served_user);
+            Ok(())
+        }
+    }
+}
+
 fn frozen_trailing_blank_keep_count(core: &CoreState, mid: &str) -> Option<usize> {
     let unit = message_strip_unit(core, "trailing_blank_keep", mid)?;
     if unit.frozen_payload.is_empty() {
@@ -11410,7 +11892,7 @@ fn refresh_trailing_blank_decisions(
         return (0, false);
     }
 
-    let newest_assistant_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let newest_assistant_mid = latest_assistant_mid(&req.messages);
     let mut updates = Vec::new();
     for rendered in rendered_messages {
         let Some(mid) = rendered.meta.harness_id.as_deref() else {
@@ -11724,9 +12206,12 @@ fn build_output_with_tags_inner(
     let output_mids = req
         .messages
         .iter()
-        .filter(|message| !message.ck.meta.synthetic)
         .filter(|message| {
-            is_tail(message.ordinal, output_coverage)
+            !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
+        })
+        .filter(|message| {
+            is_newest_synthetic_user_prompt(req, message)
+                || is_tail(message.ordinal, output_coverage)
                 || (serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic)
                     && is_uncovered_leading_system(message, meta))
                 || lineage_anchor_mid == Some(message.mid.as_str())
@@ -11780,11 +12265,10 @@ fn build_output_with_tags_inner(
         .map(|anchor| synthetic_todo_render_anchor_mid(projection, anchor));
     let mut inserted_synthetic_todo = false;
     let tail_loop_started_at = Instant::now();
-    for msg in req
-        .messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-    {
+    for msg in req.messages.iter().filter(|message| {
+        !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
+    }) {
+        let keep_live_synthetic_prompt = is_newest_synthetic_user_prompt(req, msg);
         let keep_leading_system = serializer_profile
             != Some(SerializerProfile::ClaudeCodeAnthropic)
             && is_uncovered_leading_system(msg, meta);
@@ -11794,7 +12278,8 @@ fn build_output_with_tags_inner(
             .and_then(split_block_id)
             .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
         let keep_split_invocation = split_coverage_invocation_mids.contains(msg.mid.as_str());
-        if !is_tail(msg.ordinal, output_coverage)
+        if !keep_live_synthetic_prompt
+            && !is_tail(msg.ordinal, output_coverage)
             && !keep_leading_system
             && !keep_lineage_anchor
             && !keep_split_invocation
@@ -11900,7 +12385,6 @@ fn build_output_with_tags_inner(
                                 display_payload
                                     .as_deref()
                                     .unwrap_or(unit.frozen_payload.as_str()),
-                                block.file_path.as_deref(),
                             );
                         }
                     }
@@ -12085,6 +12569,7 @@ fn build_output_with_tags_inner(
         );
     }
 
+    enforce_user_terminated_tail(req, &mut out)?;
     out = enforce_unique_tool_use_ids(out, &req.session_id);
 
     build_timings.total = elapsed_ms(build_output_started_at);
@@ -12154,14 +12639,36 @@ fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
             .is_some_and(|extras| extras.contains_key("cache_control"))
 }
 
-/// Anthropic verifies the newest assistant's signed reasoning against the original response.
-/// Keep that assistant out of every reasoning-mutation lane, regardless of profile or whether
-/// the response is still in flight.
-fn latest_assistant_reasoning_mutation_exempt_mid(messages: &[CkIngressMessage]) -> Option<&str> {
+fn latest_assistant_mid(messages: &[CkIngressMessage]) -> Option<&str> {
     messages
         .iter()
         .rev()
         .find(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .map(|message| message.mid.as_str())
+}
+
+fn has_reasoning_replay_content(message: &CkIngressMessage) -> bool {
+    message
+        .ck
+        .content
+        .iter()
+        .any(|block| !is_reasoning_ignored_block(block))
+}
+
+/// Anthropic verifies the newest provider-visible assistant's signed reasoning against the
+/// original response. OpenCode can append a metadata-only assistant shell before dispatch; that
+/// shell never reaches the provider and therefore must not steal the completed step's exemption.
+pub(crate) fn latest_assistant_reasoning_mutation_exempt_mid(
+    messages: &[CkIngressMessage],
+) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| {
+            !message.ck.meta.synthetic
+                && message.ck.role == "assistant"
+                && has_reasoning_replay_content(message)
+        })
         .map(|message| message.mid.as_str())
 }
 
@@ -12185,14 +12692,15 @@ fn latest_assistant_message_mutation_exempt_mid(
     messages
         .iter()
         .rev()
-        .find(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
-        .filter(|message| {
-            message
-                .ck
-                .content
-                .iter()
-                .find(|block| !is_reasoning_ignored_block(block))
-                .is_some_and(is_reasoning_block)
+        .find(|message| {
+            !message.ck.meta.synthetic
+                && message.ck.role == "assistant"
+                && message
+                    .ck
+                    .content
+                    .iter()
+                    .find(|block| !is_reasoning_ignored_block(block))
+                    .is_some_and(is_reasoning_block)
         })
         .map(|message| message.mid.as_str())
 }
@@ -12351,7 +12859,10 @@ fn clear_served_native_reasoning_from_iter<'a>(
         .filter(|message| !message.ck.meta.synthetic)
     {
         ordinal_by_mid.insert(message.mid.as_str(), message.ordinal);
-        if message.ck.role == "assistant" && message.ordinal >= newest_assistant_ordinal {
+        if message.ck.role == "assistant"
+            && has_reasoning_replay_content(message)
+            && message.ordinal >= newest_assistant_ordinal
+        {
             newest_assistant_ordinal = message.ordinal;
             newest_assistant_mid = Some(message.mid.as_str());
         }
@@ -12936,6 +13447,30 @@ pub(crate) mod tests {
             effective_context_limit_tokens(&ModuleUsage::default(), Some(&implausible)),
             200_000.0
         );
+    }
+
+    #[test]
+    fn nudge_display_denominator_prefers_geometry_usable_soft() {
+        let geometry = TransformGeometry {
+            usable_soft: 872_000,
+            usable_hard: 1_000_000,
+            derivation: "models.dev/1000000; usableSoft=872000".to_string(),
+        };
+        let scheduler_denominator = effective_context_limit_tokens(
+            &ModuleUsage {
+                current_total_input_tokens: 600_000,
+                context_limit_tokens: 1_000_000,
+                ..ModuleUsage::default()
+            },
+            Some(&geometry),
+        );
+
+        assert_eq!(scheduler_denominator, 1_000_000.0);
+        assert_eq!(
+            effective_nudge_window_tokens(Some(&geometry), scheduler_denominator),
+            872_000
+        );
+        assert_eq!(effective_nudge_window_tokens(None, 128_000.0), 128_000);
     }
 
     #[test]
@@ -14114,6 +14649,7 @@ pub(crate) mod tests {
         let response = transform(s, req, &ctx).unwrap();
         assert_no_duplicate_tool_use_ids(response.messages());
         assert_no_orphaned_tool_arcs(response.messages());
+        assert_no_foreign_reduction_input_keys(response.messages().iter().map(Deref::deref));
         response
     }
 
@@ -14174,6 +14710,42 @@ pub(crate) mod tests {
             .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
             .expect("renderer transition marker must be durable");
         serde_json::from_str(&marker.frozen_payload).unwrap()
+    }
+
+    #[test]
+    fn served_tool_input_invariant_detects_reduction_envelope_mutation() {
+        let mutated = CkWireMessage::from_parts(
+            "assistant",
+            vec![CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: "mutated-envelope-call".to_string(),
+                name: "edit".to_string(),
+                input: json!({
+                    "reduced": true,
+                    "summary": r#"{"filePath":"src/lib.rs","oldString":"old","newString":"new"}"#,
+                }),
+                provider_executed: false,
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta::default(),
+        );
+
+        let failure = std::panic::catch_unwind(|| {
+            assert_no_foreign_reduction_input_keys([&mutated]);
+        })
+        .expect_err("the serve-wide invariant must reject the historical envelope shape");
+        let output = failure
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                failure
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+            })
+            .expect("invariant failure must record a string diagnostic");
+        assert!(output.contains("mutated-envelope-call"));
+        assert!(output.contains("foreign reduction-envelope keys"));
+        eprintln!("mutation invariant output: {output}");
     }
 
     #[test]
@@ -17523,6 +18095,8 @@ pub(crate) mod tests {
             name: String,
             target_mid: String,
             expect_strip: bool,
+            reasoning_exempt_mid: Option<String>,
+            target_reasoning_index: usize,
             encoded_input: Vec<CkIngressMessage>,
         }
 
@@ -17530,7 +18104,7 @@ pub(crate) mod tests {
             "../testdata/merged-reasoning-adapter-golden.json"
         ))
         .unwrap();
-        assert_eq!(golden.generator_version, 1);
+        assert_eq!(golden.generator_version, 6);
         assert_eq!(
             golden
                 .cases
@@ -17542,6 +18116,10 @@ pub(crate) mod tests {
                 "thinking",
                 "redacted_thinking",
                 "reasoning_cache_control",
+                "live_tool_continuation_request_shell",
+                "incident_astro_signed_reasoning_tool_without_text",
+                "incident_engram_text_after_tool_recurrence",
+                "incident_337_text_before_tool",
             ]
         );
 
@@ -17554,6 +18132,12 @@ pub(crate) mod tests {
                 fixture.encoded_input,
             );
             request.provider_id = Some("anthropic".to_string());
+            assert_eq!(
+                latest_assistant_reasoning_mutation_exempt_mid(&request.messages),
+                fixture.reasoning_exempt_mid.as_deref(),
+                "adapter case {} disagreed with the TypeScript exemption target",
+                fixture.name
+            );
 
             let response = run(&store, &request, &spine());
             assert_eq!(response.action, "HARD");
@@ -17565,7 +18149,7 @@ pub(crate) mod tests {
                 })
                 .unwrap_or_else(|| panic!("missing adapter target for {}", fixture.name));
             let stripped = matches!(
-                &target.content[0].kind,
+                &target.content[fixture.target_reasoning_index].kind,
                 ck_wire::CkKind::Text { text } if text.is_empty()
             );
             assert_eq!(
@@ -17632,6 +18216,226 @@ pub(crate) mod tests {
             &messages[0].content[1].kind,
             ck_wire::CkKind::Reasoning { text, .. } if text == "signed thinking"
         ));
+    }
+
+    #[test]
+    fn anthropic_retry_tail_reanchors_only_contentless_assistants_and_rejects_completed_content() {
+        fn message(
+            mid: &str,
+            ordinal: u64,
+            role: &str,
+            content: Vec<CkWireBlock>,
+        ) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    role,
+                    content,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn request(session: &str, assistant_content: Vec<CkWireBlock>) -> TransformRequest {
+            let mut request = profile_req(
+                SerializerProfile::OpencodeAiSdk,
+                session,
+                "cfg",
+                vec![
+                    message(
+                        "prompt",
+                        1,
+                        "user",
+                        vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: "continue safely".to_string(),
+                        })],
+                    ),
+                    message("assistant-tail", 2, "assistant", assistant_content),
+                ],
+            );
+            request.provider_id = Some("anthropic".to_string());
+            request.serve_native = true;
+            request.prev_response_completed_at_ms = Some(1);
+            request
+        }
+
+        let blank_request = request(
+            "assistant-tail-blank",
+            vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: " \n\t".to_string(),
+            })],
+        );
+        assert_eq!(
+            user_terminated_tail_decision(&blank_request),
+            UserTerminatedTailDecision::Reanchor {
+                user_mid: "prompt".to_string()
+            }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let blank_store = store(dir.path());
+        let blank_response = run(&blank_store, &blank_request, &spine());
+        let blank_roles = blank_response
+            .messages()
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert!(blank_roles.ends_with(&["assistant", "user"]));
+        assert_eq!(
+            blank_response
+                .messages()
+                .last()
+                .unwrap()
+                .meta
+                .harness_id
+                .as_deref(),
+            Some("prompt")
+        );
+        let first_bytes = blank_response
+            .messages()
+            .iter()
+            .map(|message| message.canonical_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let replay = run(&blank_store, &blank_request, &spine());
+        assert_eq!(
+            replay
+                .messages()
+                .iter()
+                .map(|message| message.canonical_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            first_bytes
+        );
+
+        for (session, completed_content) in [
+            (
+                "assistant-tail-reasoning",
+                vec![CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "completed thought".to_string(),
+                    signature: Some("sig".to_string()),
+                })],
+            ),
+            (
+                "assistant-tail-tool",
+                // A completed tool STEP: call plus its result, the shape OpenCode's
+                // mid-turn continuation actually serves (an unpaired trailing call
+                // never reaches the provider request — results attach first).
+                vec![
+                    CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                        id: "call-completed".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({ "command": "true" }),
+                        provider_executed: false,
+                    }),
+                    CkWireBlock::bare(ck_wire::CkKind::ToolResult {
+                        id: "call-completed".to_string(),
+                        tool_name: "bash".to_string(),
+                        output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
+                            text: "done".to_string(),
+                        }),
+                        provider_executed: false,
+                    }),
+                ],
+            ),
+        ] {
+            let completed_request = request(session, completed_content);
+            // Real-content assistant tails are the normal mid-turn continuation
+            // shape (completed tool steps ride the streaming assistant), so the
+            // serve must pass them through untouched — never reorder, never refuse.
+            assert_eq!(
+                user_terminated_tail_decision(&completed_request),
+                UserTerminatedTailDecision::Unchanged
+            );
+            let completed_dir = tempfile::tempdir().unwrap();
+            let response = transform(
+                &store(completed_dir.path()),
+                &completed_request,
+                &pctx("git:proj", "/nonexistent-docs", 0),
+            )
+            .expect("mid-turn continuation tails serve untouched");
+            assert_eq!(
+                response
+                    .messages()
+                    .last()
+                    .map(|message| message.role.as_str()),
+                Some("assistant")
+            );
+        }
+    }
+
+    #[test]
+    fn newest_synthetic_user_is_served_as_the_notice_triggered_live_prompt() {
+        let mut historical_notice = wire_item(
+            "user",
+            "notice-historical",
+            1,
+            &["<system-reminder>historical completion</system-reminder>"],
+        );
+        historical_notice.ck.meta.synthetic = true;
+        let mut live_notice = wire_item(
+            "user",
+            "msg_02d6ec606001jEBwnJuw1OX68F",
+            5,
+            &["<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>"],
+        );
+        live_notice.ck.meta.synthetic = true;
+        let mut request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "notice-triggered-engram",
+            "cfg",
+            vec![
+                historical_notice,
+                wire_item(
+                    "user",
+                    "msg_02d6ebbe0001hmD4CjOCNXDw8L",
+                    2,
+                    &["tool result"],
+                ),
+                reasoning_tool_shell_message(
+                    "msg_02d6ebe9800166UUl6XLz1oLIX",
+                    3,
+                    "call-status",
+                    true,
+                ),
+                reasoning_tool_shell_message(
+                    "msg_02d6f258c001Ev9GPM03YNW5Ql",
+                    4,
+                    "call-bash",
+                    true,
+                ),
+                live_notice,
+            ],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.prev_response_completed_at_ms = Some(1);
+
+        assert_eq!(
+            user_terminated_tail_decision(&request),
+            UserTerminatedTailDecision::Unchanged,
+            "the restored live prompt must make both assistant-terminal arms inapplicable"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let response = run(&store(dir.path()), &request, &spine());
+        assert_eq!(
+            response
+                .messages()
+                .last()
+                .unwrap()
+                .meta
+                .harness_id
+                .as_deref(),
+            Some("msg_02d6ec606001jEBwnJuw1OX68F")
+        );
+        assert_eq!(response.messages().last().unwrap().role, "user");
+        assert!(response
+            .messages()
+            .iter()
+            .all(|message| message.meta.harness_id.as_deref() != Some("notice-historical")));
     }
 
     #[test]
@@ -18524,6 +19328,106 @@ pub(crate) mod tests {
             0
         );
         assert_eq!(served, vec![assistant]);
+    }
+
+    #[test]
+    fn metadata_only_assistant_shell_does_not_steal_live_step_reasoning_exemption() {
+        let live = CkIngressMessage {
+            mid: "live-step".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                        text: "signed live thinking".to_string(),
+                        signature: Some("live-signature".to_string()),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: "status before tool".to_string(),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                        id: "call-live".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({ "command": "true" }),
+                        provider_executed: false,
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolResult {
+                        id: "call-live".to_string(),
+                        tool_name: "bash".to_string(),
+                        output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
+                            text: "done".to_string(),
+                        }),
+                        provider_executed: false,
+                    }),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("live-step".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let shell = CkIngressMessage {
+            mid: "request-shell".to_string(),
+            ordinal: 2,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(
+                    ck_wire::OpaqueBlock {
+                        source: json!({ "harness": "opencode" }),
+                        kind: "step-start".to_string(),
+                        raw: json!({ "type": "step-start" }),
+                        arc: None,
+                    },
+                ))],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("request-shell".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let ingress = vec![live.clone(), shell];
+
+        assert_eq!(
+            latest_assistant_reasoning_mutation_exempt_mid(&ingress),
+            Some("live-step")
+        );
+        assert_eq!(
+            latest_assistant_message_mutation_exempt_mid(
+                &ingress,
+                Some(SerializerProfile::OpencodeAiSdk),
+                true,
+            ),
+            Some("live-step")
+        );
+
+        // OpenCode expands the completed native tool part downstream into an Anthropic
+        // assistant(tool_use) + user(tool_result) continuation. The request shell itself is
+        // wire-invisible, so the signed reasoning on the completed step remains the live block.
+        let mut native = vec![json!({
+            "info": { "id": "live-step", "role": "assistant" },
+            "parts": [{
+                "type": "reasoning",
+                "text": "signed live thinking",
+                "metadata": { "anthropic": { "signature": "live-signature" } }
+            }]
+        })];
+        assert_eq!(
+            clear_served_native_reasoning(
+                SerializerProfile::OpencodeAiSdk,
+                true,
+                &mut native,
+                std::slice::from_ref(&live.ck),
+                &ingress,
+                u64::MAX,
+                false,
+            ),
+            0
+        );
+        assert_eq!(native[0]["parts"][0]["text"], "signed live thinking");
     }
 
     #[test]
@@ -20528,13 +21432,13 @@ pub(crate) mod tests {
                 reduce(
                     "m2414#0",
                     "skeleton",
-                    r#"{"detail":"xxxxx…","path":"a.txt"}"#,
+                    r#"{"detail":"xxxxx...[truncated]","path":"a.txt"}"#,
                 ),
                 reduce("m2414#1", "drop", "[dropped]"),
                 reduce(
                     "m2414#2",
                     "skeleton",
-                    r#"{"detail":"yyyyy…","path":"b.txt"}"#,
+                    r#"{"detail":"yyyyy...[truncated]","path":"b.txt"}"#,
                 ),
                 reduce("m2414#3", "drop", "[dropped]"),
             ]),
@@ -20592,9 +21496,22 @@ pub(crate) mod tests {
             .map(|part| part["callID"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(tool_ids, vec!["astro-call-a", "astro-call-b"]);
-        assert!(assistant["parts"].as_array().unwrap().iter().all(|part| {
+        let parts = assistant["parts"].as_array().unwrap();
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part["state"]["input"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({ "detail": "xxxxx...[truncated]", "path": "a.txt" }),
+                json!({ "detail": "yyyyy...[truncated]", "path": "b.txt" }),
+            ],
+            "model-visible native calls must retain only real argument keys"
+        );
+        assert!(parts.iter().all(|part| {
             part["state"]["status"] == "completed"
-                && part["state"]["input"]["reduced"] == true
+                && part["state"]["input"].get("reduced").is_none()
+                && part["state"]["input"].get("summary").is_none()
                 && part["state"]["output"] == "[dropped]"
         }));
     }
@@ -21654,7 +22571,7 @@ pub(crate) mod tests {
         assert_eq!(tail_ids(&boot), vec!["t11"]);
         assert_eq!(
             canonical_response_hash(&boot),
-            "e361c261f3bed5b1488bbc94b9d7ad2c2bc6cbedb4f0d9ea4abca474deae8ca7",
+            "d1b31ccee47cfd71f7e6a2050d32a2c2c5661bbd6538f211f8ae211b4f7ffbe0",
             "healthy HARD bytes must match the pre-detector golden",
         );
 
@@ -23299,6 +24216,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn temporal_gap_dump_golden_backfills_all_historical_markers_in_one_transition() {
+        run_active_surface_test(|| {
+            let golden: Value =
+                serde_json::from_str(include_str!("../testdata/temporal-parity-golden.json"))
+                    .expect("temporal parity golden");
+            assert_eq!(golden["schema"], 1);
+            assert_eq!(golden["generator_version"], 1);
+            let fixture = &golden["cases"][0];
+            let messages: Vec<CkIngressMessage> =
+                serde_json::from_value(fixture["encoded_input"].clone())
+                    .expect("golden CK ingress");
+            let expected: BTreeMap<String, String> =
+                serde_json::from_value(fixture["expected_text_by_mid"].clone())
+                    .expect("golden expected text");
+
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let mut untimed = messages.clone();
+            for message in &mut untimed {
+                message.ck.meta.created_at_ms = None;
+                message.ck.meta.completed_at_ms = None;
+            }
+            let baseline_request = active_opencode_req("temporal-dump-golden", "cfg0", untimed);
+            run(&s, &baseline_request, &spine());
+            run(&s, &baseline_request, &spine());
+
+            let request = active_opencode_req("temporal-dump-golden", "cfg0", messages.clone());
+            let transitioned = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 50_569_000),
+            )
+            .unwrap();
+            assert_eq!(transitioned.action, "HARD");
+            let tags = s
+                .load_tags_for_session("temporal-dump-golden")
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.block_id, row.tag_number))
+                .collect::<HashMap<_, _>>();
+            for (mid, expected_text) in &expected {
+                let actual = tail_bytes(&transitioned, mid);
+                let tag = tags
+                    .get(&format!("{mid}#0"))
+                    .unwrap_or_else(|| panic!("missing tag for {mid}"));
+                assert_eq!(
+                    strip_tag_prefix(actual, *tag),
+                    expected_text.as_str(),
+                    "{mid}"
+                );
+            }
+            assert_eq!(
+                s.load_temporal_marks("temporal-dump-golden")
+                    .unwrap()
+                    .into_iter()
+                    .filter(|row| !row.marker_text.is_empty())
+                    .count(),
+                2,
+                "both historical markers must commit in the transition fold"
+            );
+
+            let transitioned_bytes = serde_json::to_vec(transitioned.messages()).unwrap();
+            let transitioned_row = transitioned.row_version;
+            let replay = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 50_869_000),
+            )
+            .unwrap();
+            assert_ne!(replay.action, "HARD");
+            assert_eq!(replay.row_version, transitioned_row);
+            assert_eq!(
+                serde_json::to_vec(replay.messages()).unwrap(),
+                transitioned_bytes
+            );
+        });
+    }
+
+    #[test]
     fn temporal_gap_overlay_replays_and_false_window_is_verbatim() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
@@ -23342,7 +24338,7 @@ pub(crate) mod tests {
                 &pctx("git:proj", "/nonexistent-docs", 7_930_000),
             )
             .unwrap();
-            assert_eq!(tail_bytes(&first, "m3"), "<!-- +12m -->\n§3§ question");
+            assert_eq!(tail_bytes(&first, "m3"), "§3§ <!-- +12m -->\nquestion");
             active.prev_response_completed_at_ms = Some(800_000);
             let replay = transform(
                 &s,
@@ -23404,7 +24400,7 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(
                 tail_bytes(&response, "m3"),
-                "<!-- +12m -->\n§3§ question",
+                "§3§ <!-- +12m -->\nquestion",
                 "role=system reminders are skipped when resolving the authored tail"
             );
         });
@@ -23448,7 +24444,7 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(
                 tail_bytes(&response, "m3"),
-                "<!-- +12m -->\n§3§ question",
+                "§3§ <!-- +12m -->\nquestion",
                 "a standalone reminder-shaped user message is transport, not an authored tail"
             );
         });
@@ -23501,7 +24497,7 @@ pub(crate) mod tests {
                 &pctx("git:proj", "/nonexistent-docs", 700_000),
             )
             .unwrap();
-            assert_eq!(tail_bytes(&minted, "m1"), "<!-- +10m -->\n§1§ question");
+            assert_eq!(tail_bytes(&minted, "m1"), "§1§ <!-- +10m -->\nquestion");
             assert_eq!(s.overlay_watermark("temporal-frontier").unwrap(), Some(1));
         });
     }
@@ -23585,7 +24581,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn temporal_gap_midlife_activation_has_zero_gaps() {
+    fn temporal_gap_timestamp_free_midlife_activation_has_zero_gaps() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
@@ -25201,19 +26197,107 @@ pub(crate) mod tests {
             assert_eq!(tail_bytes(&replay, "result2"), first_result);
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
 
+            let mut refire_meta = s.load("nudge").unwrap();
+            refire_meta.meta.channel1_last_nudge_undropped = 0;
+            s.commit(
+                "nudge",
+                refire_meta.row_version,
+                &refire_meta.core,
+                &refire_meta.meta,
+            )
+            .unwrap();
+
+            let mut refire_messages = messages;
+            refire_messages.push(assistant_tool_call("call3", 5, "c3"));
+            refire_messages.push(tool_result("result3", 6, "c3", &huge));
+            let mut refire_request = active_cc_req("nudge", "cfg0", refire_messages.clone());
+            refire_request.protected_tags = 0;
+            let refire_request = with_usage(refire_request, 900, 1024);
+            let sticky = run(&s, &refire_request, &spine());
+            let sticky_result = tail_bytes(&sticky, "result3").to_string();
+            assert!(
+                sticky_result.contains("Reminder: ctx_reduce housekeeping still pending —"),
+                "expected sticky refire, got {sticky_result}"
+            );
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+            let sticky_replay = run(&s, &refire_request, &spine());
+            assert_eq!(tail_bytes(&sticky_replay, "result3"), sticky_result);
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+
             let mut loaded = s.load("nudge").unwrap();
             loaded.meta.channel1_reduce_suppressed = true;
             s.commit("nudge", loaded.row_version, &loaded.core, &loaded.meta)
                 .unwrap();
-            let mut extended_messages = messages;
-            extended_messages.push(assistant_tool_call("call3", 5, "c3"));
-            extended_messages.push(tool_result("result3", 6, "c3", &huge));
-            let mut extended_request = active_cc_req("nudge", "cfg0", extended_messages);
-            extended_request.protected_tags = 0;
-            let suppressed = run(&s, &with_usage(extended_request, 900, 1024), &spine());
+            refire_messages.push(assistant_tool_call("call4", 7, "c4"));
+            refire_messages.push(tool_result("result4", 8, "c4", &huge));
+            let mut suppressed_request = active_cc_req("nudge", "cfg0", refire_messages);
+            suppressed_request.protected_tags = 0;
+            let suppressed = run(&s, &with_usage(suppressed_request, 900, 1024), &spine());
             assert!(tail_bytes(&suppressed, "result2").contains("<system-reminder>"));
-            assert!(!tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+            assert!(tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
+            assert!(!tail_bytes(&suppressed, "result4").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn applying_agent_drops_gets_one_pass_without_a_channel1_refire() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let huge = "word ".repeat(80_000);
+            let mut messages = Vec::new();
+            for number in 1..=4 {
+                messages.push(assistant_tool_call(
+                    &format!("call{number}"),
+                    number * 2 - 1,
+                    &format!("c{number}"),
+                ));
+                messages.push(tool_result(
+                    &format!("result{number}"),
+                    number * 2,
+                    &format!("c{number}"),
+                    &huge,
+                ));
+            }
+            let mut initial_request = active_cc_req("drop-grace", "cfg0", messages.clone());
+            initial_request.protected_tags = 0;
+            let initial_request = with_usage(initial_request, 900, 1024);
+            run(&s, &initial_request, &spine());
+            let first = run(&s, &initial_request, &spine());
+            assert!(tail_bytes(&first, "result4").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+
+            s.append_pending_agent_drops_with_command(
+                "drop-grace",
+                Some("drop-two-arcs"),
+                &["result4#0".to_string()],
+                1,
+                false,
+            )
+            .unwrap();
+            messages.push(assistant_tool_call("call5", 9, "c5"));
+            messages.push(tool_result("result5", 10, "c5", &huge));
+            let mut applying_request = active_cc_req("drop-grace", "cfg1", messages);
+            applying_request.protected_tags = 0;
+            let applying_request = with_usage(applying_request, 900, 1024);
+
+            let applying = run(&s, &applying_request, &spine());
+            let after_applying = s.load("drop-grace").unwrap();
+            assert!(
+                frozen_red_targets(&after_applying.core).contains("result4#0"),
+                "pending drop was not applied: {:?}",
+                s.load_pending_agent_drops("drop-grace").unwrap(),
+            );
+            assert!(!tail_bytes(&applying, "result5").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+
+            let resumed = run(&s, &applying_request, &spine());
+            let resumed_result = tail_bytes(&resumed, "result5");
+            assert!(resumed_result.contains("<system-reminder>"));
+            assert!(resumed_result.contains("Housekeeping"));
+            assert!(!resumed_result.contains("Reminder: ctx_reduce housekeeping still pending"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 2);
         });
     }
 
@@ -29512,6 +30596,92 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frozen_reduction_envelope_heals_in_one_class_scoped_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![
+            assistant_edit_call("envelope-call", 1, "edit-envelope", "src/lib.rs"),
+            edit_result("envelope-result", 2, "edit-envelope", "edit completed"),
+            item("envelope-tail", 3, "stable tail"),
+        ];
+        let request =
+            active_opencode_req("reduction-envelope-transition", "cfg0", messages.clone());
+        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+
+        let healed_input = json!({
+            "filePath": "src/lib.rs",
+            "oldString": "old-edit-envelope",
+            "newString": "new-edit-envelope",
+        });
+        let historical_envelope = json!({
+            "reduced": true,
+            "summary": serde_json::to_string(&healed_input).unwrap(),
+        })
+        .to_string();
+        append_historical_frozen_reductions(
+            &store,
+            "reduction-envelope-transition",
+            &[
+                red_unit("envelope-call#0", "edit_marker", &historical_envelope),
+                red_unit("envelope-result#0", "drop", "[dropped]"),
+            ],
+        );
+
+        let before = store.load("reduction-envelope-transition").unwrap();
+        let detected = renderer_transition_shapes(
+            &project_messages(&messages).unwrap(),
+            &before.core.frozen_units,
+            before.meta.coverage_ordinal,
+            None,
+        )
+        .classes();
+        assert_eq!(
+            detected,
+            BTreeSet::from([RendererTransitionClass::ReductionEnvelope])
+        );
+
+        let healed = run(&store, &request, &spine());
+        assert_eq!(healed.action, "HARD");
+        assert_eq!(
+            healed.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let healed_call = healed
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall { id, input, .. } if id == "edit-envelope" => Some(input),
+                _ => None,
+            })
+            .expect("healed edit call remains model-visible");
+        assert_eq!(healed_call, &healed_input);
+        assert!(healed_call.get("reduced").is_none());
+        assert!(healed_call.get("summary").is_none());
+
+        let stored = store.load("reduction-envelope-transition").unwrap();
+        assert_eq!(
+            transition_consumed_classes(&stored.core),
+            BTreeSet::from([RendererTransitionClass::ReductionEnvelope])
+        );
+        assert_eq!(
+            stored
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+                .count(),
+            1,
+            "the entire reduction-envelope class must ride one durable fold"
+        );
+
+        let healed_bytes = serde_json::to_vec(healed.messages()).unwrap();
+        let replay = run(&store, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), healed_bytes);
+    }
+
+    #[test]
     fn poisoned_reasoning_transition_salts_one_hard_and_preserves_row_version_monotonicity() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -29609,7 +30779,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn consumed_v1_shape_without_v2_shape_does_not_refire_or_change_bytes() {
+    fn consumed_v1_shape_folds_once_for_new_reduction_envelope_class() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let messages = vec![
@@ -29663,8 +30833,8 @@ pub(crate) mod tests {
         let replay =
             transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
                 .unwrap();
-        assert_eq!(replay.response.action, "SOFT+");
-        assert_ne!(
+        assert_eq!(replay.response.action, "HARD");
+        assert_eq!(
             replay.response.materialize_reason.as_deref(),
             Some("renderer_transition")
         );
@@ -29674,16 +30844,17 @@ pub(crate) mod tests {
         );
         let after = store.load("consumed-v1-only").unwrap();
         assert!(after.row_version.unwrap() >= before.row_version.unwrap());
+        let mut expected_classes = v1_transition_classes();
+        expected_classes.insert(RendererTransitionClass::ReductionEnvelope);
+        assert_eq!(transition_consumed_classes(&after.core), expected_classes);
+        let stable =
+            transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
+                .unwrap();
+        assert_eq!(stable.response.action, "SOFT+");
         assert_eq!(
-            transition_consumed_classes(&after.core),
-            v1_transition_classes()
+            serde_json::to_vec(stable.response.messages()).unwrap(),
+            golden_bytes
         );
-        assert!(after
-            .core
-            .frozen_units
-            .iter()
-            .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
-            .is_some_and(|unit| unit.frozen_payload.is_empty()));
     }
 
     #[test]
@@ -29774,7 +30945,10 @@ pub(crate) mod tests {
             transition.materialize_reason.as_deref(),
             Some("renderer_transition")
         );
-        let expected = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        let expected = BTreeSet::from([
+            RendererTransitionClass::UnmatchedPair,
+            RendererTransitionClass::ReductionEnvelope,
+        ]);
         assert_eq!(
             stored_transition_marker_classes(&initial_store, session),
             expected
@@ -29843,7 +31017,10 @@ pub(crate) mod tests {
             unmatched_transition.materialize_reason.as_deref(),
             Some("renderer_transition")
         );
-        let unmatched_only = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        let unmatched_only = BTreeSet::from([
+            RendererTransitionClass::UnmatchedPair,
+            RendererTransitionClass::ReductionEnvelope,
+        ]);
         assert_eq!(
             stored_transition_marker_classes(&store, session),
             unmatched_only,
@@ -29875,6 +31052,7 @@ pub(crate) mod tests {
         let expected = BTreeSet::from([
             RendererTransitionClass::PoisonedReasoning,
             RendererTransitionClass::UnmatchedPair,
+            RendererTransitionClass::ReductionEnvelope,
         ]);
         assert_eq!(stored_transition_marker_classes(&store, session), expected);
 
@@ -30109,6 +31287,7 @@ pub(crate) mod tests {
         .classes();
         let mut expected_classes = v1_transition_classes();
         expected_classes.insert(RendererTransitionClass::SplitCoverage);
+        expected_classes.insert(RendererTransitionClass::ReductionEnvelope);
         assert_eq!(detected, expected_classes);
 
         let folded =

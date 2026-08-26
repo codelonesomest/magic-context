@@ -5,6 +5,7 @@ import {
     DEFAULT_LOCAL_EMBEDDING_MODEL,
     type MagicContextConfig,
     MagicContextConfigSchema,
+    PER_HARNESS_MIGRATION_INVENTORY,
 } from "./magic-context";
 
 describe("MagicContextConfigSchema", () => {
@@ -49,6 +50,7 @@ describe("MagicContextConfigSchema", () => {
                     },
                 },
             });
+            expect(result.historian_timeout_ms).toBeGreaterThanOrEqual(10 * 60_000);
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
             expect(result.sidekick).toBeUndefined();
@@ -230,8 +232,10 @@ describe("MagicContextConfigSchema", () => {
             expect(result.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
         });
 
-        it("defaults classify-memories and retrospective on daily in dreamer task schema", () => {
-            const result = MagicContextConfigSchema.parse({ dreamer: { model: "x/y" } });
+        it("defaults classify-memories and retrospective on daily in dreamer task metadata", () => {
+            const result = MagicContextConfigSchema.parse({
+                dreamer: { opencode: { model: "x/y" } },
+            });
             expect(result.dreamer?.tasks["classify-memories"].schedule).toBe("0 6 * * *");
             expect(result.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
         });
@@ -313,6 +317,273 @@ describe("MagicContextConfigSchema", () => {
             expect(
                 MagicContextConfigSchema.parse({ prompt_surface: promptSurface }).prompt_surface,
             ).toEqual(promptSurface);
+        });
+    });
+
+    describe("config profiles", () => {
+        it("admits model-selection fields and preserves per-entry harness qualifiers", () => {
+            const result = MagicContextConfigSchema.parse({
+                profile: "work",
+                profiles: {
+                    work: {
+                        historian: {
+                            opencode: {
+                                model: { model: "anthropic/work-historian", variant: "high" },
+                                fallback_models: [
+                                    { model: "openai/work-fallback", variant: "low" },
+                                ],
+                                variant: "high",
+                            },
+                            pi: {
+                                model: {
+                                    model: "github-copilot/work-historian",
+                                    thinking_level: "high",
+                                },
+                                thinking_level: "high",
+                            },
+                        },
+                        dreamer: {
+                            opencode: {
+                                model: { model: "anthropic/work-dreamer", variant: "medium" },
+                                fallback_models: [
+                                    { model: "openai/work-dreamer-fallback", variant: "low" },
+                                ],
+                                variant: "medium",
+                            },
+                            pi: {
+                                model: {
+                                    model: "github-copilot/work-dreamer",
+                                    thinking_level: "high",
+                                },
+                                fallback_models: [
+                                    {
+                                        model: "openai/work-dreamer-fallback",
+                                        thinking_level: "minimal",
+                                    },
+                                ],
+                                thinking_level: "high",
+                            },
+                        },
+                        sidekick: {
+                            model: "anthropic/work-sidekick",
+                            fallback_models: ["openai/work-sidekick-fallback"],
+                        },
+                    },
+                },
+            });
+
+            expect(result.profiles?.work?.historian?.opencode?.fallback_models).toEqual([
+                { model: "openai/work-fallback", variant: "low" },
+            ]);
+            expect(result.profiles?.work?.dreamer?.opencode).toEqual({
+                model: { model: "anthropic/work-dreamer", variant: "medium" },
+                fallback_models: [{ model: "openai/work-dreamer-fallback", variant: "low" }],
+                variant: "medium",
+            });
+            expect(result.profiles?.work?.dreamer?.pi?.fallback_models).toEqual([
+                { model: "openai/work-dreamer-fallback", thinking_level: "minimal" },
+            ]);
+            expect(result.profiles?.work?.sidekick?.model).toBe("anthropic/work-sidekick");
+        });
+
+        it("rejects timeout_minutes in a dreamer profile", () => {
+            const profiles = {
+                work: {
+                    dreamer: {
+                        opencode: {
+                            tasks: { verify: { timeout_minutes: 30 } },
+                        },
+                    },
+                },
+            };
+
+            expect(MagicContextConfigSchema.safeParse({ profiles }).success).toBe(false);
+        });
+
+        it("rejects task execution and every other non-model field class in profiles", () => {
+            const profilesWithExcludedFields = [
+                { work: { embedding: { provider: "off" } } },
+                { work: { historian: { two_pass: true } } },
+                { work: { historian: { opencode: { prompt: "override" } } } },
+                { work: { dreamer: { opencode: { tasks: {} } } } },
+                {
+                    work: {
+                        dreamer: {
+                            opencode: {
+                                tasks: {
+                                    verify: {
+                                        model: "anthropic/task-model",
+                                        fallback_models: ["openai/task-fallback"],
+                                        variant: "high",
+                                        timeout_minutes: 30,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                {
+                    work: {
+                        dreamer: {
+                            pi: {
+                                tasks: {
+                                    verify: {
+                                        model: "github-copilot/task-model",
+                                        fallback_models: ["openai/task-fallback"],
+                                        thinking_level: "high",
+                                        timeout_minutes: 30,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                { work: { dreamer: { tasks: { verify: { schedule: "0 3 * * *" } } } } },
+                { work: { sidekick: { timeout_ms: 60_000 } } },
+            ];
+
+            for (const profiles of profilesWithExcludedFields) {
+                expect(MagicContextConfigSchema.safeParse({ profiles }).success).toBe(false);
+            }
+        });
+    });
+
+    describe("per-harness model configuration", () => {
+        it("keeps the migration inventory exhaustive and field-specific", () => {
+            expect(PER_HARNESS_MIGRATION_INVENTORY).toEqual({
+                historian: {
+                    retained: [
+                        "temperature",
+                        "top_p",
+                        "prompt",
+                        "tools",
+                        "disable",
+                        "description",
+                        "mode",
+                        "color",
+                        "maxSteps",
+                        "permission",
+                        "maxTokens",
+                        "two_pass",
+                        "disallowed_tools",
+                    ],
+                    migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+                },
+                dreamer: {
+                    retained: [
+                        "temperature",
+                        "top_p",
+                        "prompt",
+                        "tools",
+                        "disable",
+                        "description",
+                        "mode",
+                        "color",
+                        "maxSteps",
+                        "permission",
+                        "maxTokens",
+                        "inject_docs",
+                    ],
+                    migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+                },
+                task: {
+                    retained: ["schedule", "promotion_threshold"],
+                    migrated_execution: [
+                        "model",
+                        "fallback_models",
+                        "variant",
+                        "thinking_level",
+                        "timeout_minutes",
+                    ],
+                },
+            });
+        });
+
+        it("keeps agent and task metadata separate from strict harness execution blocks", () => {
+            const result = MagicContextConfigSchema.parse({
+                historian: {
+                    disable: false,
+                    two_pass: true,
+                    disallowed_tools: ["read"],
+                    opencode: {
+                        model: { model: "anthropic/claude-sonnet-4-6", variant: "high" },
+                        fallback_models: ["openai/gpt-5.4"],
+                        variant: "medium",
+                    },
+                    pi: {
+                        model: {
+                            model: "github-copilot/gpt-5.4",
+                            thinking_level: "high",
+                        },
+                        fallback_models: ["openai/gpt-5.4"],
+                        thinking_level: "medium",
+                    },
+                },
+                dreamer: {
+                    disable: false,
+                    inject_docs: false,
+                    tasks: {
+                        "review-user-memories": {
+                            schedule: "0 3 * * *",
+                            promotion_threshold: 4,
+                        },
+                    },
+                    opencode: {
+                        model: "anthropic/claude-sonnet-4-6",
+                        fallback_models: [{ model: "openai/gpt-5.4", variant: "low" }],
+                        tasks: {
+                            verify: {
+                                model: "anthropic/claude-haiku-4-5",
+                                fallback_models: ["openai/gpt-5.4"],
+                                variant: "medium",
+                                timeout_minutes: 30,
+                            },
+                        },
+                    },
+                    pi: {
+                        model: "github-copilot/gpt-5.4",
+                        fallback_models: [{ model: "openai/gpt-5.4", thinking_level: "minimal" }],
+                        tasks: {
+                            verify: {
+                                model: "github-copilot/gpt-5.4",
+                                fallback_models: ["openai/gpt-5.4"],
+                                thinking_level: "high",
+                                timeout_minutes: 30,
+                            },
+                        },
+                    },
+                },
+            });
+
+            expect(result.historian?.opencode?.fallback_models).toEqual(["openai/gpt-5.4"]);
+            expect(result.dreamer?.tasks["review-user-memories"]).toEqual({
+                schedule: "0 3 * * *",
+                promotion_threshold: 4,
+            });
+            expect(result.dreamer?.opencode?.tasks?.verify?.timeout_minutes).toBe(30);
+        });
+
+        it("rejects cross-harness vocabulary, non-array fallbacks, and execution fields at metadata depth", () => {
+            const invalidConfigs = [
+                { historian: { opencode: { thinking_level: "high" } } },
+                { historian: { pi: { variant: "high" } } },
+                {
+                    dreamer: {
+                        opencode: { tasks: { verify: { thinking_level: "high" } } },
+                    },
+                },
+                {
+                    dreamer: {
+                        pi: { tasks: { verify: { variant: "high" } } },
+                    },
+                },
+                { historian: { opencode: { fallback_models: "anthropic/claude-sonnet-4-6" } } },
+                { dreamer: { tasks: { verify: { model: "anthropic/claude-sonnet-4-6" } } } },
+            ];
+
+            for (const config of invalidConfigs) {
+                expect(MagicContextConfigSchema.safeParse(config).success).toBe(false);
+            }
         });
     });
 

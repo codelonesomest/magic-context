@@ -56,16 +56,18 @@ import {
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { getCurrentToolSetHash } from "../../features/magic-context/tool-definition-tokens";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
+import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
+import { resolveHistorianModel } from "../../shared/model-resolution";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
-import { resolveFallbackChain } from "../../shared/resolve-fallbacks";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
@@ -86,7 +88,8 @@ import {
 } from "./event-resolvers";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
-import { dropSlot } from "./lkg-slot";
+import { createDbLkgPersistence } from "./lkg-persist";
+import { dropSlot, registerLkgPersistence } from "./lkg-slot";
 import { SubcModuleTransport } from "./module-transport";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
@@ -352,9 +355,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // context, not the main session model's. Re-derived per historian invocation
     // (matching RPC/TUI paths) so config/model changes take effect without
     // restart, and so all trigger sources produce consistent chunk sizes.
+    const resolveHistorianAttempts = () => resolveHistorianModel(deps.config, "opencode");
     const getHistorianChunkTokens = (): number =>
-        deriveHistorianChunkTokens(resolveHistorianContextLimit(deps.config.historian?.model));
-    const historianFallbackModels = resolveFallbackChain(deps.config.historian?.fallback_models);
+        deriveHistorianChunkTokens(
+            resolveHistorianContextLimit(resolveHistorianAttempts().primary?.model),
+        );
+    const historianModel = resolveHistorianAttempts().primary;
+    const historianFallbackModels = resolveHistorianAttempts().fallbacks;
 
     // Three independent cache-busting signal sets, sourced from the
     // process-scoped LiveSessionState so RPC handlers (TUI recomp) can
@@ -503,6 +510,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianTimeoutMs: deps.config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
         memoryEnabled: deps.config.memory?.enabled ?? true,
         autoPromote: deps.config.memory?.auto_promote ?? true,
+        historianModel,
         fallbackModels: historianFallbackModels,
         language: deps.config.language,
         fallbackModelId: (() => {
@@ -510,7 +518,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         })(),
         historianTwoPass: deps.config.historian?.two_pass === true,
-        runMigration: deps.config.memory?.enabled !== false && !!deps.config.historian?.model,
+        runMigration: deps.config.memory?.enabled !== false && !!historianModel?.model,
         // Option C privacy gate: behavioral observation candidates are collected
         // during historian runs only when the user has SCHEDULED the
         // review-user-memories task (schedule != ""). Replaces the v1
@@ -1043,6 +1051,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             );
     };
 
+    // Durable LKG replay: register the db-backed backend so slot drops clear the
+    // persisted row and in-memory misses (notably the first pass after a
+    // process restart) hydrate the snapshot captured by the last applied pass.
+    // Re-registration on a healed storage reopen replaces the stale handle.
+    registerLkgPersistence(createDbLkgPersistence(db));
+
     const transform = createTransform({
         tagger: deps.tagger,
         scheduler: deps.scheduler,
@@ -1080,6 +1094,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeThresholdPercentage: deps.config.execute_threshold_percentage,
         executeThresholdTokens: deps.config.execute_threshold_tokens,
         historianTimeoutMs: deps.config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+        historianModel,
         fallbackModels: historianFallbackModels,
         getNotificationParams: (sessionId) =>
             getLiveNotificationParams(
@@ -1092,6 +1107,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         getModelKey: (sessionId) => {
             const model = liveModelBySession.get(sessionId);
             return resolveModelKey(model?.providerID, model?.modelID);
+        },
+        getToolSetHash: (sessionId) => {
+            const model = liveModelBySession.get(sessionId);
+            if (!model) return "";
+            return getCurrentToolSetHash(
+                model.providerID,
+                model.modelID,
+                agentBySession.get(sessionId),
+            );
         },
         getFallbackModelId: (sessionId) => {
             const model = liveModelBySession.get(sessionId);
@@ -1218,7 +1242,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // Dreamer v2: the per-task scheduler owns due-evaluation + keyed leases.
         // This message-event-driven path is a secondary trigger to the process
         // timer; both call the same idempotent scheduler (leases prevent overlap).
-        const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreaming, deps.config.language);
+        const runtimeConfigs = buildDreamTaskRuntimeConfigs(
+            dreaming,
+            "opencode",
+            deps.config.language,
+            deps.config.mural?.model,
+        );
         const executor = createDreamTaskExecutor({
             client: deps.client,
             // Run in the directory this hook instance owns, not a stale sibling
@@ -1277,6 +1306,20 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             // falls back to the default threshold and displays a stale budget.
             const model = resolveLiveModel(sessionId);
             return model ? `${model.providerID}/${model.modelID}` : undefined;
+        },
+        getStatusDetail: (sessionId, moduleStatus) => {
+            const model = resolveLiveModel(sessionId);
+            return buildStatusDetail(
+                db,
+                sessionId,
+                sessionDirectoryBySession.get(sessionId) ?? deps.directory,
+                model ? `${model.providerID}/${model.modelID}` : undefined,
+                deps.config as unknown as Record<string, unknown>,
+                deps.liveSessionState,
+                deps.config.memory?.injection_budget_tokens,
+                moduleStatus,
+                !compactionOff,
+            );
         },
         getDreamerProgress: () => dreamerProgressByProject.get(projectPath) ?? null,
         getTailHygiene: (sessionId) => channel1StateBySession.get(sessionId),
@@ -1350,7 +1393,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       runManualDream({
                           db,
                           projectIdentity: projectPath,
-                          tasks: buildDreamTaskRuntimeConfigs(dreamerConfig, deps.config.language),
+                          tasks: buildDreamTaskRuntimeConfigs(
+                              dreamerConfig,
+                              "opencode",
+                              deps.config.language,
+                              deps.config.mural?.model,
+                          ),
                           executor: createDreamTaskExecutor({
                               client: deps.client,
                               sessionDirectory: deps.directory,

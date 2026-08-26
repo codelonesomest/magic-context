@@ -6,6 +6,7 @@ import { type ContextDatabase, updateSessionMeta } from "../../features/magic-co
 import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared/logger";
+import type { ModelInput } from "../../shared/model-resolution";
 import {
     type ActiveCompartmentRun,
     getActiveCompartmentRun,
@@ -47,7 +48,8 @@ interface RunCompartmentPhaseArgs {
     historianChunkTokens: number;
     historyBudgetTokens?: number;
     historianTimeoutMs?: number;
-    fallbackModels?: readonly string[];
+    historianModel?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     compartmentDirectory: string;
     messages: MessageLike[];
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
@@ -325,6 +327,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 currentContextLimit: args.boundaryContextLimit,
                 historyBudgetTokens: args.historyBudgetTokens,
                 historianTimeoutMs: args.historianTimeoutMs,
+                model: args.historianModel,
                 fallbackModels: args.fallbackModels,
                 directory: args.compartmentDirectory,
                 fallbackModelId: args.fallbackModelId,
@@ -369,6 +372,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 currentContextLimit: args.boundaryContextLimit,
                 historyBudgetTokens: args.historyBudgetTokens,
                 historianTimeoutMs: args.historianTimeoutMs,
+                model: args.historianModel,
                 fallbackModels: args.fallbackModels,
                 directory: args.compartmentDirectory,
                 fallbackModelId: args.fallbackModelId,

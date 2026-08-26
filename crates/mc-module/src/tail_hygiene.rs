@@ -55,6 +55,20 @@ pub(crate) struct TailHygieneMeasurement {
     pub(crate) parts: Vec<TailHygienePartMeasurement>,
 }
 
+/// Count distinct user messages that reached the tail as authored turns.
+/// `FlatBlock::synthetic` is the codec's machine-origin marker: it is set for
+/// injected m0/m1 heads and Channel-2 rows, so those user-shaped rows do not
+/// advance Channel-1's cadence.
+pub(crate) fn real_user_turn_count(projection: &FlatProjection) -> u64 {
+    projection
+        .blocks
+        .iter()
+        .filter(|block| block.role == "user" && !block.synthetic)
+        .map(|block| block.mid.as_str())
+        .collect::<HashSet<_>>()
+        .len() as u64
+}
+
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes.as_ref()))
 }
@@ -250,6 +264,7 @@ fn part_measurement(
     tokens: i64,
     tag_number: Option<i64>,
     protected: bool,
+    queued_for_drop: bool,
 ) -> TailHygienePartMeasurement {
     let kind_name = match kind {
         TailHygienePartKind::Text => "text",
@@ -262,7 +277,7 @@ fn part_measurement(
     hash_input.push_str(kind_name);
     hash_input.push('\0');
     hash_input.push_str(content);
-    let active = tag_number.is_some();
+    let active = tag_number.is_some() && !queued_for_drop;
     TailHygienePartMeasurement {
         key,
         content_hash: hex_digest(hash_input),
@@ -270,13 +285,22 @@ fn part_measurement(
         tokens,
         u_tokens: if active && !protected { tokens } else { 0 },
         tag_number,
-        tag_status: active.then(|| "active".to_string()),
+        tag_status: tag_number.map(|_| "active".to_string()),
         protected,
+        queued_for_drop,
     }
 }
 
 fn excluded_part(key: String, content: &str) -> TailHygienePartMeasurement {
-    part_measurement(key, TailHygienePartKind::Excluded, content, 0, None, false)
+    part_measurement(
+        key,
+        TailHygienePartKind::Excluded,
+        content,
+        0,
+        None,
+        false,
+        false,
+    )
 }
 
 fn projection_message_indexes(projection: &FlatProjection) -> HashMap<&str, usize> {
@@ -455,6 +479,10 @@ fn block_is_protected(
             .is_some_and(|arc_id| protected_arc_ids.contains(arc_id))
 }
 
+// Production measures through measure_tail_hygiene_with_pending_drops (queued
+// agent drops leave U); this unqueued form remains as the tests' baseline
+// reference for delta/parity assertions.
+#[cfg(test)]
 pub(crate) fn measure_tail_hygiene(
     projection: &FlatProjection,
     core: &CoreState,
@@ -463,8 +491,40 @@ pub(crate) fn measure_tail_hygiene(
     protected_tags: usize,
     protected_block_ids: &HashSet<String>,
 ) -> TailHygieneMeasurement {
+    measure_tail_hygiene_with_pending_drops(
+        projection,
+        core,
+        coverage_ordinal,
+        tag_rows,
+        protected_tags,
+        protected_block_ids,
+        &HashSet::new(),
+    )
+}
+
+pub(crate) fn queued_tag_numbers(
+    tag_rows: &[McTagRow],
+    pending_drop_target_ids: &HashSet<String>,
+) -> HashSet<i64> {
+    tag_rows
+        .iter()
+        .filter(|row| pending_drop_target_ids.contains(&row.block_id))
+        .map(|row| row.tag_number)
+        .collect()
+}
+
+pub(crate) fn measure_tail_hygiene_with_pending_drops(
+    projection: &FlatProjection,
+    core: &CoreState,
+    coverage_ordinal: Option<u64>,
+    tag_rows: &[McTagRow],
+    protected_tags: usize,
+    protected_block_ids: &HashSet<String>,
+    pending_drop_target_ids: &HashSet<String>,
+) -> TailHygieneMeasurement {
     let (tags_by_block, tags_by_arc) = tag_numbers_by_block_and_arc(projection, tag_rows);
     let protected_numbers = protected_tag_numbers(tag_rows, protected_tags);
+    let queued_numbers = queued_tag_numbers(tag_rows, pending_drop_target_ids);
     let protected_arc_ids = projection
         .blocks
         .iter()
@@ -519,6 +579,7 @@ pub(crate) fn measure_tail_hygiene(
             protected_block_ids,
             &protected_arc_ids,
         );
+        let queued_for_drop = tag_number.is_some_and(|number| queued_numbers.contains(&number));
         let measured = match &block.wire.kind {
             mc_store::CkKind::Text { text }
                 if block.role == "user" || block.role == "assistant" =>
@@ -535,6 +596,7 @@ pub(crate) fn measure_tail_hygiene(
                         estimated_tokens(content),
                         tag_number,
                         protected,
+                        queued_for_drop,
                     )
                 }
             }
@@ -547,6 +609,7 @@ pub(crate) fn measure_tail_hygiene(
                     estimated_tokens(&content),
                     tag_number,
                     protected,
+                    queued_for_drop,
                 )
             }
             mc_store::CkKind::ToolResult { output, .. } => {
@@ -562,6 +625,7 @@ pub(crate) fn measure_tail_hygiene(
                         estimated_tokens(content),
                         tag_number,
                         protected,
+                        queued_for_drop,
                     )
                 }
             }
@@ -577,6 +641,7 @@ pub(crate) fn measure_tail_hygiene(
                         media_tokens(media, &content),
                         tag_number,
                         protected,
+                        queued_for_drop,
                     )
                 }
             }
@@ -605,11 +670,12 @@ pub(crate) fn measure_tail_hygiene(
 fn same_measured_prefix(
     baseline: &[TailHygienePartMeasurement],
     current: &[TailHygienePartMeasurement],
-) -> Option<i64> {
+) -> Option<(i64, i64)> {
     if current.len() < baseline.len() {
         return None;
     }
     let mut boundary_advance_u = 0i64;
+    let mut queued_drop_delta_u = 0i64;
     for (before, after) in baseline.iter().zip(current) {
         if before.key != after.key
             || before.content_hash != after.content_hash
@@ -625,12 +691,20 @@ fn same_measured_prefix(
             if after.tag_status.as_deref() != Some("active") {
                 return None;
             }
-            boundary_advance_u = boundary_advance_u.saturating_add(after.tokens);
+            boundary_advance_u = boundary_advance_u.saturating_add(after.u_tokens);
+        } else if before.queued_for_drop != after.queued_for_drop {
+            if before.tag_status.as_deref() != Some("active")
+                || after.tag_status.as_deref() != Some("active")
+            {
+                return None;
+            }
+            queued_drop_delta_u =
+                queued_drop_delta_u.saturating_add(after.u_tokens.saturating_sub(before.u_tokens));
         } else if before.u_tokens != after.u_tokens {
             return None;
         }
     }
-    Some(boundary_advance_u)
+    Some((boundary_advance_u, queued_drop_delta_u))
 }
 
 pub(crate) fn refresh_tail_hygiene_baseline(
@@ -662,7 +736,8 @@ pub(crate) fn refresh_tail_hygiene_baseline(
     }
 
     let previous = previous.expect("non-busting refresh has a previous baseline");
-    let Some(mut turn_delta_u) = same_measured_prefix(&previous.baseline_parts, &measured.parts)
+    let Some((boundary_advance_u, queued_drop_delta_u)) =
+        same_measured_prefix(&previous.baseline_parts, &measured.parts)
     else {
         let mut invalidated = previous.clone();
         invalidated.evaluable = false;
@@ -671,6 +746,9 @@ pub(crate) fn refresh_tail_hygiene_baseline(
         return invalidated;
     };
     let mut turn_delta_t = 0i64;
+    // Queue membership is an action-state delta: it reduces the actionable token
+    // backlog while the frozen baseline and still-rendered token total remain unchanged.
+    let mut turn_delta_u = boundary_advance_u.saturating_add(queued_drop_delta_u);
     for part in &measured.parts[previous.baseline_parts.len()..] {
         turn_delta_t = turn_delta_t.saturating_add(part.tokens);
         // A just-completed output is always in the newest recency reserve. Keeping it T-only
@@ -769,6 +847,22 @@ mod tests {
     }
 
     #[test]
+    fn real_user_turn_count_ignores_interleaved_synthetic_user_rows() {
+        let real = text("real", 1, "continue");
+        let mut reminder = text(
+            "reminder",
+            2,
+            "<system-reminder>board stale</system-reminder>",
+        );
+        reminder.ck.meta.synthetic = true;
+        let mut channel2 = text("channel2", 3, "<system-reminder>reduce</system-reminder>");
+        channel2.ck.meta.synthetic = true;
+        let projection = project_messages(&[real, reminder, channel2]).unwrap();
+
+        assert_eq!(real_user_turn_count(&projection), 1);
+    }
+
+    #[test]
     fn defer_delta_and_boundary_advance_are_additive() {
         let base = vec![
             text("old", 1, &"old mass ".repeat(2_000)),
@@ -807,6 +901,112 @@ mod tests {
             "old protected mass should advance into U"
         );
         assert_eq!(defer.baseline_generation, baseline.baseline_generation);
+    }
+
+    #[test]
+    fn queued_drop_mass_uses_a_defer_delta_without_changing_t_or_the_frozen_baseline() {
+        let messages = vec![
+            text("queued", 1, &"mass ".repeat(25_000)),
+            text("remaining", 2, &"mass ".repeat(45_000)),
+            text("untagged", 3, &"mass ".repeat(30_000)),
+        ];
+        let tags = vec![tag(1, "queued#0"), tag(2, "remaining#0")];
+        let projection = project_messages(&messages).unwrap();
+        let initial = measure_tail_hygiene(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+        );
+        let baseline = refresh_tail_hygiene_baseline(initial.clone(), true, None, 10);
+        let queued_targets = HashSet::from(["queued#0".to_string()]);
+        let queued = measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+            &queued_targets,
+        );
+        let queued_only = project_messages(&[messages[0].clone()]).unwrap();
+        let queued_mass = measure_tail_hygiene(
+            &queued_only,
+            &CoreState::default(),
+            None,
+            &[tags[0].clone()],
+            0,
+            &HashSet::new(),
+        )
+        .u;
+        let defer = refresh_tail_hygiene_baseline(queued.clone(), false, Some(&baseline), 20);
+
+        assert_eq!(queued.t, initial.t);
+        assert_eq!(queued.u, initial.u - queued_mass);
+        assert!(defer.evaluable);
+        assert_eq!(defer.baseline_u, baseline.baseline_u);
+        assert_eq!(defer.baseline_t, baseline.baseline_t);
+        assert_eq!(effective_tail_hygiene(&defer), (queued.u, queued.t));
+        assert_eq!(hygiene_band(initial.u, initial.t), HygieneBand::Urgent);
+        assert_eq!(hygiene_band(queued.u, queued.t), HygieneBand::Firm);
+    }
+
+    #[test]
+    fn queued_tool_tag_excludes_the_full_call_and_result_arc_from_u() {
+        let messages = vec![
+            message(
+                "owner",
+                1,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "queued-call".to_string(),
+                    name: "read".to_string(),
+                    input: json!({ "payload": "large queued input".repeat(200) }),
+                    provider_executed: false,
+                }],
+            ),
+            message(
+                "result",
+                2,
+                "user",
+                vec![CkKind::ToolResult {
+                    id: "queued-call".to_string(),
+                    tool_name: "read".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: "large queued output ".repeat(2_000),
+                    }),
+                    provider_executed: false,
+                }],
+            ),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let mut tool_tag = tag(7, "result#0");
+        tool_tag.kind = "tool".to_string();
+        let tags = vec![tool_tag];
+        let initial = measure_tail_hygiene(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+        );
+        let queued = measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+            &HashSet::from(["result#0".to_string()]),
+        );
+
+        assert!(initial.u > 0);
+        assert_eq!(initial.u - queued.u, initial.u);
+        assert_eq!(queued.u, 0);
+        assert_eq!(queued.t, initial.t);
     }
 
     #[test]
@@ -864,6 +1064,8 @@ mod tests {
         protected_tags: usize,
         messages: Vec<HygieneFixtureMessage>,
         tags: Vec<HygieneFixtureTag>,
+        #[serde(default)]
+        pending_drop_tag_numbers: Vec<i64>,
         expected: HygieneExpected,
     }
 
@@ -929,6 +1131,8 @@ mod tests {
         protected_tags: usize,
         messages: &'a [HygieneFixtureMessage],
         tags: &'a [HygieneFixtureTag],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pending_drop_tag_numbers: Option<&'a [i64]>,
     }
 
     fn hygiene_fixture_canonical(cases: &[HygieneGoldenCase]) -> String {
@@ -939,6 +1143,8 @@ mod tests {
                 protected_tags: case.protected_tags,
                 messages: &case.messages,
                 tags: &case.tags,
+                pending_drop_tag_numbers: (!case.pending_drop_tag_numbers.is_empty())
+                    .then_some(case.pending_drop_tag_numbers.as_slice()),
             })
             .collect::<Vec<_>>();
         format!(
@@ -1047,13 +1253,24 @@ mod tests {
                 .collect::<Vec<_>>();
             let tags = case.tags.iter().map(fixture_tag).collect::<Vec<_>>();
             let projection = project_messages(&messages).expect("project parity fixture");
-            let measured = measure_tail_hygiene(
+            let pending_numbers = case
+                .pending_drop_tag_numbers
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let pending_targets = tags
+                .iter()
+                .filter(|tag| pending_numbers.contains(&tag.tag_number))
+                .map(|tag| tag.block_id.clone())
+                .collect::<HashSet<_>>();
+            let measured = measure_tail_hygiene_with_pending_drops(
                 &projection,
                 &CoreState::default(),
                 None,
                 &tags,
                 case.protected_tags,
                 &HashSet::new(),
+                &pending_targets,
             );
             for (label, rust, ts) in [
                 ("U", measured.u, case.expected.u),
@@ -1064,6 +1281,25 @@ mod tests {
                     (rust - ts).abs() <= tolerance,
                     "{} {label} drifted outside tokenizer tolerance: Rust={rust}, TS={ts}, tolerance={tolerance}",
                     case.id
+                );
+            }
+            if case.id == "queued-tool-arc-full-mass" {
+                let unqueued = measure_tail_hygiene(
+                    &projection,
+                    &CoreState::default(),
+                    None,
+                    &tags,
+                    case.protected_tags,
+                    &HashSet::new(),
+                );
+                assert_eq!(
+                    unqueued.u - measured.u,
+                    unqueued.u,
+                    "queueing the tool tag must remove the full attributed call/result mass",
+                );
+                assert_eq!(
+                    measured.u, case.expected.u,
+                    "Rust and TS queued U must agree"
                 );
             }
             if case.id == "reasoning-excluded-both-terms" {

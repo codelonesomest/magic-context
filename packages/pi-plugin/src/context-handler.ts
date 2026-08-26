@@ -165,6 +165,7 @@ import {
 import { escalationBands } from "@magic-context/core/shared/escalation-bands";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
+import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
@@ -234,6 +235,7 @@ import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import { clearPiSystemPromptSession } from "./system-prompt";
 import {
 	assertPiTailHygieneContentUnchanged,
+	countRealPiUserMessages,
 	effectivePiTailHygiene,
 	refreshPiTailHygieneBaseline,
 } from "./tail-hygiene-walk-pi";
@@ -931,8 +933,8 @@ export interface PiHistorianOptions {
 	runner: SubagentRunner;
 	/** Historian provider/model id (e.g. `anthropic/claude-haiku-4-5`). */
 	model: string;
-	/** Optional ordered fallback chain. */
-	fallbackModels?: readonly string[];
+	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
+	fallbackModels?: readonly ModelInput[];
 	/** Historian context window — used to derive chunk token budget. */
 	historianChunkTokens: number;
 	/** Optional per-call timeout (default 120s). */
@@ -2985,6 +2987,18 @@ export function registerPiContextHandler(
 							result.materializeReason,
 							result.materialized,
 						),
+						systemHashPrev: result.materialized
+							? (result.injectionResult?.systemHashPrev ?? null)
+							: null,
+						systemHashNew: result.materialized
+							? (result.injectionResult?.systemHashNew ?? null)
+							: null,
+						m0ModelKeyPrev: result.materialized
+							? (result.injectionResult?.m0ModelKeyPrev ?? null)
+							: null,
+						m0ModelKeyNew: result.materialized
+							? (result.injectionResult?.m0ModelKeyNew ?? null)
+							: null,
 						emergency: result.emergency,
 						droppedTokens: result.droppedTokens,
 						droppedCount: result.droppedCount,
@@ -3166,6 +3180,13 @@ export function registerPiContextHandler(
 				if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
 					const tags = getTagsBySession(options.db, sessionId);
 					const protectedTags = options.protectedTags ?? 20;
+					// Queued ctx_reduce drops are completed agent decisions. Their bytes
+					// remain in T until a cache-busting materialization, but not in U.
+					const pendingDropTagNumbers = new Set(
+						getPendingOps(options.db, sessionId)
+							.filter((operation) => operation.operation === "drop")
+							.map((operation) => operation.tagId),
+					);
 					const stableId = (message: unknown): string | undefined =>
 						message && typeof message === "object"
 							? result.postCommitEntryIdByRef.get(message)
@@ -3174,6 +3195,7 @@ export function registerPiContextHandler(
 						messages: outputMessages,
 						tags,
 						protectedTags,
+						pendingDropTagNumbers,
 						stableId,
 						syntheticLeadingCount: result.syntheticLeadingCount,
 						cacheBusting: result.bustedThisPass,
@@ -3188,7 +3210,17 @@ export function registerPiContextHandler(
 					);
 					const channelState = {
 						...baseline,
+						usableWindow: usageContextLimit ?? 0,
+						realUserTurnCount: countRealPiUserMessages({
+							messages: outputMessages,
+							tags,
+							protectedTags,
+							pendingDropTagNumbers,
+							stableId,
+							syntheticLeadingCount: result.syntheticLeadingCount,
+						}),
 						reducedSinceRefresh: false,
+						agentDropsAppliedThisPass: result.agentDropsAppliedThisPass,
 						oldestReclaimableToolTags,
 					};
 					setPiChannel1Baseline(sessionId, channelState);
@@ -3219,6 +3251,7 @@ export function registerPiContextHandler(
 							messages: outputMessages,
 							tags,
 							protectedTags,
+							pendingDropTagNumbers,
 							stableId,
 							syntheticLeadingCount: result.syntheticLeadingCount,
 							expectedSignature: baseline.contentSignature,
@@ -4278,6 +4311,7 @@ interface RunPipelineResult {
 	droppedCount: number;
 	emergency: boolean;
 	bustedThisPass: boolean;
+	agentDropsAppliedThisPass: boolean;
 	targetCount: number;
 	reasoningWatermark: number;
 	activeTags: ReturnType<typeof getActiveTagsBySession>;
@@ -4403,6 +4437,7 @@ async function runCompactionOffPipeline(
 		droppedCount: 0,
 		emergency: false,
 		bustedThisPass: injectionResult?.m0Materialized === true,
+		agentDropsAppliedThisPass: false,
 		targetCount: 0,
 		reasoningWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
 		activeTags: [],
@@ -5463,6 +5498,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						m0Materialized: true,
 						m0Reason:
 							preFoldInjectionResult.m0Reason ?? wireInjectionResult.m0Reason,
+						systemHashPrev: preFoldInjectionResult.systemHashPrev ?? null,
+						systemHashNew: preFoldInjectionResult.systemHashNew ?? null,
+						m0ModelKeyPrev: preFoldInjectionResult.m0ModelKeyPrev ?? null,
+						m0ModelKeyNew: preFoldInjectionResult.m0ModelKeyNew ?? null,
 					}
 				: wireInjectionResult;
 			// Temporal markers are derived before history injection trims raw messages.
@@ -5720,6 +5759,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		droppedCount,
 		emergency,
 		bustedThisPass,
+		agentDropsAppliedThisPass: pendingOpsDidMutate,
 		targetCount: targets.size,
 		reasoningWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
 		activeTags,

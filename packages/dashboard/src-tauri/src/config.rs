@@ -112,12 +112,20 @@ pub fn write_config(path: &Path, content: &str) -> Result<(), String> {
     write_config_atomic(path, content, None)
 }
 
-pub fn write_project_config(project_path: &str, path: &Path, content: &str) -> Result<(), String> {
+pub fn write_project_config(project_path: &str, content: &str) -> Result<(), String> {
     let canonical_project = Path::new(project_path)
         .canonicalize()
         .map_err(|e| format!("Invalid project path: {e}"))?;
-    validate_project_config_target(&canonical_project, path)?;
-    write_config_atomic(path, content, Some(&canonical_project))
+
+    // The project path can be a workspace-member alias (for example, a symlinked
+    // checkout). Derive the write target from its canonical root so the containment
+    // guard compares two paths in the same namespace and cannot be redirected by a
+    // caller-provided target.
+    let path = canonical_project
+        .join(".cortexkit")
+        .join("magic-context.jsonc");
+    validate_project_config_target(&canonical_project, &path)?;
+    write_config_atomic(&path, content, Some(&canonical_project))
 }
 
 fn validate_project_config_target(canonical_project: &Path, path: &Path) -> Result<(), String> {
@@ -338,9 +346,7 @@ pub fn discover_project_configs_with_db(
                 for p in &projects {
                     if let Some(path) = &p.path {
                         if !path.is_empty() {
-                            worktree_map
-                                .entry(path.clone())
-                                .or_insert(p.label.clone());
+                            worktree_map.entry(path.clone()).or_insert(p.label.clone());
                         }
                     }
                 }
@@ -353,8 +359,7 @@ pub fn discover_project_configs_with_db(
     if let Some(ref opencode_path) = opencode_db {
         if let Ok(conn) = rusqlite::Connection::open_with_flags(
             opencode_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
             collect_opencode_db_projects(&conn, &mut worktree_map);
         }
@@ -492,7 +497,6 @@ mod tests {
 
         write_project_config(
             canonical_project.to_str().unwrap(),
-            &path,
             "{\n  \"enabled\": true\n}\n",
         )
         .expect("initial write");
@@ -503,13 +507,37 @@ mod tests {
 
         write_project_config(
             canonical_project.to_str().unwrap(),
-            &path,
             "{\n  \"enabled\": false\n}\n",
         )
         .expect("overwrite regular file");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{\n  \"enabled\": false\n}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_project_config_uses_the_canonical_workspace_member_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let workspace_member = dir.path().join("workspace/member");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir_all(workspace_member.parent().unwrap()).unwrap();
+        symlink(&project, &workspace_member).unwrap();
+
+        write_project_config(
+            workspace_member.to_str().unwrap(),
+            "{\n  \"dreamer\": { \"tasks\": {} }\n}\n",
+        )
+        .expect("workspace member should create its own project override");
+
+        let canonical_target = project.join(".cortexkit/magic-context.jsonc");
+        assert_eq!(
+            std::fs::read_to_string(canonical_target).unwrap(),
+            "{\n  \"dreamer\": { \"tasks\": {} }\n}\n"
         );
     }
 
@@ -528,12 +556,8 @@ mod tests {
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         symlink(&outside, &config_path).unwrap();
 
-        let err = write_project_config(
-            canonical_project.to_str().unwrap(),
-            &config_path,
-            "{\"enabled\":true}\n",
-        )
-        .expect_err("symlinked config must be refused");
+        let err = write_project_config(canonical_project.to_str().unwrap(), "{\"enabled\":true}\n")
+            .expect_err("symlinked config must be refused");
         assert!(err.contains("symlink"), "unexpected error: {err}");
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
@@ -551,7 +575,7 @@ mod tests {
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::create_dir(&config_path).unwrap();
 
-        let err = write_project_config(canonical_project.to_str().unwrap(), &config_path, "{}\n")
+        let err = write_project_config(canonical_project.to_str().unwrap(), "{}\n")
             .expect_err("directory target must be refused");
         assert!(err.contains("regular file"), "unexpected error: {err}");
     }
@@ -615,10 +639,7 @@ mod tests {
 
         // Set up opencode.db with the project
         let oc_path = data_home.join("opencode").join("opencode.db");
-        let oc = create_test_opencode_db(
-            &oc_path,
-            &[("My Project", proj_str.as_str())],
-        );
+        let oc = create_test_opencode_db(&oc_path, &[("My Project", proj_str.as_str())]);
         drop(oc);
 
         // No context.db — simulate Desktop scenario
@@ -668,14 +689,14 @@ mod tests {
         // Set up opencode.db with the project (so enumerate_projects can
         // resolve the identity → path mapping)
         let oc_path = data_home.join("opencode").join("opencode.db");
-        let oc = create_test_opencode_db(
-            &oc_path,
-            &[("My Project", proj_str.as_str())],
-        );
+        let oc = create_test_opencode_db(&oc_path, &[("My Project", proj_str.as_str())]);
         drop(oc);
 
         // Set up context.db with a memory row for the same project
-        let ctx_path = data_home.join("cortexkit").join("magic-context").join("context.db");
+        let ctx_path = data_home
+            .join("cortexkit")
+            .join("magic-context")
+            .join("context.db");
         std::fs::create_dir_all(ctx_path.parent().unwrap()).unwrap();
         let ctx_conn = rusqlite::Connection::open(&ctx_path).unwrap();
         ctx_conn

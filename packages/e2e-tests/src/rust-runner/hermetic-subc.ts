@@ -127,8 +127,27 @@ function processKill(pid: number): void {
     process.kill(pid, "SIGKILL");
 }
 
+/**
+ * Keep Rust e2e artifacts outside either live source workspace's target directory.
+ * This directory is durable across test runs so Cargo can reuse incremental artifacts,
+ * while a developer build in either workspace cannot hold the harness's target lock.
+ */
+const RUST_E2E_CARGO_TARGET_DIR = join(
+    REPO_ROOT,
+    "packages/e2e-tests/.cache/rust-e2e-cargo-target",
+);
+
 /** ck-mc lives in THIS workspace; ck-subc in the sibling subconscious workspace. */
-const CK_MC_RELEASE = join(REPO_ROOT, "target/release/ck-mc");
+const CK_MC_RELEASE = join(RUST_E2E_CARGO_TARGET_DIR, "release/ck-mc");
+
+/**
+ * Resolve only the binary that Cargo builds from this checkout. The release
+ * preflight can export a PATH fallback through `MC_E2E_CK_MC_BIN`, but consuming
+ * that fallback here could replay an older tree while the e2e loads current tests.
+ */
+function currentTreeCkMcBinary(_configuredBinary: string | undefined): string {
+    return CK_MC_RELEASE;
+}
 
 /**
  * Candidate locations for the sibling subconscious workspace. In a normal
@@ -192,12 +211,17 @@ interface BuiltBinaries {
 
 let buildPromise: Promise<BuiltBinaries> | null = null;
 
+function rustE2eCargoEnv(): NodeJS.ProcessEnv {
+    return { ...process.env, CARGO_TARGET_DIR: RUST_E2E_CARGO_TARGET_DIR };
+}
+
 function runCargo(
     args: string[],
     cwd: string,
+    env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
     return new Promise((resolveRun) => {
-        const child = spawn("cargo", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+        const child = spawn("cargo", args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
         let stdout = "";
         let stderr = "";
         child.stdout?.on("data", (chunk: Buffer) => {
@@ -219,31 +243,28 @@ function runCargo(
  * Build the module and daemon from their current workspaces, incrementally.
  *
  * `ck-mc` links protocol/client path dependencies from the sibling workspace, so
- * pairing it with an older prebuilt daemon can exercise two different sibling
- * revisions. Running Cargo for both workspaces keeps the hermetic pair coherent;
- * Cargo's incremental check makes unchanged builds cheap, and `buildPromise`
- * serializes and memoizes the work for this test process.
+ * pairing it with any prebuilt component can exercise different source revisions.
+ * Running Cargo for both workspaces keeps the hermetic pair coherent. The module
+ * build always targets this checkout, even when a release preflight exported a
+ * PATH fallback through `MC_E2E_CK_MC_BIN`; Cargo still reuses valid incremental
+ * artifacts. Both builds use the e2e-owned target directory, avoiding either live
+ * workspace's Cargo target lock. `buildPromise` serializes and memoizes the work
+ * for this test process.
  */
 export async function buildHermeticBinaries(subconsciousRoot: string): Promise<BuiltBinaries> {
     if (buildPromise) return buildPromise;
     buildPromise = (async () => {
-        const configuredCkMc = process.env.MC_E2E_CK_MC_BIN;
-        let ckMcBin = configuredCkMc && existsSync(configuredCkMc) ? configuredCkMc : undefined;
-        if (!ckMcBin) {
-            const moduleBuild = await runCargo(
-                ["build", "--release", "-p", "mc-module"],
-                REPO_ROOT,
+        const cargoEnv = rustE2eCargoEnv();
+        let ckMcBin = currentTreeCkMcBinary(process.env.MC_E2E_CK_MC_BIN);
+        const moduleBuild = await runCargo(
+            ["build", "--release", "-p", "mc-module"],
+            REPO_ROOT,
+            cargoEnv,
+        );
+        if (!moduleBuild.ok || !existsSync(ckMcBin)) {
+            throw new Error(
+                `failed to build ck-mc (cargo build --release -p mc-module):\n${moduleBuild.stderr.slice(-4000)}`,
             );
-            if (!moduleBuild.ok || !existsSync(CK_MC_RELEASE)) {
-                throw new Error(
-                    `failed to build ck-mc (cargo build --release -p mc-module):\n${moduleBuild.stderr.slice(-4000)}`,
-                );
-            }
-            ckMcBin = CK_MC_RELEASE;
-        }
-
-        if (!ckMcBin || !existsSync(ckMcBin)) {
-            throw new Error("ck-mc binary was not resolved after prerequisite detection");
         }
 
         // Run the module under a dev-distinct process name so a test binary is
@@ -264,10 +285,11 @@ export async function buildHermeticBinaries(subconsciousRoot: string): Promise<B
             }
         }
 
-        const ckSubcRelease = join(subconsciousRoot, "target/release/ck-subc");
+        const ckSubcRelease = join(RUST_E2E_CARGO_TARGET_DIR, "release/ck-subc");
         const daemonBuild = await runCargo(
             ["build", "--release", "-p", "subc-core", "--bins"],
             subconsciousRoot,
+            cargoEnv,
         );
         if (!daemonBuild.ok || !existsSync(ckSubcRelease)) {
             throw new Error(
@@ -841,7 +863,10 @@ export class HermeticSubcStack {
 }
 
 export const __hermeticSubcTest = {
+    currentTreeCkMcBinary,
     isStaleRustE2ePidRecord,
+    rustE2eCargoEnv,
+    rustE2eCargoTargetDir: RUST_E2E_CARGO_TARGET_DIR,
     stalePidAgeMs: RUST_E2E_STALE_PID_AGE_MS,
 };
 

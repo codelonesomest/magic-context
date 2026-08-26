@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, setDefaultTimeout, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,7 +40,9 @@ class MockPrompts implements PromptIO {
         info: (message: string) => this.messages.push(`info:${message}`),
         success: (message: string) => this.messages.push(`success:${message}`),
         warn: (message: string) => this.messages.push(`warn:${message}`),
+        error: (message: string) => this.messages.push(`error:${message}`),
         message: (message: string) => this.messages.push(`message:${message}`),
+        step: (message: string) => this.messages.push(`step:${message}`),
     };
 
     intro(message: string): void {
@@ -251,19 +253,10 @@ describe("Pi doctor", () => {
         }) as typeof damaged.prepare;
         if (!options.deps) throw new Error("expected doctor dependencies");
         options.deps.openExistingContextDatabase = () => damaged;
-        const errors: string[] = [];
-        const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
-            errors.push(args.map(String).join(" "));
-        });
+        const code = await runDoctor(options);
+        expect(code).toBe(1);
 
-        try {
-            const code = await runDoctor(options);
-            expect(code).toBe(1);
-        } finally {
-            errorSpy.mockRestore();
-        }
-
-        const output = errors.join("\n");
+        const output = prompts.messages.join("\n");
         const dbPath = join(root, ".local", "share", "cortexkit", "magic-context", "context.db");
         expect(output).toContain(`Database: ${dbPath}`);
         expect(output).toContain("bunx @cortexkit/magic-context@latest doctor repair-db");
@@ -326,7 +319,7 @@ describe("Pi doctor", () => {
         expect(code).toBe(0);
         const output = prompts.messages.join("\n");
         expect(output).toContain(
-            "WARN Embedding provider: local — onnxruntime-node native binding missing",
+            "WARN Embedding provider: local — native runtime and WASM fallback both unavailable",
         );
         expect(output).toContain("postinstall likely failed");
         expect(output).toContain("Stale Pi extension cache found");
@@ -345,7 +338,7 @@ describe("Pi doctor", () => {
 
         expect(code).toBe(0);
         const output = prompts.messages.join("\n");
-        expect(output).toContain("PASS Embedding provider: local (native runtime present)");
+        expect(output).toContain("PASS Embedding provider: local (native runtime OK)");
     });
 
     it("repairs missing package entry and missing user config in --force mode", async () => {
@@ -371,6 +364,7 @@ describe("Pi doctor", () => {
         expect(settings.packages).toContain("npm:@cortexkit/pi-magic-context");
         expect(existsSync(join(root, ".config", "cortexkit", "magic-context.jsonc"))).toBe(true);
         const output = prompts.messages.join("\n");
+        expect(output).toContain("FAIL npm:@cortexkit/pi-magic-context is missing from packages[]");
         expect(output).toContain("Added npm:@cortexkit/pi-magic-context");
         expect(output).toContain("Wrote default Magic Context config");
         expect(output).toContain("Repair attempted; 2 item(s) changed");
@@ -404,6 +398,7 @@ describe("Pi doctor", () => {
         expect(existsSync(legacyPath)).toBe(false);
         expect(existsSync(`${legacyPath}.MOVED_READPLEASE`)).toBe(true);
         const output = prompts.messages.join("\n");
+        expect(output).toContain("FAIL npm:@cortexkit/pi-magic-context is missing from packages[]");
         expect(output).toContain("Migrated Magic Context user config");
         expect(output).not.toContain("Wrote default Magic Context config");
     });
@@ -668,32 +663,51 @@ describe("Pi doctor", () => {
         );
         const prompts = new MockPrompts();
         const options = baseOptions(root, cwd, prompts);
-        const errors: string[] = [];
-        const originalError = console.error;
-        console.error = (message?: unknown) => {
-            errors.push(String(message));
-        };
-        try {
-            const code = await runDoctor({
-                ...options,
-                deps: {
-                    ...options.deps,
-                    probeEmbeddingEndpoint: async () => ({
-                        kind: "invalid_scheme",
-                        endpoint: "ftp://user:pass@example.com/v1?api_key=secret",
-                    }),
-                },
-            });
+        const code = await runDoctor({
+            ...options,
+            deps: {
+                ...options.deps,
+                probeEmbeddingEndpoint: async () => ({
+                    kind: "invalid_scheme",
+                    endpoint: "ftp://user:pass@example.com/v1?api_key=secret",
+                }),
+            },
+        });
 
-            expect(code).toBe(1);
-        } finally {
-            console.error = originalError;
-        }
-
-        const output = errors.join("\n");
+        expect(code).toBe(1);
+        const output = prompts.messages.join("\n");
         expect(output).toContain("ftp://example.com/v1");
         expect(output).not.toContain("user:pass");
         expect(output).not.toContain("api_key=secret");
+    });
+
+    it("checks Copilot reasoning configuration in the Pi historian block", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: { provider: "local" },
+                historian: {
+                    opencode: {
+                        model: { model: "github-copilot/opencode-only", variant: "high" },
+                    },
+                    pi: { model: "github-copilot/gpt-5.4" },
+                },
+            }),
+        );
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            'WARN historian.model "github-copilot/gpt-5.4" is a GitHub Copilot reasoning model',
+        );
+        expect(output).not.toContain('github-copilot/opencode-only" is a GitHub Copilot');
     });
 
     it("sanitizes thrown embedding probe errors before printing them", async () => {
@@ -713,28 +727,18 @@ describe("Pi doctor", () => {
         );
         const prompts = new MockPrompts();
         const options = baseOptions(root, cwd, prompts);
-        const errors: string[] = [];
-        const originalError = console.error;
-        console.error = (message?: unknown) => {
-            errors.push(String(message));
-        };
-        try {
-            const code = await runDoctor({
-                ...options,
-                deps: {
-                    ...options.deps,
-                    probeEmbeddingEndpoint: async () => {
-                        throw new Error("token=abc123 from /Users/alice/private");
-                    },
+        const code = await runDoctor({
+            ...options,
+            deps: {
+                ...options.deps,
+                probeEmbeddingEndpoint: async () => {
+                    throw new Error("token=abc123 from /Users/alice/private");
                 },
-            });
+            },
+        });
 
-            expect(code).toBe(1);
-        } finally {
-            console.error = originalError;
-        }
-
-        const output = errors.join("\n");
+        expect(code).toBe(1);
+        const output = prompts.messages.join("\n");
         expect(output).toContain("Embedding probe threw: token=<REDACTED:token>");
         expect(output).toContain("/Users/<USER>/private");
         expect(output).not.toContain("alice");

@@ -26,6 +26,8 @@ export interface PiTailHygieneWalkInput {
 	messages: readonly unknown[];
 	tags: readonly TagEntry[];
 	protectedTags: number;
+	/** Active tags whose drop is queued but has not yet changed the rendered Pi entries. */
+	pendingDropTagNumbers?: ReadonlySet<number>;
 	stableId?: (message: unknown, index: number) => string | undefined;
 	syntheticLeadingCount?: number;
 	syntheticMessages?: ReadonlySet<object>;
@@ -170,6 +172,21 @@ function isSyntheticMessage(
 	if (message.syntheticTodoMarker === true) return true;
 	const role = typeof message.role === "string" ? message.role : "";
 	return role === "system" || role === "custom" || role === "compactionSummary";
+}
+
+/**
+ * Counts only JSONL `user` entries that the rendered-entry classifier keeps
+ * as user-authored. `isSyntheticMessage` excludes m0/m1 through
+ * `syntheticLeadingCount` and Channel-2's hidden `custom` entries.
+ */
+export function countRealPiUserMessages(input: PiTailHygieneWalkInput): number {
+	let count = 0;
+	for (let index = 0; index < input.messages.length; index += 1) {
+		const message = input.messages[index];
+		if (!isRecord(message) || message.role !== "user") continue;
+		if (!isSyntheticMessage(message, index, input)) count += 1;
+	}
+	return count;
 }
 
 function imageContentAndTokens(part: Record<string, unknown>): {
@@ -415,6 +432,7 @@ function excludedDraft(key: string, value: unknown): DraftPart {
 function finalizeParts(
 	drafts: readonly DraftPart[],
 	protectedTags: number,
+	pendingDropTagNumbers: ReadonlySet<number>,
 ): TailHygieneMeasurement {
 	const visibleTags = new Map<number, TagEntry>();
 	for (const part of drafts) {
@@ -440,8 +458,13 @@ function finalizeParts(
 			? protectedNumbers.has(draft.tag.tagNumber)
 			: false;
 		const tokens = Math.max(0, draft.tokens);
+		const queuedForDrop = draft.tag
+			? pendingDropTagNumbers.has(draft.tag.tagNumber)
+			: false;
 		const uTokens =
-			draft.tag && !protectedPart && draft.kind !== "excluded" ? tokens : 0;
+			draft.tag && !protectedPart && !queuedForDrop && draft.kind !== "excluded"
+				? tokens
+				: 0;
 		t += tokens;
 		u += uTokens;
 		return {
@@ -455,6 +478,7 @@ function finalizeParts(
 			// active for baseline/delta purposes regardless of the durable row's status.
 			tagStatus: draft.tag ? "active" : null,
 			protected: protectedPart,
+			queuedForDrop,
 		};
 	});
 	const clampedT = Math.max(0, t);
@@ -621,16 +645,21 @@ export function measurePiTailHygiene(
 			drafts.push(excludedDraft(`${key}\0excluded`, part));
 		}
 	}
-	return finalizeParts(drafts, input.protectedTags);
+	return finalizeParts(
+		drafts,
+		input.protectedTags,
+		input.pendingDropTagNumbers ?? new Set<number>(),
+	);
 }
 
 function sameMeasuredPrefix(
 	baseline: readonly TailHygienePartMeasurement[],
 	current: readonly TailHygienePartMeasurement[],
-): { valid: boolean; boundaryAdvanceU: number } {
+): { valid: boolean; boundaryAdvanceU: number; queuedDropDeltaU: number } {
 	if (current.length < baseline.length)
-		return { valid: false, boundaryAdvanceU: 0 };
+		return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
 	let boundaryAdvanceU = 0;
+	let queuedDropDeltaU = 0;
 	for (let index = 0; index < baseline.length; index += 1) {
 		const before = baseline[index];
 		const after = current[index];
@@ -642,19 +671,23 @@ function sameMeasuredPrefix(
 			before.tagNumber !== after.tagNumber ||
 			before.tagStatus !== after.tagStatus
 		) {
-			return { valid: false, boundaryAdvanceU: 0 };
+			return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
 		}
 		if (!before.protected && after.protected)
-			return { valid: false, boundaryAdvanceU: 0 };
+			return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
 		if (before.protected && !after.protected) {
 			if (after.tagStatus !== "active")
-				return { valid: false, boundaryAdvanceU: 0 };
-			boundaryAdvanceU += after.tokens;
+				return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
+			boundaryAdvanceU += after.uTokens;
+		} else if (before.queuedForDrop !== after.queuedForDrop) {
+			if (before.tagStatus !== "active" || after.tagStatus !== "active")
+				return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
+			queuedDropDeltaU += after.uTokens - before.uTokens;
 		} else if (before.uTokens !== after.uTokens) {
-			return { valid: false, boundaryAdvanceU: 0 };
+			return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
 		}
 	}
-	return { valid: true, boundaryAdvanceU };
+	return { valid: true, boundaryAdvanceU, queuedDropDeltaU };
 }
 
 export function refreshPiTailHygieneBaseline(
@@ -697,7 +730,9 @@ export function refreshPiTailHygieneBaseline(
 		};
 	}
 	let turnDeltaT = 0;
-	let turnDeltaU = prefix.boundaryAdvanceU;
+	// Queue membership is an action-state delta: it reduces the actionable token
+	// backlog while the frozen baseline and still-rendered token total remain unchanged.
+	let turnDeltaU = prefix.boundaryAdvanceU + prefix.queuedDropDeltaU;
 	for (
 		let index = input.previous.baselineParts.length;
 		index < measured.parts.length;

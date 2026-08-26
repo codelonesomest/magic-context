@@ -18,8 +18,8 @@ import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     clearPendingOps,
     closeDatabase,
+    getChannel1NudgeState,
     getHistorianFailureState,
-    getLastNudgeLevel,
     getLastNudgeUndropped,
     getOrCreateSessionMeta,
     getOverflowState,
@@ -32,7 +32,7 @@ import {
     openDatabase,
     queuePendingOp,
     recordOverflowDetected,
-    setLastNudgeLevel,
+    setChannel1NudgeState,
     setLastNudgeUndropped,
     updateSessionMeta,
     updateTagStatus,
@@ -1091,6 +1091,10 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-ops-");
         const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
         const scheduler: Scheduler = { shouldExecute };
+        const channel1StateBySession = new Map<
+            string,
+            import("./ctx-reduce-nudge").Channel1State
+        >();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -1106,6 +1110,7 @@ describe("createTransform", () => {
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTags: 0,
+            channel1StateBySession,
         });
 
         const firstPass: TestMessage[] = [
@@ -1160,6 +1165,7 @@ describe("createTransform", () => {
         expect(getTagById(db, "ses-1", 1)?.status).toBe("dropped");
         expect(getTagById(db, "ses-1", 2)?.status).toBe("dropped");
         expect(getTagById(db, "ses-1", 2)?.dropMode).toBe("full");
+        expect(channel1StateBySession.get("ses-1")?.agentDropsAppliedThisPass).toBe(true);
         expect(clearPendingOps(db, "ses-1")).toBeUndefined();
     });
 
@@ -1634,7 +1640,7 @@ describe("createTransform", () => {
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const db = openDatabase();
         setLastNudgeUndropped(db, sessionId, 80_000);
-        setLastNudgeLevel(db, sessionId, "urgent");
+        setChannel1NudgeState(db, sessionId, { level: "urgent", ordinal: 12 });
         const channel1StateBySession = new Map<
             string,
             import("./ctx-reduce-nudge").Channel1State
@@ -1670,7 +1676,12 @@ describe("createTransform", () => {
         );
 
         expect(getLastNudgeUndropped(db, sessionId)).toBe(0);
-        expect(getLastNudgeLevel(db, sessionId)).toBe("");
+        expect(getChannel1NudgeState(db, sessionId)).toEqual({ level: "", ordinal: 0 });
+        expect(
+            db
+                .prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ last_nudge_level: '{"level":"","ordinal":0}' });
     });
 
     it("Unit B: primary without callable ctx_reduce gets NO Channel 1 baseline (latent-gap fix)", async () => {

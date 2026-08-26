@@ -14,6 +14,7 @@ import type {
   LogEntry,
   Memory,
   MemoryStats,
+  ModelCatalogs,
   MuralManifest,
   Note,
   OpencodeInstallState,
@@ -370,6 +371,10 @@ export async function getDreamRunMemoryChanges(runId: number): Promise<DreamRunM
 
 // ── Log & Cache API ─────────────────────────────────────────
 
+export async function getLogPaths(): Promise<string[]> {
+  return invoke("get_log_paths");
+}
+
 export async function getLogEntries(maxLines?: number): Promise<LogEntry[]> {
   return invoke("get_log_entries", { maxLines: maxLines ?? 500 });
 }
@@ -424,12 +429,8 @@ export async function getOpencodeInstallState(): Promise<OpencodeInstallState> {
   return invoke("get_opencode_install_state");
 }
 
-export async function getAvailableModels(): Promise<string[]> {
-  return invoke("get_available_models");
-}
-
-export async function getAvailablePiModels(): Promise<string[]> {
-  return invoke("get_available_pi_models");
+export async function getModelCatalogs(): Promise<ModelCatalogs> {
+  return invoke("get_model_catalogs");
 }
 
 // ── User Memory API ─────────────────────────────────────────

@@ -116,15 +116,63 @@ pub(crate) struct MatchedBlockMetas<'a> {
 
 impl MatchedBlockMetas<'_> {
     pub(crate) fn remove_unretained_native_parts<T>(&self, parts: Vec<T>) -> Vec<T> {
-        parts
-            .into_iter()
-            .enumerate()
-            .filter_map(|(native_index, part)| {
-                let decoded_block_was_removed = self.decoded_native_indices.contains(&native_index)
-                    && !self.retained_native_indices.contains(&native_index);
-                (!decoded_block_was_removed).then_some(part)
-            })
-            .collect()
+        self.remove_unretained_native_parts_with_insertions(parts, Vec::new())
+    }
+
+    /// Remove decoded native parts whose CK blocks disappeared, then place unmatched replacement
+    /// parts at an explicit native index or beside the nearest matched CK neighbor. This preserves
+    /// persisted part order when fingerprints cannot prove identity after a sibling was removed.
+    pub(crate) fn remove_unretained_native_parts_with_insertions<T>(
+        &self,
+        parts: Vec<T>,
+        pending: Vec<(usize, Option<usize>, T)>,
+    ) -> Vec<T> {
+        let native_part_count = parts.len();
+        let mut insertions = BTreeMap::<usize, Vec<T>>::new();
+        for (block_index, preferred_native_index, part) in pending {
+            let next_native_index = self
+                .by_block
+                .iter()
+                .skip(block_index.saturating_add(1))
+                .flatten()
+                .find_map(|meta| meta.native_index);
+            let previous_native_index = self
+                .by_block
+                .iter()
+                .take(block_index)
+                .rev()
+                .flatten()
+                .find_map(|meta| meta.native_index);
+            let insertion_index = preferred_native_index
+                .or(next_native_index)
+                .or_else(|| previous_native_index.map(|index| index.saturating_add(1)))
+                .unwrap_or(parts.len())
+                .min(parts.len());
+            insertions.entry(insertion_index).or_default().push(part);
+        }
+
+        let mut retained = Vec::with_capacity(
+            parts
+                .len()
+                .saturating_add(insertions.values().map(Vec::len).sum::<usize>()),
+        );
+        for (native_index, part) in parts.into_iter().enumerate() {
+            if let Some(mut inserted) = insertions.remove(&native_index) {
+                retained.append(&mut inserted);
+            }
+            let decoded_block_was_removed = self.decoded_native_indices.contains(&native_index)
+                && !self.retained_native_indices.contains(&native_index);
+            if !decoded_block_was_removed {
+                retained.push(part);
+            }
+        }
+        if let Some(mut inserted) = insertions.remove(&native_part_count) {
+            retained.append(&mut inserted);
+        }
+        for (_, mut inserted) in insertions {
+            retained.append(&mut inserted);
+        }
+        retained
     }
 }
 
@@ -229,15 +277,41 @@ fn alignment_candidate(
 pub(crate) fn match_block_metas<'a>(
     blocks: &[CkWireBlock],
     metas: &'a [BlockMeta],
+    allow_unstamped_positional_alignment: bool,
     mut matches: impl FnMut(&CkWireBlock, &BlockMeta) -> bool,
 ) -> MatchedBlockMetas<'a> {
+    let mut kind_matches = vec![vec![false; metas.len()]; blocks.len()];
     let mut candidates = vec![vec![None; metas.len()]; blocks.len()];
     for (block_index, block) in blocks.iter().enumerate() {
         for (meta_index, meta) in metas.iter().enumerate() {
-            let kind_matches = matches(block, meta);
+            let kind_matches_meta = matches(block, meta);
+            kind_matches[block_index][meta_index] = kind_matches_meta;
             candidates[block_index][meta_index] =
-                alignment_candidate(block, block_index, meta, kind_matches);
+                alignment_candidate(block, block_index, meta, kind_matches_meta);
         }
+    }
+
+    // The TypeScript adapter and the native decoder independently project the same persisted
+    // OpenCode parts. Adapter blocks do not carry the decoder's private origin stamp, but when
+    // the complete kind vector and every native block index agree, position is the stable origin
+    // identity. This lets an in-place tag edit update its original text part instead of appending
+    // after a later tool part. Any insertion or deletion breaks the whole-vector check and falls
+    // through to stamped/fingerprint alignment, preserving deletion-compaction safety.
+    let adapter_projection_matches = allow_unstamped_positional_alignment
+        && blocks.len() == metas.len()
+        && blocks
+            .iter()
+            .all(|block| stamped_block_identity(block).is_none())
+        && metas
+            .iter()
+            .enumerate()
+            .all(|(index, meta)| meta.block_index == index && kind_matches[index][index]);
+    if adapter_projection_matches {
+        return MatchedBlockMetas {
+            by_block: metas.iter().map(Some).collect(),
+            retained_native_indices: metas.iter().filter_map(|meta| meta.native_index).collect(),
+            decoded_native_indices: metas.iter().filter_map(|meta| meta.native_index).collect(),
+        };
     }
 
     // Origin indexes are stamped onto decoded blocks and survive reductions, overlays, and

@@ -13,10 +13,10 @@ import {
     clearEmergencyDropSample,
     clearEmergencyRecovery,
     clearHistorianFailureState,
-    getLastNudgeLevel,
+    getChannel1NudgeState,
     getLastNudgeUndropped,
     resetLastNudgeCycle,
-    setLastNudgeLevel,
+    setChannel1NudgeState,
     setLastNudgeUndropped,
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
@@ -33,8 +33,10 @@ import {
     CHANNEL1_SENTINEL,
     type Channel1State,
     decideChannel1,
+    shouldUseStickyChannel1Reminder,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
+import { annotateEmptyTaskOutput } from "./empty-task-output";
 import {
     getMessageUpdatedAssistantInfo,
     getMessageUpdatedInfo,
@@ -477,30 +479,48 @@ function maybeInjectChannel1Nudge(
     // inside the recency reserve, so it grows T but not U.
     state.turnDeltaT += toolOutputTokens(out.output);
 
-    if (state.reducedSinceRefresh) return;
+    if (state.reducedSinceRefresh || state.agentDropsAppliedThisPass) return;
 
+    const nudgeState = getChannel1NudgeState(args.db, sessionId);
     const decision = decideChannel1({
         baselineU: state.baselineU,
         baselineT: state.baselineT,
         turnDeltaU: state.turnDeltaU,
         turnDeltaT: state.turnDeltaT,
         lastNudgeUndropped: getLastNudgeUndropped(args.db, sessionId),
-        lastNudgeLevel: getLastNudgeLevel(args.db, sessionId),
+        lastNudgeLevel: nudgeState.level,
         hasRecentReduce: false,
         evaluable: state.evaluable,
         generationInvalidated: state.generationInvalidated,
     });
 
-    // Always persist the cadence + band state so a reduce-driven drop re-arms it.
+    // Store the cadence level and dampening ordinal together so one persisted state stays in sync.
     setLastNudgeUndropped(args.db, sessionId, decision.nextLastNudge);
-    setLastNudgeLevel(args.db, sessionId, decision.nextLastNudgeLevel);
-    if (!decision.fire) return;
+    if (!decision.fire) {
+        setChannel1NudgeState(args.db, sessionId, {
+            ...nudgeState,
+            level: decision.nextLastNudgeLevel,
+        });
+        return;
+    }
 
+    const sticky = shouldUseStickyChannel1Reminder({
+        lastLevel: nudgeState.level,
+        lastOrdinal: nudgeState.ordinal,
+        level: decision.level,
+        currentRealUserTurnCount: state.realUserTurnCount,
+    });
     out.output += buildChannel1Reminder(
         decision.level,
         decision.undroppedTokens,
+        state.usableWindow,
         state.oldestReclaimableToolTags,
+        sticky,
     );
+    setChannel1NudgeState(args.db, sessionId, {
+        level: decision.level,
+        ordinal: state.realUserTurnCount,
+    });
     sessionLog(
         sessionId,
         `channel1 nudge fired: level=${decision.level} undropped~${Math.round(decision.undroppedTokens / 1000)}k tool=${tool}`,
@@ -533,6 +553,10 @@ export function createToolExecuteAfterHook(args: {
         // boundary. The queue helper re-checks the read-only mid-turn signal,
         // so this is a no-op until the assistant is actually idle.
         await flushIgnoredMessages(typedInput.sessionID);
+
+        // Surface a completed native task that returned no final text so the
+        // caller can distinguish an empty result from a genuinely-empty tool.
+        annotateEmptyTaskOutput(typedInput.tool, output);
 
         if (typedInput.tool === "ctx_reduce") {
             // Mark the Channel 1 baseline dirty so the next nudge re-measures the

@@ -17,6 +17,8 @@ import { initializeDatabase } from "../storage-db";
 import { acquireLease } from "./lease";
 import {
     applyBatchMappings,
+    computeMapBatchSliceMs,
+    MAP_BATCH_FLOOR_MS,
     type MapMemoriesArgs,
     mapMemories,
     selectMapMemoryInputs,
@@ -52,7 +54,9 @@ function mapArgs(db: Database, sessionDirectory: string, projectIdentity: string
         sessionDirectory,
         holderId,
         leaseKey,
-        deadline: Date.now() + 60_000,
+        // Every direct mapping test that reaches the loop needs enough budget to
+        // clear the production floor; deadline-stop fixtures override this value.
+        deadline: Date.now() + MAP_BATCH_FLOOR_MS + 60_000,
     };
 }
 
@@ -74,9 +78,11 @@ function assistantMessages(text: string) {
 function scriptedMapClient(manifestFor: (promptCall: number, ids: number[]) => string): {
     client: unknown;
     promptCalls: () => number;
+    promptIds: () => number[][];
 } {
     let promptCalls = 0;
     let lastIds: number[] = [];
+    const promptedIds: number[][] = [];
     return {
         client: {
             session: {
@@ -85,6 +91,7 @@ function scriptedMapClient(manifestFor: (promptCall: number, ids: number[]) => s
                     promptCalls += 1;
                     const prompt = args.body?.parts?.[0]?.text ?? "";
                     lastIds = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
+                    promptedIds.push(lastIds);
                     return {};
                 },
                 messages: async () => ({
@@ -94,6 +101,7 @@ function scriptedMapClient(manifestFor: (promptCall: number, ids: number[]) => s
             },
         },
         promptCalls: () => promptCalls,
+        promptIds: () => promptedIds,
     };
 }
 
@@ -110,6 +118,21 @@ function successfulMapClient(onPrompt?: () => void) {
                 return {};
             },
             messages: async () => ({ data: assistantMessages(manifest) }),
+            delete: async () => ({}),
+        },
+    };
+}
+
+/** The exact timeout-class error from the shared prompt helper. */
+function timeoutMapClient(onPrompt?: () => void) {
+    return {
+        session: {
+            create: async () => ({ data: { id: "map-child" } }),
+            prompt: async () => {
+                onPrompt?.();
+                throw new Error("prompt timed out after 99997ms");
+            },
+            messages: async () => ({ data: [] }),
             delete: async () => ({}),
         },
     };
@@ -142,6 +165,290 @@ describe("mapMemories disposition", () => {
                 batches: 1,
                 remaining: 1,
                 complete: false,
+                stopReason: "deadline",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("floors a 12-batch default-deadline backfill and banks its first completed batch", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-floor-primary";
+            const dir = tempProject();
+            // 881 memories produce 12 batches. The old even split assigned only
+            // 100 seconds (1,200,000 / 12) to each batch, below the agentic floor.
+            const defaultDeadlineMs = 20 * 60 * 1000;
+            expect(Math.floor(defaultDeadlineMs / 12)).toBe(100_000);
+            expect(computeMapBatchSliceMs(defaultDeadlineMs, 12)).toBe(MAP_BATCH_FLOOR_MS);
+            for (let index = 0; index < 881; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Large-backlog mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            args.deadline = Date.now() + defaultDeadlineMs;
+            let promptCalls = 0;
+            args.client = successfulMapClient(() => {
+                promptCalls += 1;
+                // One full floor-sized batch completed; no fair slice remains for
+                // batch two, so its untouched inputs must stay banked for resume.
+                args.deadline = Date.now() + 60_000;
+            }) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(1);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 80,
+                batches: 1,
+                remaining: 801,
+                complete: false,
+                stopReason: "deadline",
+            });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(801);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("stops before the next batch when the remaining deadline cannot fit the floor", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-floor-stop";
+            const dir = tempProject();
+            for (let index = 0; index < 81; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Floor-boundary mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            let promptCalls = 0;
+            args.client = successfulMapClient(() => {
+                promptCalls += 1;
+                args.deadline = Date.now() + 60_000;
+            }) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(1);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 80,
+                batches: 1,
+                remaining: 1,
+                complete: false,
+                stopReason: "deadline",
+            });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("two consecutive batch timeouts trip the starvation circuit breaker", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-timeout-breaker";
+            const dir = tempProject();
+            // Three batches prove the third is left unattempted by the two-timeout breaker.
+            for (let index = 0; index < 241; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Timeout mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            let promptCalls = 0;
+            args.client = timeoutMapClient(() => {
+                promptCalls += 1;
+            }) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(2);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 0,
+                batches: 0,
+                remaining: 241,
+                complete: false,
+                stopReason: "timeout-circuit-breaker",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a later run resumes the durable remainder after a floored partial run", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-floor-resume";
+            const dir = tempProject();
+            for (let index = 0; index < 161; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Resumable mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            args.client = successfulMapClient(() => {
+                args.deadline = Date.now() + 60_000;
+            }) as never;
+
+            const first = await mapMemories(args);
+            expect(first).toMatchObject({ independent: 80, batches: 1, remaining: 81 });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(81);
+
+            args.deadline = Date.now() + 2 * MAP_BATCH_FLOOR_MS;
+            args.client = successfulMapClient() as never;
+            const second = await mapMemories(args);
+
+            expect(second).toEqual({
+                mapped: 0,
+                independent: 81,
+                batches: 2,
+                remaining: 0,
+                complete: true,
+            });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("commits a 79/80 closed subset and retries only its omitted id", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-omission-retry";
+            const dir = tempProject();
+            const memoryIds: number[] = [];
+            for (let index = 0; index < 80; index += 1) {
+                memoryIds.push(
+                    insertMemory(db, {
+                        projectPath: projectIdentity,
+                        category: "ARCHITECTURE",
+                        content: `Mapping omission fact ${index}.`,
+                        sourceSessionId: "ses",
+                    }).id,
+                );
+            }
+            const progress: number[] = [];
+            const args = mapArgs(db, dir, projectIdentity);
+            const scripted = scriptedMapClient((call, ids) => {
+                if (call === 2) {
+                    // The closing root makes the first response complete rather than
+                    // truncated, so its returned mappings can commit immediately. Only
+                    // its one absent id is present in the retry prompt.
+                    expect(ids).toHaveLength(1);
+                    expect(getMemoryVerifications(db, memoryIds).size).toBe(79);
+                    expect(getMemoryVerifications(db, ids).has(ids[0] as number)).toBe(false);
+                }
+                const returnedIds = call === 1 ? ids.slice(0, -1) : ids;
+                return `<mappings>${returnedIds.map((id) => `<memory id="${id}" independent="true"/>`).join("")}</mappings>`;
+            });
+            args.client = scripted.client as never;
+            args.onProgress = (processed) => progress.push(processed);
+
+            const result = await mapMemories(args);
+
+            expect(scripted.promptCalls()).toBe(2);
+            const promptIds = scripted.promptIds();
+            const initialPrompt = promptIds[0];
+            const retryPrompt = promptIds[1];
+            if (!initialPrompt || !retryPrompt) throw new Error("missing prompt fixture");
+            expect(initialPrompt).toHaveLength(80);
+            expect([...initialPrompt].sort((a, b) => a - b)).toEqual(
+                [...memoryIds].sort((a, b) => a - b),
+            );
+            expect(retryPrompt).toEqual([initialPrompt[initialPrompt.length - 1]]);
+            expect(progress).toEqual([79, 80]);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 80,
+                batches: 2,
+                remaining: 0,
+                complete: true,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("leaves an id omitted again by its targeted retry for the next run", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-omission-resume";
+            const dir = tempProject();
+            const first = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "First resumable fact.",
+                sourceSessionId: "ses",
+            });
+            const second = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Second resumable fact.",
+                sourceSessionId: "ses",
+            });
+            const firstRun = mapArgs(db, dir, projectIdentity);
+            const partial = scriptedMapClient((call) =>
+                call === 1
+                    ? `<mappings><memory id="${first.id}" independent="true"/></mappings>`
+                    : "<mappings></mappings>",
+            );
+            firstRun.client = partial.client as never;
+
+            const firstResult = await mapMemories(firstRun);
+
+            const [initialPrompt, retryPrompt] = partial.promptIds();
+            if (!initialPrompt || !retryPrompt) throw new Error("missing prompt fixture");
+            expect(initialPrompt).toHaveLength(2);
+            expect([...initialPrompt].sort((a, b) => a - b)).toEqual([first.id, second.id]);
+            // Mapping prioritizes by the memory query's recency ordering. The retry
+            // contract is that the unreturned id, rather than a fixed prompt position,
+            // is the one left for the next run.
+            expect(retryPrompt).toEqual([second.id]);
+            expect(firstResult).toEqual({
+                mapped: 0,
+                independent: 1,
+                batches: 1,
+                remaining: 1,
+                complete: false,
+            });
+            expect(
+                selectMapMemoryInputs(db, projectIdentity, dir).map((memory) => memory.id),
+            ).toEqual([second.id]);
+
+            const resumed = mapArgs(db, dir, projectIdentity);
+            const complete = scriptedMapClient(
+                (_call, ids) =>
+                    `<mappings>${ids.map((id) => `<memory id="${id}" independent="true"/>`).join("")}</mappings>`,
+            );
+            resumed.client = complete.client as never;
+
+            const resumedResult = await mapMemories(resumed);
+
+            expect(complete.promptIds()).toEqual([[second.id]]);
+            expect(resumedResult).toEqual({
+                mapped: 0,
+                independent: 1,
+                batches: 1,
+                remaining: 0,
+                complete: true,
             });
         } finally {
             closeQuietly(db);
@@ -238,7 +545,7 @@ describe("mapMemories retry-time validation", () => {
         }
     });
 
-    test("coverage mismatch fires the fallback model", async () => {
+    test("an unclosed subset rejects the full batch before the fallback retry", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:map-retry-coverage";
@@ -249,7 +556,7 @@ describe("mapMemories retry-time validation", () => {
                 content: "First fact.",
                 sourceSessionId: "ses",
             });
-            insertMemory(db, {
+            const second = insertMemory(db, {
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Second fact.",
@@ -258,7 +565,7 @@ describe("mapMemories retry-time validation", () => {
             const args = mapArgs(db, dir, projectIdentity);
             const scripted = scriptedMapClient((call, ids) =>
                 call === 1
-                    ? `<mappings><memory id="${first.id}" independent="true"/></mappings>`
+                    ? `<mappings><memory id="${first.id}" independent="true"/>`
                     : `<mappings>${ids.map((id) => `<memory id="${id}" independent="true"/>`).join("")}</mappings>`,
             );
             args.client = scripted.client as never;
@@ -266,6 +573,11 @@ describe("mapMemories retry-time validation", () => {
 
             const result = await mapMemories(args);
             expect(scripted.promptCalls()).toBe(2);
+            const promptIds = scripted.promptIds();
+            expect(promptIds[0]).toEqual(promptIds[1]);
+            expect([...new Set(promptIds[0])].sort((a, b) => a - b)).toEqual(
+                [first.id, second.id].sort((a, b) => a - b),
+            );
             expect(result.independent).toBe(2);
             expect(result.complete).toBe(true);
         } finally {
@@ -346,43 +658,91 @@ describe("applyBatchMappings", () => {
         }
     });
 
-    test("apply-time coverage belt still rejects missing and extra ids", async () => {
+    test("drops unknown ids and commits the valid remainder", async () => {
         const db = freshDb();
         try {
-            const projectIdentity = "git:test-belt";
+            const projectIdentity = "git:test-unknown";
             const dir = tempProject();
-            const memory = insertMemory(db, {
+            const mapped = insertMemory(db, {
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
-                content: "Fact lives in src/fact.ts.",
+                content: "Mapped fact.",
                 sourceSessionId: "ses",
             });
-            const extra = insertMemory(db, {
+            const omitted = insertMemory(db, {
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
-                content: "Another fact.",
+                content: "Omitted fact.",
                 sourceSessionId: "ses",
             });
-            const batch = [
-                {
-                    id: memory.id,
-                    category: memory.category,
-                    content: memory.content,
-                    candidates: [] as string[],
-                },
-            ];
-            const args = mapArgs(db, dir, projectIdentity);
+            const unknown = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Wrong-batch fact.",
+                sourceSessionId: "ses",
+            });
+            const batch = [mapped, omitted].map((memory) => ({
+                id: memory.id,
+                category: memory.category,
+                content: memory.content,
+                candidates: [] as string[],
+            }));
+
+            const result = await applyBatchMappings(
+                mapArgs(db, dir, projectIdentity),
+                batch,
+                `<mappings><memory id="${mapped.id}" independent="true"/><memory id="${unknown.id}" independent="true"/></mappings>`,
+            );
+
+            expect(result).toEqual({ mapped: 0, independent: 1 });
+            const states = getMemoryVerifications(db, [mapped.id, omitted.id, unknown.id]);
+            expect(states.has(mapped.id)).toBe(true);
+            expect(states.has(omitted.id)).toBe(false);
+            expect(states.has(unknown.id)).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rejects a manifest covering less than half of the batch", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test-mostly-wrong";
+            const dir = tempProject();
+            const batchMemories = ["First", "Second", "Third"].map((content) =>
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content,
+                    sourceSessionId: "ses",
+                }),
+            );
+            const unknown = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Wrong-batch fact.",
+                sourceSessionId: "ses",
+            });
+            const batch = batchMemories.map((memory) => ({
+                id: memory.id,
+                category: memory.category,
+                content: memory.content,
+                candidates: [] as string[],
+            }));
 
             await expect(
                 applyBatchMappings(
-                    args,
+                    mapArgs(db, dir, projectIdentity),
                     batch,
-                    `<mappings><memory id="${memory.id}" files="src/fact.ts"/><memory id="${extra.id}" independent="true"/></mappings>`,
+                    `<mappings><memory id="${batchMemories[0]?.id}" independent="true"/><memory id="${unknown.id}" independent="true"/></mappings>`,
                 ),
-            ).rejects.toThrow(/unknown id/);
-            await expect(applyBatchMappings(args, batch, `<mappings></mappings>`)).rejects.toThrow(
-                /missing id|parsed zero entries/,
-            );
+            ).rejects.toThrow(/mostly-wrong manifest/);
+            expect(
+                getMemoryVerifications(
+                    db,
+                    batch.map((memory) => memory.id),
+                ).size,
+            ).toBe(0);
         } finally {
             closeQuietly(db);
         }

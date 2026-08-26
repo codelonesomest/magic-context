@@ -23,7 +23,7 @@ Add the schema line for editor validation and autocomplete:
 ```
 
 :::note
-Project-level configs cannot use `{env:VAR}` / `{file:path}` expansion. A cloned repository also cannot set `output_reserve`, `sqlite.*`, `storage.enforce_private_permissions`, hidden-agent prompts/permissions, `historian.model`, or `historian.fallback_models`. Project `execute_threshold_percentage` / `execute_threshold_tokens` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and `memory.enabled` remain allowed project overrides.
+Project-level configs cannot use `{env:VAR}` / `{file:path}` expansion. A cloned repository also cannot set `output_reserve`, `sqlite.*`, `storage.enforce_private_permissions`, hidden-agent prompts/permissions, `historian.model`, or `historian.fallback_models`. Profile definitions in `profiles` are user-level only; a project may set only `profile` to choose a named user profile. Project `execute_threshold_percentage` / `execute_threshold_tokens` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and `memory.enabled` remain allowed project overrides.
 :::
 
 ## Top-level switches
@@ -62,7 +62,7 @@ When and how aggressively Magic Context manages the session's context window. Pe
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `cache_ttl` | string \\| map<string, string> | `"5m"` | Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. |
+| `cache_ttl` | string \\| map<string, string> | `"5m"` | How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body). |
 | `output_reserve` | number (0–) \\| map<string, number (0–)> | — | User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. Takes precedence over every derived source: an explicit value here always wins against catalog output limits, provider window-geometry facts, and the 25%-of-context fallback (usable window = context window minus this reserve). When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged. |
 | `execute_threshold_percentage` | number (20–90) \\| map<string, number (20–90)> | `65` | Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, "provider/model": 45 }). Values above 90 are rejected because the runtime caps at 90% of the output-reserved safe window (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE |
 | `execute_threshold_tokens` | object | — | Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000. |
@@ -71,14 +71,22 @@ When and how aggressively Magic Context manages the session's context window. Pe
 | `clear_reasoning_age` | number (10–) | `50` | Clear reasoning/thinking blocks older than N tags (default: 50) |
 | `history_budget_percentage` | number (0.05–0.5) | `0.15` | Fraction of usable context (context_limit × execute_threshold) reserved for the session history block (default: 0.15) |
 
+## Model profiles
+
+Named user-owned model-selection overlays. A project may select a profile name but cannot define or alter profile contents.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `profile` | string | — | Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration. |
+| `profiles` | map<string, object> | — | User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi thinking_level fields plus sidekick model-selection fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles. |
+
 ## Historian
 
 The background agent that condenses old conversation into compact history.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `historian` | object | — | Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.) |
-| `historian.model` | string | — | Primary model ID (e.g. 'claude-sonnet-4-6') |
+| `historian` | object | — | Historian metadata plus independent strict OpenCode and Pi execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode or historian.pi. |
 | `historian.temperature` | number (0–2) | — | Sampling temperature (0-2) |
 | `historian.top_p` | number (0–1) | — | Nucleus sampling top_p (0-1) |
 | `historian.prompt` | string | — | Additional system prompt text |
@@ -95,12 +103,17 @@ The background agent that condenses old conversation into compact history.
 | `historian.permission.doom_loop` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
 | `historian.permission.external_directory` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
 | `historian.maxTokens` | number | — | Maximum output tokens |
-| `historian.variant` | string | — | OpenCode reasoning variant (e.g. for extended thinking) |
-| `historian.fallback_models` | string \\| string[] | — | Fallback model IDs if primary is unavailable |
+| `historian.opencode` | object | — | Strict OpenCode model-resolution block. It accepts no Pi vocabulary. |
+| `historian.opencode.model` | string \\| object | — | Primary OpenCode model entry. |
+| `historian.opencode.fallback_models` | string \\| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.opencode.variant` | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
+| `historian.pi` | object | — | Strict Pi model-resolution block. It accepts no OpenCode vocabulary. |
+| `historian.pi.model` | string \\| object | — | Primary Pi model entry. |
+| `historian.pi.fallback_models` | string \\| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.two_pass` | boolean | `false` | Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false) |
-| `historian.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off \| minimal \| low \| medium \| high \| xhigh \| max |
 | `historian.disallowed_tools` | `"*"` \\| `"read"` \\| `"aft_outline"` \\| `"aft_zoom"` \\| `"aft_search"`[] | `[]` | OpenCode only. Tools to REMOVE from the historian's default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: []) |
-| `historian_timeout_ms` | number (60000–) | `300000` | Timeout for each historian prompt call in milliseconds (default: 300000) |
+| `historian_timeout_ms` | number (60000–) | `600000` | Timeout for each historian prompt call in milliseconds (default: 600000) |
 | `commit_cluster_trigger` | object | — | Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail |
 | `commit_cluster_trigger.enabled` | boolean | `true` | Enable commit-cluster based historian triggering (default: true) |
 | `commit_cluster_trigger.min_clusters` | number (1–) | `3` | Minimum commit clusters required to trigger historian (min: 1, default: 3) |
@@ -142,8 +155,7 @@ Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `dreamer` | object | — | Dreamer agent + scheduling configuration (model, fallback_models, disable, schedule, tasks, etc.) |
-| `dreamer.model` | string | — | Primary model ID (e.g. 'claude-sonnet-4-6') |
+| `dreamer` | object | — | Dreamer metadata and scheduling plus independent strict OpenCode and Pi execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block. |
 | `dreamer.temperature` | number (0–2) | — | Sampling temperature (0-2) |
 | `dreamer.top_p` | number (0–1) | — | Nucleus sampling top_p (0-1) |
 | `dreamer.prompt` | string | — | Additional system prompt text |
@@ -160,73 +172,32 @@ Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
 | `dreamer.permission.doom_loop` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
 | `dreamer.permission.external_directory` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
 | `dreamer.maxTokens` | number | — | Maximum output tokens |
-| `dreamer.variant` | string | — | OpenCode reasoning variant (e.g. for extended thinking) |
-| `dreamer.fallback_models` | string \\| string[] | — | Fallback model IDs if primary is unavailable |
-| `dreamer.tasks` | object | — | Per-task scheduling + model config. Each task has its own cron schedule and may override the dreamer-level model. |
+| `dreamer.opencode` | object | — | Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary. |
+| `dreamer.opencode.model` | string \\| object | — | Primary OpenCode model entry. |
+| `dreamer.opencode.fallback_models` | string \\| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `dreamer.opencode.variant` | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
+| `dreamer.opencode.tasks` | map<string, object> | — | OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes. |
+| `dreamer.pi` | object | — | Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary. |
+| `dreamer.pi.model` | string \\| object | — | Primary Pi model entry. |
+| `dreamer.pi.fallback_models` | string \\| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `dreamer.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
+| `dreamer.pi.tasks` | map<string, object> | — | Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes. |
+| `dreamer.tasks` | object | — | Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks or dreamer.pi.tasks. |
 | `dreamer.tasks.map-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.map-memories.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.map-memories.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.map-memories.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.map-memories.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.verify.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.verify.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.verify.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.verify.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.verify.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.verify-broad.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.verify-broad.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.verify-broad.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.verify-broad.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.verify-broad.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.curate.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.curate.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.curate.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.curate.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.curate.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.compress-cues.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.compress-cues.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.compress-cues.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.compress-cues.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.compress-cues.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.classify-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.classify-memories.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.classify-memories.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.classify-memories.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.classify-memories.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.retrospective.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.retrospective.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.retrospective.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.retrospective.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.retrospective.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.maintain-docs.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.maintain-docs.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.maintain-docs.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.maintain-docs.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.maintain-docs.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.evaluate-smart-notes.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.evaluate-smart-notes.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.evaluate-smart-notes.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.evaluate-smart-notes.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.evaluate-smart-notes.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.review-user-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.review-user-memories.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.review-user-memories.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.review-user-memories.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.review-user-memories.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.review-user-memories.promotion_threshold` | number (2–20) | — | review-user-memories: min candidate observations before promotion is considered (default: 3) |
 | `dreamer.tasks.promote-primers.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.promote-primers.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.promote-primers.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.promote-primers.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.promote-primers.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.promote-primers.promotion_threshold` | number (2–20) | — | promote-primers: min recurring source days before promotion is considered (default: 2) |
 | `dreamer.tasks.refresh-primers.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.refresh-primers.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.refresh-primers.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.refresh-primers.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.refresh-primers.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true) |
-| `dreamer.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level. |
 | `sidekick` | object | — | Optional sidekick agent configuration for session-start memory retrieval |
 | `sidekick.model` | string | — | Primary model ID (e.g. 'claude-sonnet-4-6') |
 | `sidekick.temperature` | number (0–2) | — | Sampling temperature (0-2) |
@@ -249,7 +220,7 @@ Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
 | `sidekick.fallback_models` | string \\| string[] | — | Fallback model IDs if primary is unavailable |
 | `sidekick.timeout_ms` | number | `30000` | Timeout for sidekick calls in milliseconds |
 | `sidekick.system_prompt` | string | — | Custom system prompt for sidekick |
-| `sidekick.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: explicit thinking level for sidekick subagent invocations. See historian.thinking_level. |
+| `sidekick.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: explicit thinking level for sidekick subagent invocations. See historian.pi.thinking_level. |
 
 ## Advanced
 

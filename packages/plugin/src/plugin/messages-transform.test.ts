@@ -357,6 +357,89 @@ describe("createMessagesTransformHandler — issue #327 wire tail", () => {
         expect(output.messages.at(-1)?.info.id).toBe("m1");
         expect(output.messages[0].parts).toEqual([{ type: "text", text: "" }]);
     });
+
+    it("re-anchors a persisted error-only assistant shell without deleting it", async () => {
+        let called = false;
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async () => {
+                    called = true;
+                },
+            },
+        });
+        const output = makeOutput();
+        output.messages.push({
+            info: {
+                id: "assistant-error-shell",
+                role: "assistant",
+                sessionID: "ses_test",
+                error: { name: "APIError" },
+            },
+            parts: [{ type: "text", text: " \n\t" }],
+        });
+
+        await handler({}, output);
+
+        expect(called).toBe(true);
+        expect(output.messages.map((message: any) => message.info.id)).toEqual([
+            "assistant-error-shell",
+            "m1",
+        ]);
+    });
+
+    it("rejects a completed assistant-terminal retry instead of reordering its prompt", async () => {
+        let called = false;
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async () => {
+                    called = true;
+                },
+            },
+        });
+        const output = makeOutput();
+        output.messages.push({
+            info: { id: "assistant-completed", role: "assistant", sessionID: "ses_test" },
+            parts: [
+                { type: "reasoning", text: "completed thought", signature: "sig" },
+                {
+                    type: "tool",
+                    tool: "bash",
+                    state: { status: "completed", input: {}, output: "done" },
+                },
+            ],
+        });
+
+        // Mid-turn continuation shape: the streaming assistant (with completed
+        // tool parts) legitimately terminates the array. The wrapper must pass it
+        // through untouched and still run the inner transform.
+        await handler({}, output);
+        expect(called).toBe(true);
+        expect(output.messages.at(-1)?.info.id).toBe("assistant-completed");
+    });
+
+    it("rejects real content appended after the input user during an asynchronous pass", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    await Promise.resolve();
+                    (out.messages as any).push({
+                        info: {
+                            id: "assistant-completed-late",
+                            role: "assistant",
+                            sessionID: "ses_test",
+                        },
+                        parts: [{ type: "text", text: "completed answer" }],
+                    });
+                },
+            },
+        });
+
+        const output = makeOutput();
+        await handler({}, output);
+        // Completed content appended mid-transform stays exactly where OpenCode
+        // put it — never reordered below its prompt, never refused.
+        expect(output.messages.at(-1)?.info.id).toBe("assistant-completed-late");
+    });
 });
 
 describe("createMessagesTransformHandler — user-tail removal defense", () => {

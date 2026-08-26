@@ -84,6 +84,7 @@ fn main() {
             commands::get_dream_runs,
             commands::get_dream_run_memory_changes,
             // Logs & Cache
+            commands::get_log_paths,
             commands::get_log_entries,
             commands::get_cache_events,
             commands::get_session_cache_stats,
@@ -99,8 +100,7 @@ fn main() {
             magic_context_dashboard_lib::config::pi_config_path,
             // Models
             commands::get_opencode_install_state,
-            commands::get_available_models,
-            commands::get_available_pi_models,
+            commands::get_model_catalogs,
             commands::test_embedding_endpoint,
             // User Memories
             commands::get_user_memories,
