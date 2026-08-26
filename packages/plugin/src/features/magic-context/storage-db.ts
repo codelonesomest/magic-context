@@ -415,14 +415,8 @@ function classifyDiscoveryRecordKind(record: {
         ) {
             return "OpenCode instance (TUI/CLI)";
         }
-        if (
-            normalized === "pi" ||
-            normalized === "pi harness" ||
-            normalized === "omp" ||
-            normalized === "oh-my-pi"
-        ) {
-            return "Pi";
-        }
+        if (normalized === "pi" || normalized === "pi harness") return "Pi";
+        if (normalized === "omp" || normalized === "oh-my-pi") return "OMP";
     }
     return null;
 }
@@ -593,9 +587,11 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
 }
 
 function createPiBlockingProcess(pid: number): FailClosedBlockingProcess {
+    const evidence = readProcessProbeEvidence(pid);
+    const detectedKind = classifyProcessKind(evidence.commandLine);
     return attachFailClosedBlockingProcessEvidence(
-        { kind: "Pi", pid },
-        readProcessProbeEvidence(pid),
+        { kind: detectedKind === "process" ? "Pi" : detectedKind, pid },
+        evidence,
     );
 }
 

@@ -70,6 +70,11 @@ describe("classifyProcessKind", () => {
                 "bun /workspace/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
             ),
         ).toBe("Pi");
+        expect(
+            classifyProcessKind(
+                "omp --extension /Users/davis/.omp/agent/extensions/orca-agent-status.ts -r",
+            ),
+        ).toBe("OMP");
         expect(classifyProcessKind("/usr/bin/other --flag")).toBe("process");
         expect(classifyProcessKind(null)).toBe("process");
     });

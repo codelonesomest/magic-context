@@ -3,7 +3,12 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type ProcessKind = "OpenCode server" | "OpenCode instance (TUI/CLI)" | "Pi" | "process";
+export type ProcessKind =
+    | "OpenCode server"
+    | "OpenCode instance (TUI/CLI)"
+    | "Pi"
+    | "OMP"
+    | "process";
 
 /** Best-effort process details captured while validating a migration blocker. */
 export interface ProcessProbeEvidence {
@@ -292,21 +297,26 @@ function commandHasOpenCodeExecutable(tokens: readonly string[]): number {
     });
 }
 
-function commandHasPiExecutable(tokens: readonly string[]): boolean {
+function commandPiFamilyKind(tokens: readonly string[]): "Pi" | "OMP" | null {
     for (let index = 0; index < tokens.length; index += 1) {
         const executable = executableName(tokens[index]).replace(/\.(?:exe|cmd)$/, "");
-        if (["pi", "omp", "oh-my-pi"].includes(executable)) return true;
+        if (["omp", "oh-my-pi"].includes(executable)) return "OMP";
+        if (executable === "pi") return "Pi";
         if (["node", "bun", "deno"].includes(executable)) {
-            const script = executableName(tokens[index + 1]).replace(/\.(?:exe|cmd)$/, "");
+            const scriptToken = tokens[index + 1] ?? "";
+            const script = executableName(scriptToken).replace(/\.(?:exe|cmd)$/, "");
+            if (scriptToken.includes("@oh-my-pi/") || scriptToken.includes("oh-my-pi")) {
+                return "OMP";
+            }
             if (
                 ["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script) ||
-                tokens[index + 1]?.includes("pi-coding-agent")
+                scriptToken.includes("pi-coding-agent")
             ) {
-                return true;
+                return "Pi";
             }
         }
     }
-    return false;
+    return null;
 }
 
 /** Classify a process command without changing the liveness decision. */
@@ -325,7 +335,7 @@ export function classifyProcessKind(command: string | null | undefined): Process
         }
         return "OpenCode instance (TUI/CLI)";
     }
-    return commandHasPiExecutable(tokens) ? "Pi" : "process";
+    return commandPiFamilyKind(tokens) ?? "process";
 }
 
 function commandLooksLikeOpenCode(command: string): boolean {

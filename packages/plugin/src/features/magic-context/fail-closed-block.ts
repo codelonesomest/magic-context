@@ -108,6 +108,7 @@ function normalizeFailClosedProcessKind(process: FailClosedBlockingProcess): Fai
         case "OpenCode server":
         case "OpenCode instance (TUI/CLI)":
         case "Pi":
+        case "OMP":
         case "process":
             return process.kind;
     }
@@ -119,8 +120,10 @@ function normalizeFailClosedProcessKind(process: FailClosedBlockingProcess): Fai
             return "OpenCode instance (TUI/CLI)";
         case "pi":
         case "pi harness":
-        case "omp":
             return "Pi";
+        case "omp":
+        case "oh-my-pi":
+            return "OMP";
         default:
             return "process";
     }

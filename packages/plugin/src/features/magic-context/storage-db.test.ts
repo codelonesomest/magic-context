@@ -571,6 +571,31 @@ describe("storage-db", () => {
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
+        it("#when an older OMP harness is live #then refuses migration and identifies OMP", () => {
+            const dataHome = useTempDataHome("storage-db-live-omp-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41002 omp --extension /home/user/.omp/agent/extensions/status.ts -r\n") as typeof execFileSync,
+                execFileSync: ((_, args) =>
+                    args.includes("command=")
+                        ? "omp --extension /home/user/.omp/agent/extensions/status.ts -r\n"
+                        : "Thu Aug 27 00:46:46 2026\n") as typeof execFileSync,
+            });
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toEqual({
+                persistedVersion: LATEST_SUPPORTED_VERSION - 1,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+                serverPids: [41002],
+                blockingProcesses: [{ kind: "OMP", pid: 41002 }],
+            });
+            expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
+                { kind: "OMP", pid: 41002 },
+            ]);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
         it("#when only an OMP internal worker is live #then migrates the shared database", () => {
             const dataHome = useTempDataHome("storage-db-omp-worker-migration-");
             const dbPath = seedPendingMigration(dataHome);
