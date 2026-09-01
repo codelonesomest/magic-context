@@ -86,63 +86,7 @@ import {
 } from "./test-utils.test";
 import { createPiTranscript } from "./transcript-pi";
 
-describe("applyForwardPressureFloor", () => {
-	const { FORWARD_PRESSURE_LIMIT_FACTOR, applyForwardPressureFloor } =
-		contextHandlerInternals;
-
-	it("floors stale trailing pressure with Pi's live forward token estimate", () => {
-		const result = applyForwardPressureFloor(68, 273_200, 340_000, 400_000);
-
-		expect(FORWARD_PRESSURE_LIMIT_FACTOR).toBe(0.85);
-		expect(result.percentage).toBeCloseTo(100, 8);
-		expect(result.inputTokens).toBe(340_000);
-	});
-
-	it("leaves trailing pressure unchanged without usable forward tokens or a sane limit", () => {
-		const trailing = { percentage: 68, inputTokens: 273_200 };
-
-		expect(
-			applyForwardPressureFloor(
-				trailing.percentage,
-				trailing.inputTokens,
-				undefined,
-				400_000,
-			),
-		).toEqual(trailing);
-		expect(
-			applyForwardPressureFloor(
-				trailing.percentage,
-				trailing.inputTokens,
-				null,
-				400_000,
-			),
-		).toEqual(trailing);
-		expect(
-			applyForwardPressureFloor(
-				trailing.percentage,
-				trailing.inputTokens,
-				340_000,
-				6_748,
-			),
-		).toEqual(trailing);
-	});
-
-	it("never lowers pressure or input-token accounting", () => {
-		expect(applyForwardPressureFloor(80, 80_000, 10_000, 100_000)).toEqual({
-			percentage: 80,
-			inputTokens: 80_000,
-		});
-	});
-
-	it("maps forward tokens at limit × 0.85 to 100%", () => {
-		const atMargin = applyForwardPressureFloor(0, 0, 85_000, 100_000);
-		const belowMargin = applyForwardPressureFloor(0, 0, 84_999, 100_000);
-
-		expect(atMargin.percentage).toBeCloseTo(100, 8);
-		expect(atMargin.inputTokens).toBe(85_000);
-		expect(belowMargin.percentage).toBeLessThan(100);
-	});
-
+describe("Pi pressure guards", () => {
 	it("keeps the emergency recovery bump as a floor instead of a cap", () => {
 		const src = readFileSync(
 			join(import.meta.dir, "context-handler.ts"),
@@ -169,6 +113,133 @@ describe("applyForwardPressureFloor", () => {
 				"const alreadyMutatingThisPass = executedWorkThisPass",
 			);
 		});
+	});
+});
+
+describe("Pi scheduler decision observability", () => {
+	async function runPass(
+		handler: (
+			event: { messages: never[] },
+			ctx: never,
+		) => Promise<{ messages: never[] } | undefined>,
+		sessionId: string,
+		messages: ReturnType<typeof userMessage>[],
+	): Promise<void> {
+		await handler(
+			{ messages: messages as never[] },
+			fakeContext(
+				sessionId,
+				process.cwd(),
+				messages.map((_message, index) => `entry-${index}`),
+				messages as never,
+			) as never,
+		);
+	}
+
+	it("logs the durable queue depth and mid-turn boundary reason", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-decision-log-mid-turn";
+		const lines: string[] = [];
+		const restoreObserver =
+			contextHandlerInternals.setPendingDecisionLogObserverForTests((line) =>
+				lines.push(line),
+			);
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				heuristics: {},
+			});
+			const handler = fake.handlers.get("context") as Parameters<
+				typeof runPass
+			>[0];
+			const firstPass = [
+				userMessage("first", 1),
+				assistantMessage("answer", 2),
+			];
+			await runPass(handler, sessionId, firstPass);
+			lines.length = 0;
+			queuePendingOp(db, sessionId, 1, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 70,
+				lastInputTokens: 70_000,
+				lastResponseTime: Date.now(),
+			});
+			const midTurnPass = [
+				userMessage("second", 3),
+				assistantToolCall("call-1", "ctx_reduce", {}, 4),
+			];
+			await runPass(handler, sessionId, midTurnPass);
+
+			expect(lines).toContain(
+				"pending ops WILL NOT APPLY — reason=mid_turn_boundary pendingOps=1 context=70.0%",
+			);
+			expect(lines).toContain(
+				"heuristics WILL NOT RUN — reason=mid_turn_boundary",
+			);
+
+			lines.length = 0;
+			const boundaryPass = [
+				userMessage("third", 5),
+				assistantMessage("answer", 6),
+			];
+			await runPass(handler, sessionId, boundaryPass);
+			expect(lines).toContain(
+				"pending ops WILL APPLY — reason=scheduler_execute (scheduler=execute), pendingOps=1 context=70.0%",
+			);
+		} finally {
+			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("keeps scheduler_defer for a genuine below-threshold refusal", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-decision-log-genuine-defer";
+		const lines: string[] = [];
+		const restoreObserver =
+			contextHandlerInternals.setPendingDecisionLogObserverForTests((line) =>
+				lines.push(line),
+			);
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				heuristics: {},
+			});
+			const handler = fake.handlers.get("context") as Parameters<
+				typeof runPass
+			>[0];
+			const firstPass = [
+				userMessage("first", 1),
+				assistantMessage("answer", 2),
+			];
+			await runPass(handler, sessionId, firstPass);
+			lines.length = 0;
+			queuePendingOp(db, sessionId, 1, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 20,
+				lastInputTokens: 20_000,
+				lastResponseTime: Date.now(),
+			});
+			const freshTurn = [
+				userMessage("second", 3),
+				assistantMessage("answer", 4),
+			];
+			await runPass(handler, sessionId, freshTurn);
+
+			expect(lines).toContain(
+				"pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=1 context=20.0%",
+			);
+			expect(lines).toContain(
+				"heuristics WILL NOT RUN — reason=scheduler_defer",
+			);
+		} finally {
+			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
 	});
 });
 
@@ -1074,6 +1145,44 @@ describe("registerPiContextHandler", () => {
 		clearAutoSearchForPiSession("ses-sticky-context");
 	});
 
+	it("awaits only the requested session's in-flight historian", async () => {
+		let resolveA!: () => void;
+		let resolveB!: () => void;
+		const historianA = new Promise<void>((resolve) => {
+			resolveA = resolve;
+		});
+		const historianB = new Promise<void>((resolve) => {
+			resolveB = resolve;
+		});
+		const restoreA = contextHandlerInternals.setInFlightHistorianForTests(
+			"ses-drain-a",
+			historianA,
+		);
+		const restoreB = contextHandlerInternals.setInFlightHistorianForTests(
+			"ses-drain-b",
+			historianB,
+		);
+		let sessionADrained = false;
+		const drainA = awaitInFlightHistorians("ses-drain-a").then(() => {
+			sessionADrained = true;
+		});
+
+		try {
+			resolveB();
+			await awaitInFlightHistorians("ses-drain-b");
+			expect(sessionADrained).toBe(false);
+
+			resolveA();
+			await drainA;
+			expect(sessionADrained).toBe(true);
+		} finally {
+			resolveA();
+			resolveB();
+			restoreA();
+			restoreB();
+		}
+	});
+
 	it("does not reset Pi model-specific state when canonical and native alias spellings flip", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-model-alias-switch";
@@ -1373,7 +1482,7 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
-	it("resets the persisted Channel 1 band when baseline refresh sees a smaller tail", async () => {
+	it("preserves Channel 1 crossing state when a baseline refresh sees a smaller tail", async () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-band-reset";
@@ -1394,10 +1503,12 @@ describe("registerPiContextHandler", () => {
 				fakeContext(sessionId) as never,
 			);
 
-			expect(getLastNudgeUndropped(db, sessionId)).toBe(0);
+			// The next tool-result decision observes a lower band and rearms it.
+			// Clearing here would turn the same post-reduce band into a full crossing.
+			expect(getLastNudgeUndropped(db, sessionId)).toBe(80_000);
 			expect(getChannel1NudgeState(db, sessionId)).toEqual({
-				level: "",
-				ordinal: 0,
+				level: "urgent",
+				ordinal: 12,
 			});
 			expect(
 				db
@@ -1405,7 +1516,7 @@ describe("registerPiContextHandler", () => {
 						"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
 					)
 					.get(sessionId),
-			).toEqual({ last_nudge_level: '{"level":"","ordinal":0}' });
+			).toEqual({ last_nudge_level: '{"level":"urgent","ordinal":12}' });
 		} finally {
 			closeQuietly(db);
 		}
@@ -2481,7 +2592,7 @@ describe("registerPiContextHandler", () => {
 		});
 	});
 
-	it("latches same-sample emergency drops but re-runs on fresh forward growth", async () => {
+	it("latches one emergency batch per force-pressure episode and rearms only on safe edges", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-forward-emergency-latch";
 		const largeToolOutput = "x".repeat(12_000);
@@ -2500,7 +2611,7 @@ describe("registerPiContextHandler", () => {
 			) => Promise<{ messages: never[] }>;
 			const buildMessages = () => {
 				const messages = [userMessage("start tool burst", 1)];
-				for (let i = 0; i < 20; i++) {
+				for (let i = 0; i < 40; i++) {
 					messages.push(assistantToolCall(`call-${i}`, "bash", {}, 2 + i * 2), {
 						...toolResultMessage(`call-${i}`, largeToolOutput, 3 + i * 2),
 						toolName: "bash",
@@ -2524,6 +2635,11 @@ describe("registerPiContextHandler", () => {
 					}),
 				} as never);
 			};
+			const droppedToolCount = () =>
+				getTagsBySession(db, sessionId).filter(
+					(tag) => tag.type === "tool" && tag.status === "dropped",
+				).length;
+
 			await runPass(1_000);
 			updateSessionMeta(db, sessionId, {
 				lastResponseTime: Date.now(),
@@ -2533,9 +2649,7 @@ describe("registerPiContextHandler", () => {
 			});
 
 			await runPass(85_000);
-			const firstDropped = getTagsBySession(db, sessionId).filter(
-				(tag) => tag.type === "tool" && tag.status === "dropped",
-			).length;
+			const firstDropped = droppedToolCount();
 			const toolCount = getTagsBySession(db, sessionId).filter(
 				(tag) => tag.type === "tool",
 			).length;
@@ -2543,17 +2657,26 @@ describe("registerPiContextHandler", () => {
 			expect(firstDropped).toBeLessThan(toolCount);
 			expect(getEmergencyInputSample(db, sessionId)).toBe(85_000);
 
-			await runPass(85_000);
-			const sameSampleDropped = getTagsBySession(db, sessionId).filter(
-				(tag) => tag.type === "tool" && tag.status === "dropped",
-			).length;
-			expect(sameSampleDropped).toBe(firstDropped);
-
 			await runPass(90_000);
-			const freshGrowthDropped = getTagsBySession(db, sessionId).filter(
-				(tag) => tag.type === "tool" && tag.status === "dropped",
-			).length;
-			expect(freshGrowthDropped).toBeGreaterThan(sameSampleDropped);
+			expect(droppedToolCount()).toBe(firstDropped);
+
+			await runPass(70_000);
+			expect(getEmergencyInputSample(db, sessionId)).toBe(0);
+			await runPass(90_000);
+			const afterPressureExit = droppedToolCount();
+			expect(afterPressureExit).toBeGreaterThan(firstDropped);
+
+			await runPass(92_000);
+			expect(droppedToolCount()).toBe(afterPressureExit);
+			const independentDrop = getTagsBySession(db, sessionId).find(
+				(tag) => tag.type === "tool" && tag.status === "active",
+			);
+			if (!independentDrop)
+				throw new Error("expected an active tool for the priced mutation");
+			queuePendingOp(db, sessionId, independentDrop.tagNumber, "drop", 1);
+
+			await runPass(93_000);
+			expect(droppedToolCount()).toBeGreaterThan(afterPressureExit + 1);
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
@@ -2687,8 +2810,8 @@ describe("registerPiContextHandler", () => {
 				...fakeContext(sessionId, process.cwd(), ["entry-1"], messages),
 				ui: { notify },
 				getContextUsage: () => ({
-					tokens: 85_000,
-					percent: 85,
+					tokens: 95_000,
+					percent: 95,
 					contextWindow: 100_000,
 				}),
 			} as never);
@@ -2725,8 +2848,8 @@ describe("registerPiContextHandler", () => {
 				...fakeContext(sessionId, process.cwd(), ["entry-1"], messages),
 				ui: { notify },
 				getContextUsage: () => ({
-					tokens: 85_000,
-					percent: 85,
+					tokens: 95_000,
+					percent: 95,
 					contextWindow: 100_000,
 				}),
 			} as never);

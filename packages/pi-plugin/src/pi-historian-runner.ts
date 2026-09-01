@@ -57,6 +57,7 @@ import {
 	clearEmergencyRecovery,
 	clearHistorianDrainFailure,
 	clearHistorianFailureState,
+	describeProtectedTailDrainBudgetSkip,
 	getOverflowState,
 	incrementHistorianFailure,
 	isWrapupInProgress,
@@ -372,8 +373,12 @@ export interface PiHistorianDeps {
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
 	/** Current resolved context limit used to reject stale snapshots after model switches. */
 	currentContextLimit?: number;
-	/** Optional per-call timeout (default 120s). */
+	/** Optional per-call timeout (default 600s). */
 	historianTimeoutMs?: number;
+	/** Sampling temperature carried to the serialized provider request. */
+	temperature?: number;
+	/** Output-token budget carried to the serialized provider request. */
+	maxOutputTokens?: number;
 	/** Optional cancellation signal for the historian run and retry backoff. */
 	signal?: AbortSignal;
 	/** Test seam for transient retry backoff. Defaults to OpenCode's retry cadence. */
@@ -439,6 +444,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		refreshBoundarySnapshot,
 		currentContextLimit,
 		historianTimeoutMs = DEFAULT_HISTORIAN_TIMEOUT_MS,
+		temperature,
+		maxOutputTokens = 32_000,
 		signal,
 		retryBackoffMs,
 		twoPass,
@@ -627,12 +634,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							boundarySnapshot.executeThresholdPercentage,
 					});
 			if (!reserve.ok) {
-				sessionLog(
-					sessionId,
-					`historian rate-limit skip: ${reserve.skippedReason ?? "quota exhausted"}`,
-				);
+				sessionLog(sessionId, describeProtectedTailDrainBudgetSkip(reserve));
 				telemetry.status = "noop";
-				telemetry.failureReason = "protected-tail drain quota exhausted";
+				telemetry.failureReason = "internal protected-tail drain budget spent";
 				return;
 			}
 			drainReservation = reserve.reservation;
@@ -840,6 +844,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					cwd: directory,
 					signal,
 					thinkingLevel,
+					temperature,
+					maxOutputTokens,
 					onProgress: buildProgressLogger("first"),
 					accountingSessionId: sessionId,
 					accountingSubagent: "historian",
@@ -891,6 +897,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						cwd: directory,
 						signal,
 						thinkingLevel,
+						temperature,
+						maxOutputTokens,
 						onProgress: buildProgressLogger("repair"),
 						accountingSessionId: sessionId,
 						accountingSubagent: "historian",
@@ -951,6 +959,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							cwd: directory,
 							signal,
 							thinkingLevel: candidate.entry.qualifier,
+							temperature,
+							maxOutputTokens,
 							onProgress: buildProgressLogger("fallback"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",
@@ -1023,6 +1033,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							cwd: directory,
 							signal,
 							thinkingLevel,
+							temperature,
+							maxOutputTokens,
 							onProgress: buildProgressLogger("editor"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian_editor",
@@ -1680,7 +1692,7 @@ export function buildPiCompactionSummary(
  * cut at, so defer there too.
  */
 export function findFirstKeptEntryId(
-	entries: unknown[],
+	entries: readonly unknown[],
 	lastCompactedOrdinal: number,
 ): string | null {
 	const rawMessages = convertEntriesToRawMessages(entries);

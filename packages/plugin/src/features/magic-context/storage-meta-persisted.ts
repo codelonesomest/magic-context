@@ -155,12 +155,31 @@ export interface ProtectedTailDrainReservation {
     tokens: number;
 }
 
+export interface ProtectedTailDrainBudgetState {
+    windowStartedAt: number;
+    resetsAt: number;
+    resetInMs: number;
+    spentTokens: number;
+    limitTokens: number;
+}
+
 export interface ProtectedTailDrainReserveResult {
     ok: boolean;
     reservedTokens: number;
     overQuotaBypass: boolean;
     reservation: ProtectedTailDrainReservation | null;
+    budgetState: ProtectedTailDrainBudgetState | null;
     skippedReason?: string;
+}
+
+/** Describe the internal limiter without implying that the model provider rejected a request. */
+export function describeProtectedTailDrainBudgetSkip(
+    result: ProtectedTailDrainReserveResult,
+): string {
+    const state = result.budgetState;
+    if (!state) return "historian skip: internal drain budget spent";
+    const resetMinutes = Math.max(1, Math.ceil(state.resetInMs / 60_000));
+    return `historian skip: internal drain budget spent (${state.spentTokens}/${state.limitTokens} tokens; resets in ${resetMinutes}m)`;
 }
 
 export interface WrapupInProgressState {
@@ -766,22 +785,34 @@ export function reserveProtectedTailDrainTokens(args: {
     const now = args.now ?? Date.now();
     const requested = Math.max(0, Math.floor(args.trueRawTokens));
     if (requested === 0) {
-        return { ok: true, reservedTokens: 0, overQuotaBypass: false, reservation: null };
+        return {
+            ok: true,
+            reservedTokens: 0,
+            overQuotaBypass: false,
+            reservation: null,
+            budgetState: null,
+        };
     }
     let result: ProtectedTailDrainReserveResult = {
         ok: false,
         reservedTokens: 0,
         overQuotaBypass: false,
         reservation: null,
-        skippedReason: "quota exhausted",
+        budgetState: null,
+        skippedReason: "internal drain budget spent",
     };
     args.db.transaction(() => {
         ensureSessionMetaRow(args.db, args.sessionId);
         let meta = loadProtectedTailMeta(args.db, args.sessionId);
-        if (now - meta.protectedTailDrainWindowStartedAt > DRAIN_WINDOW_MS) {
-            // Reset the per-window budget. The emergency latch is usage-driven and
-            // deliberately NOT cleared here — it must persist across window
-            // boundaries until usage returns to the safe zone.
+        const windowStartedAt = meta.protectedTailDrainWindowStartedAt;
+        const windowExpired =
+            windowStartedAt <= 0 ||
+            windowStartedAt > now ||
+            now - windowStartedAt >= DRAIN_WINDOW_MS;
+        if (windowExpired) {
+            // Expiry is checked before every reservation, including skipped attempts.
+            // A future timestamp is invalid wall-clock state and starts a fresh window
+            // instead of holding the session behind the limiter until that time arrives.
             args.db
                 .prepare(
                     `UPDATE session_meta
@@ -816,30 +847,47 @@ export function reserveProtectedTailDrainTokens(args: {
         const remaining = Math.max(0, budget - meta.protectedTailDrainTokens);
         let reserved = Math.min(requested, args.perRunCap, remaining);
         let bypass = false;
-        // While the latch is active, drain a chunk EVERY pass past the window budget
-        // — UNLESS a recent historian failure is still in its backoff window (so a
-        // broken historian can't retry-thrash under the latch).
+        // While emergency draining is active, reserve a chunk on every pass beyond
+        // the normal window budget unless a recent historian failure is still backing
+        // off. A future failure timestamp is ignored because it cannot represent a
+        // recent failure after the wall clock moved backward.
         const inFailureBackoff =
             meta.historianDrainFailureAt > 0 &&
+            meta.historianDrainFailureAt <= now &&
             now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
         if (reserved <= 0 && latchActive && !inFailureBackoff) {
             reserved = Math.min(requested, args.perRunCap);
             bypass = true;
         }
-        if (reserved <= 0) return;
+
+        const activeWindowStartedAt = meta.protectedTailDrainWindowStartedAt;
+        const budgetState = (spentTokens: number): ProtectedTailDrainBudgetState => ({
+            windowStartedAt: activeWindowStartedAt,
+            resetsAt: activeWindowStartedAt + DRAIN_WINDOW_MS,
+            resetInMs: Math.max(0, activeWindowStartedAt + DRAIN_WINDOW_MS - now),
+            spentTokens,
+            limitTokens: budget,
+        });
+        if (reserved <= 0) {
+            result = {
+                ...result,
+                budgetState: budgetState(meta.protectedTailDrainTokens),
+            };
+            return;
+        }
         args.db
             .prepare(
                 `UPDATE session_meta
-                 SET protected_tail_drain_window_started_at = CASE WHEN protected_tail_drain_window_started_at = 0 THEN ? ELSE protected_tail_drain_window_started_at END,
-                     protected_tail_drain_tokens = COALESCE(protected_tail_drain_tokens, 0) + ?
+                 SET protected_tail_drain_tokens = COALESCE(protected_tail_drain_tokens, 0) + ?
                  WHERE session_id = ?`,
             )
-            .run(now, reserved, args.sessionId);
+            .run(reserved, args.sessionId);
         result = {
             ok: true,
             reservedTokens: reserved,
             overQuotaBypass: bypass,
             reservation: { sessionId: args.sessionId, runId: args.runId, tokens: reserved },
+            budgetState: budgetState(meta.protectedTailDrainTokens + reserved),
         };
     })();
     return result;
@@ -922,18 +970,16 @@ export function clearPersistedReasoningWatermark(db: Database, sessionId: string
 }
 
 // ---- Tiered emergency-drop watermark (Phase 2) ----
-// `last_emergency_input_sample` is the `currentTotalInputTokens` reading at the
-// moment the tiered emergency drop last acted. It is the SOLE idempotence latch
-// for the emergency drop (there is intentionally no tag-number watermark — a
-// scalar "dropped-through" cursor wrongly excludes still-active lower-numbered
-// tags after a non-contiguous tier-ordered drop; dropped tags already leave the
-// `status='active'` set, so they can't be re-selected). The drop reduces the
-// wire, but the provider hasn't re-measured it yet — the persisted usage stays
-// at the pre-drop value until the next assistant response lands. Without this
-// latch a second force-band pass on the SAME stale reading recomputes the floor from
-// the now-smaller active tail and over-drops the rest of the tail (and busts the
-// cache again). We only re-evaluate once a FRESH provider sample arrives (the
-// reading changes). Reset to 0 on model change (which moves the ceiling).
+// `last_emergency_input_sample` is the pressure-episode latch for the tiered
+// emergency drop. Zero means no originating batch has acted in the current force
+// episode; non-zero records the usage at that batch. Fresh provider samples do
+// not release it, because sustained force-band residency otherwise ages one tag
+// at a time past the protected tail and mints one bust per execute pass. The
+// postprocess caller resets it after pressure exits or immediately before an
+// independent provider-visible mutation, so accumulated candidates either start
+// one pressure bust or ride an already-priced bust. There is deliberately no
+// tag-number watermark: tier-ordered drops are non-contiguous, and a scalar
+// cursor would exclude still-active lower-numbered tags.
 interface PersistedEmergencyInputSampleRow {
     last_emergency_input_sample: number;
 }
@@ -954,9 +1000,8 @@ export function getEmergencyInputSample(db: Database, sessionId: string): number
 }
 
 /**
- * Latch the usage sample on every emergency acting pass, including when the
- * selector finds no eligible target. This stops repeated cache busts on the same
- * stale sample; the 95% block remains the backstop for genuine "nothing left to drop".
+ * Latch every emergency evaluation in a force-band episode, including one with
+ * no eligible target. The 95% block remains the backstop for genuine exhaustion.
  */
 export function setEmergencyDropSample(db: Database, sessionId: string, inputSample: number): void {
     db.transaction(() => {
@@ -977,9 +1022,9 @@ export function clearEmergencyDropSample(db: Database, sessionId: string): void 
 }
 
 // ---- Channel 1 (in-turn tool-output ctx_reduce nudge) cadence + band state ----
-// `last_nudge_undropped` records the `undropped` estimate when Channel 1 last
-// fired. The existing `last_nudge_level` scalar holds the paired level and last
-// real-user-turn counter as JSON, so no schema change is needed for dampening.
+// `last_nudge_undropped` records the U watermark for cadence. The existing
+// `last_nudge_level` scalar holds band, turn cadence, and post-reduce grace as
+// JSON so the state machine remains durable without another schema column.
 export type PersistedChannel1NudgeLevel = "" | "gentle" | "firm" | "urgent";
 
 interface PersistedLastNudgeUndroppedRow {
@@ -991,9 +1036,16 @@ interface PersistedLastNudgeLevelRow {
 }
 
 export interface PersistedChannel1NudgeState {
+    /** Currently observed band; an upward change is the only full-copy crossing. */
     level: PersistedChannel1NudgeLevel;
     /** Real-user-turn counter at the last fire; the JSON key stays stable. */
     ordinal: number;
+    /** Waiting for the first tail walk whose U already excludes queued drops. */
+    postReduceGracePending?: boolean;
+    /** U measured after queued drops were excluded. */
+    postReduceGraceBaselineU?: number;
+    /** Band observed before the complying ctx_reduce call. */
+    postReduceGracePreLevel?: PersistedChannel1NudgeLevel;
 }
 
 const EMPTY_CHANNEL1_NUDGE_STATE: PersistedChannel1NudgeState = { level: "", ordinal: 0 };
@@ -1020,15 +1072,36 @@ function normalizeLastNudgeLevel(value: unknown): PersistedChannel1NudgeLevel {
 
 function parseChannel1NudgeState(raw: string): PersistedChannel1NudgeState {
     try {
-        const parsed = JSON.parse(raw) as { level?: unknown; ordinal?: unknown };
+        const parsed = JSON.parse(raw) as {
+            level?: unknown;
+            ordinal?: unknown;
+            postReduceGracePending?: unknown;
+            postReduceGraceBaselineU?: unknown;
+            postReduceGracePreLevel?: unknown;
+        };
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-            return {
+            const state: PersistedChannel1NudgeState = {
                 level: normalizeLastNudgeLevel(parsed.level),
                 ordinal:
                     typeof parsed.ordinal === "number"
                         ? Math.max(0, Math.round(parsed.ordinal))
                         : 0,
             };
+            if (parsed.postReduceGracePending === true) state.postReduceGracePending = true;
+            if (
+                typeof parsed.postReduceGraceBaselineU === "number" &&
+                Number.isFinite(parsed.postReduceGraceBaselineU)
+            ) {
+                state.postReduceGraceBaselineU = Math.max(
+                    0,
+                    Math.round(parsed.postReduceGraceBaselineU),
+                );
+            }
+            const preLevel = normalizeLastNudgeLevel(parsed.postReduceGracePreLevel);
+            if (preLevel !== "" || parsed.postReduceGracePreLevel === "") {
+                state.postReduceGracePreLevel = preLevel;
+            }
+            return state;
         }
     } catch {
         // Legacy rows stored only the cadence level as a scalar.
@@ -1037,10 +1110,21 @@ function parseChannel1NudgeState(raw: string): PersistedChannel1NudgeState {
 }
 
 function serializeChannel1NudgeState(value: PersistedChannel1NudgeState): string {
-    return JSON.stringify({
+    const serialized: Record<string, boolean | number | string> = {
         level: normalizeLastNudgeLevel(value.level),
         ordinal: Math.max(0, Math.round(value.ordinal)),
-    });
+    };
+    if (value.postReduceGracePending === true) serialized.postReduceGracePending = true;
+    if (value.postReduceGraceBaselineU !== undefined) {
+        serialized.postReduceGraceBaselineU = Math.max(
+            0,
+            Math.round(value.postReduceGraceBaselineU),
+        );
+    }
+    if (value.postReduceGracePreLevel !== undefined) {
+        serialized.postReduceGracePreLevel = normalizeLastNudgeLevel(value.postReduceGracePreLevel);
+    }
+    return JSON.stringify(serialized);
 }
 
 export function getLastNudgeUndropped(db: Database, sessionId: string): number {
@@ -1083,6 +1167,53 @@ export function setChannel1NudgeState(
             serializeChannel1NudgeState(value),
             sessionId,
         );
+    })();
+}
+
+/** Record compliance without guessing U from the stale pre-drop baseline. */
+export function markChannel1PostReduceGracePending(
+    db: Database,
+    sessionId: string,
+): PersistedChannel1NudgeState {
+    return db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        const current = getChannel1NudgeState(db, sessionId);
+        const next: PersistedChannel1NudgeState = {
+            level: current.level,
+            ordinal: current.ordinal,
+            postReduceGracePending: true,
+            postReduceGracePreLevel: current.level,
+        };
+        db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
+            serializeChannel1NudgeState(next),
+            sessionId,
+        );
+        return next;
+    })();
+}
+
+/** Start grace from the first U value that has already excluded queued drops. */
+export function captureChannel1PostReduceGraceBaseline(
+    db: Database,
+    sessionId: string,
+    measuredUndropped: number,
+): PersistedChannel1NudgeState {
+    return db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        const current = getChannel1NudgeState(db, sessionId);
+        if (current.postReduceGracePending !== true) return current;
+        const baselineU = Math.max(0, Math.round(measuredUndropped));
+        const next: PersistedChannel1NudgeState = {
+            level: current.level,
+            ordinal: current.ordinal,
+            postReduceGraceBaselineU: baselineU,
+            postReduceGracePreLevel: current.postReduceGracePreLevel ?? current.level,
+        };
+        db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
+            serializeChannel1NudgeState(next),
+            sessionId,
+        );
+        return next;
     })();
 }
 
@@ -2275,6 +2406,50 @@ export function addTrailingBlankDecisions(
     }
     sessionLog(sessionId, `trailing_blank_decisions CAS: ${CAS_RETRY_LIMIT} retries exhausted`);
     return false;
+}
+
+/**
+ * Convert keep decisions that would incorrectly preserve trailing blank content to strip
+ * without advancing the session metadata boundary. Returns the IDs changed by this call,
+ * or null when compare-and-swap retries are exhausted.
+ */
+export function demoteTrailingBlankKeepDecisions(
+    db: Database,
+    sessionId: string,
+    messageIds: Iterable<string>,
+): string[] | null {
+    const ids = new Set(messageIds);
+    if (ids.size === 0) return [];
+    ensureSessionMetaRow(db, sessionId);
+
+    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
+        const row = db
+            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { trailing_blank_decisions?: string | null } | undefined;
+        const rawStored = row ? (row.trailing_blank_decisions ?? null) : null;
+        const current = parseTrailingBlankDecisions(rawStored);
+        const demotedIds: string[] = [];
+        for (const id of ids) {
+            const decision = current.get(id);
+            if (decision === "keep" || decision?.startsWith("keep:") === true) {
+                current.set(id, "strip");
+                demotedIds.push(id);
+            }
+        }
+        if (demotedIds.length === 0) return [];
+        const nextBlob = JSON.stringify(Object.fromEntries(current));
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ? AND trailing_blank_decisions IS ?",
+            )
+            .run(nextBlob, sessionId, rawStored);
+        if (result.changes > 0) return demotedIds;
+    }
+    sessionLog(
+        sessionId,
+        `trailing_blank_decisions demotion CAS: ${CAS_RETRY_LIMIT} retries exhausted`,
+    );
+    return null;
 }
 
 // ── Stale ctx_reduce stripped message IDs (frozen replay watermark) ──

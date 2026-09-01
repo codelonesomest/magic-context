@@ -28,7 +28,7 @@ import {
 	getChannel2NudgeClaim,
 	getChannel2NudgeState,
 	getLastNudgeUndropped,
-	resetLastNudgeCycle,
+	markChannel1PostReduceGracePending,
 	setChannel1NudgeState,
 	setLastNudgeUndropped,
 } from "@magic-context/core/features/magic-context/storage";
@@ -38,8 +38,8 @@ import {
 	CHANNEL1_SENTINEL,
 	decideChannel1,
 	evaluateChannel2,
+	reclaimableToolOutputCount,
 	type Channel1State as SharedChannel1State,
-	shouldUseStickyChannel1Reminder,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -71,7 +71,7 @@ export function clearPiChannel1State(sessionId: string): void {
 	channel1StateBySession.delete(sessionId);
 }
 
-/** Mark that the agent ran ctx_reduce since the last baseline refresh (suppress self-nag). */
+/** Mark compliance now; the next post-drop walk supplies the grace U baseline. */
 export function markPiChannel1Reduced(sessionId: string, db?: Database): void {
 	const state = channel1StateBySession.get(sessionId);
 	if (state) {
@@ -79,7 +79,14 @@ export function markPiChannel1Reduced(sessionId: string, db?: Database): void {
 		state.evaluable = false;
 		state.generationInvalidated = true;
 	}
-	if (db) resetLastNudgeCycle(db, sessionId);
+	if (!db) return;
+	const grace = markChannel1PostReduceGracePending(db, sessionId);
+	if (state) {
+		state.channel1PostReduceGrace = {
+			pending: true,
+			preReduceLevel: grace.postReduceGracePreLevel ?? grace.level,
+		};
+	}
 }
 
 interface PiTextContent {
@@ -123,10 +130,7 @@ export function maybeChannel1ReminderForToolResult(args: {
 	if (!state) return null; // primary-only: no baseline ⇒ subagent ⇒ off
 
 	if (toolName === "ctx_reduce") {
-		state.reducedSinceRefresh = true;
-		state.evaluable = false;
-		state.generationInvalidated = true;
-		resetLastNudgeCycle(db, sessionId);
+		markPiChannel1Reduced(sessionId, db);
 		return null;
 	}
 
@@ -148,36 +152,45 @@ export function maybeChannel1ReminderForToolResult(args: {
 		...state,
 		lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
 		lastNudgeLevel: nudgeState.level,
+		lastFireOrdinal: nudgeState.ordinal,
+		currentRealUserTurnCount: state.realUserTurnCount,
 		hasRecentReduce: state.reducedSinceRefresh,
+		postReduceGracePending: nudgeState.postReduceGracePending,
+		postReduceGraceBaselineU: nudgeState.postReduceGraceBaselineU,
+		postReduceGracePreLevel: nudgeState.postReduceGracePreLevel,
 	});
 
 	setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
+	const nextNudgeState = {
+		...nudgeState,
+		level: decision.nextLastNudgeLevel,
+		ordinal: decision.nextLastNudgeLevel === "" ? 0 : nudgeState.ordinal,
+		postReduceGracePending: decision.clearPostReduceGrace
+			? undefined
+			: nudgeState.postReduceGracePending,
+		postReduceGraceBaselineU: decision.clearPostReduceGrace
+			? undefined
+			: nudgeState.postReduceGraceBaselineU,
+		postReduceGracePreLevel: decision.clearPostReduceGrace
+			? undefined
+			: nudgeState.postReduceGracePreLevel,
+	};
 	if (!decision.fire) {
-		setChannel1NudgeState(db, sessionId, {
-			level: decision.nextLastNudgeLevel,
-			ordinal: decision.nextLastNudgeLevel === "" ? 0 : nudgeState.ordinal,
-		});
+		setChannel1NudgeState(db, sessionId, nextNudgeState);
 		return null;
 	}
-
-	const sticky = shouldUseStickyChannel1Reminder({
-		lastLevel: nudgeState.level,
-		lastOrdinal: nudgeState.ordinal,
-		level: decision.level,
-		currentRealUserTurnCount: state.realUserTurnCount,
-	});
 	const block = {
 		type: "text" as const,
 		text: buildChannel1Reminder(
 			decision.level,
 			decision.undroppedTokens,
-			state.usableWindow,
+			reclaimableToolOutputCount(state.baselineParts),
 			state.oldestReclaimableToolTags,
-			sticky,
+			decision.sticky,
 		),
 	};
 	setChannel1NudgeState(db, sessionId, {
-		level: decision.level,
+		...nextNudgeState,
 		ordinal: state.realUserTurnCount,
 	});
 	return block;
@@ -266,7 +279,7 @@ export function maybeDeliverChannel2Pi(
 			customType: CHANNEL2_NUDGE_CUSTOM_TYPE,
 			content: buildChannel2Reminder(
 				undropped,
-				baseline.usableWindow,
+				reclaimableToolOutputCount(baseline.baselineParts),
 				baseline.oldestReclaimableToolTags,
 			),
 			display: false,

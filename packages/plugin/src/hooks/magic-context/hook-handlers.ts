@@ -15,7 +15,7 @@ import {
     clearHistorianFailureState,
     getChannel1NudgeState,
     getLastNudgeUndropped,
-    resetLastNudgeCycle,
+    markChannel1PostReduceGracePending,
     setChannel1NudgeState,
     setLastNudgeUndropped,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -23,6 +23,7 @@ import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared/logger";
 import { clearAutoSearchForSession } from "./auto-search-runner";
+import type { CommandExecuteInput, CommandExecuteOutput } from "./command-handler";
 import {
     cachedToolPermissionDenied,
     resolveTodowriteAvailability,
@@ -33,7 +34,7 @@ import {
     CHANNEL1_SENTINEL,
     type Channel1State,
     decideChannel1,
-    shouldUseStickyChannel1Reminder,
+    reclaimableToolOutputCount,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
 import { annotateEmptyTaskOutput } from "./empty-task-output";
@@ -52,6 +53,7 @@ import {
 import { readRawSessionMessageById, readRawSessionMessages } from "./read-session-chunk";
 import { clearIgnoredMessages, flushIgnoredMessages } from "./send-session-notification";
 import { variantChangeBustsProviderCache } from "./sentinel";
+import { matchStrippedMagicContextCommand } from "./stripped-command";
 import { normalizeTodoStateJson } from "./todo-view";
 
 export type LiveModelBySession = Map<string, { providerID: string; modelID: string }>;
@@ -134,6 +136,21 @@ export type FlushedSessions = Set<string>;
 
 export type LastHeuristicsTurnId = Map<string, string>;
 
+type CommandNotificationParams = {
+    agent?: string;
+    variant?: string;
+    providerId?: string;
+    modelId?: string;
+};
+
+export interface MagicContextCommandHandler {
+    "command.execute.before": (
+        input: CommandExecuteInput,
+        output: CommandExecuteOutput,
+        params: CommandNotificationParams,
+    ) => Promise<unknown>;
+}
+
 export function getLiveNotificationParams(
     sessionId: string,
     liveModelBySession: LiveModelBySession,
@@ -173,15 +190,48 @@ export function createChatMessageHook(args: {
     /** E5 — one-time session upgrade reminder. Optional: only wired when the
      *  historian can run (so an upgrade is actually possible). Self-gates. */
     upgradeReminder?: (sessionId: string) => Promise<void>;
+    /** The native slash-command handler, reused when Desktop removes the slash. */
+    commandHandler?: MagicContextCommandHandler;
 }) {
-    return async (input: {
-        sessionID?: string;
-        variant?: string;
-        agent?: string;
-        model?: { providerID?: string; modelID?: string };
-    }) => {
+    return async (
+        input: {
+            sessionID?: string;
+            variant?: string;
+            agent?: string;
+            model?: { providerID?: string; modelID?: string };
+        },
+        output?: {
+            parts?: Array<{
+                type: string;
+                text?: string;
+                ignored?: boolean;
+                synthetic?: boolean;
+            }>;
+        },
+    ) => {
         const sessionId = input.sessionID;
         if (!sessionId) return;
+
+        const strippedCommand =
+            args.commandHandler && output?.parts
+                ? matchStrippedMagicContextCommand(output.parts)
+                : null;
+        if (strippedCommand && args.commandHandler && output?.parts) {
+            await args.commandHandler["command.execute.before"](
+                {
+                    command: strippedCommand.command,
+                    sessionID: sessionId,
+                    arguments: strippedCommand.arguments,
+                },
+                { parts: output.parts },
+                {
+                    agent: input.agent,
+                    variant: input.variant,
+                    providerId: input.model?.providerID,
+                    modelId: input.model?.modelID,
+                },
+            );
+        }
 
         // E5: fire-and-forget one-time upgrade reminder for legacy sessions.
         // Self-gating + model-invisible, so it never affects the prompt prefix.
@@ -417,15 +467,9 @@ export function createEventHook(args: {
     };
 }
 
-export function createCommandExecuteBeforeHook(commandHandler: {
-    "command.execute.before": (
-        input: import("./command-handler").CommandExecuteInput,
-        output: import("./command-handler").CommandExecuteOutput,
-        params: { agent?: string; variant?: string; providerId?: string; modelId?: string },
-    ) => Promise<unknown>;
-}) {
+export function createCommandExecuteBeforeHook(commandHandler: MagicContextCommandHandler) {
     return async (input: unknown, output: unknown) => {
-        const typedInput = input as import("./command-handler").CommandExecuteInput & {
+        const typedInput = input as CommandExecuteInput & {
             agent?: string;
             variant?: string;
             providerID?: string;
@@ -438,8 +482,8 @@ export function createCommandExecuteBeforeHook(commandHandler: {
             modelId: typedInput.modelID,
         };
         return commandHandler["command.execute.before"](
-            typedInput as import("./command-handler").CommandExecuteInput,
-            output as import("./command-handler").CommandExecuteOutput,
+            typedInput as CommandExecuteInput,
+            output as CommandExecuteOutput,
             params,
         );
     };
@@ -489,36 +533,45 @@ function maybeInjectChannel1Nudge(
         turnDeltaT: state.turnDeltaT,
         lastNudgeUndropped: getLastNudgeUndropped(args.db, sessionId),
         lastNudgeLevel: nudgeState.level,
+        lastFireOrdinal: nudgeState.ordinal,
+        currentRealUserTurnCount: state.realUserTurnCount,
         hasRecentReduce: false,
+        postReduceGracePending: nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: nudgeState.postReduceGracePreLevel,
         evaluable: state.evaluable,
         generationInvalidated: state.generationInvalidated,
     });
 
     // Store the cadence level and dampening ordinal together so one persisted state stays in sync.
     setLastNudgeUndropped(args.db, sessionId, decision.nextLastNudge);
+    const nextNudgeState = {
+        ...nudgeState,
+        level: decision.nextLastNudgeLevel,
+        postReduceGracePending: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGracePreLevel,
+    };
     if (!decision.fire) {
-        setChannel1NudgeState(args.db, sessionId, {
-            ...nudgeState,
-            level: decision.nextLastNudgeLevel,
-        });
+        setChannel1NudgeState(args.db, sessionId, nextNudgeState);
         return;
     }
 
-    const sticky = shouldUseStickyChannel1Reminder({
-        lastLevel: nudgeState.level,
-        lastOrdinal: nudgeState.ordinal,
-        level: decision.level,
-        currentRealUserTurnCount: state.realUserTurnCount,
-    });
     out.output += buildChannel1Reminder(
         decision.level,
         decision.undroppedTokens,
-        state.usableWindow,
+        reclaimableToolOutputCount(state.baselineParts),
         state.oldestReclaimableToolTags,
-        sticky,
+        decision.sticky,
     );
     setChannel1NudgeState(args.db, sessionId, {
-        level: decision.level,
+        ...nextNudgeState,
         ordinal: state.realUserTurnCount,
     });
     sessionLog(
@@ -568,9 +621,19 @@ export function createToolExecuteAfterHook(args: {
                 state.generationInvalidated = true;
             }
             try {
-                resetLastNudgeCycle(args.db, typedInput.sessionID);
+                const grace = markChannel1PostReduceGracePending(args.db, typedInput.sessionID);
+                if (state) {
+                    state.channel1PostReduceGrace = {
+                        pending: true,
+                        preReduceLevel: grace.postReduceGracePreLevel ?? grace.level,
+                    };
+                }
             } catch (error) {
-                sessionLog(typedInput.sessionID, "channel1 reduce reset failed (ignored):", error);
+                sessionLog(
+                    typedInput.sessionID,
+                    "channel1 reduce grace arm failed (ignored):",
+                    error,
+                );
             }
         } else {
             // Channel 1: append an in-turn ctx_reduce nudge when the rendered-tail

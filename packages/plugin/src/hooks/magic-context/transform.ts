@@ -5,6 +5,7 @@ import {
     drainAuthority,
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
+    observeAuthorityRouting,
 } from "../../features/magic-context/context-authority";
 import {
     isLinkedGitWorktree,
@@ -38,7 +39,6 @@ import {
     getOverflowState,
     loadProtectedTailMeta,
     recordOverflowDetected,
-    resetLastNudgeCycleIfTailShrank,
     resetProtectedTailNoEligibleHead,
     setDeferredExecutePendingIfAbsent,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -113,6 +113,7 @@ import { modelAcceptsEmptyContent } from "./sentinel";
 import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
+    snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
 import { injectTemporalMarkers } from "./temporal-awareness";
@@ -121,6 +122,7 @@ import { loadContextUsage, resolveSchedulerDecision } from "./transform-context-
 import { findLastUserMessageId, findSessionId } from "./transform-message-helpers";
 import {
     applyFlushedStatuses,
+    hasRecentAssistantCommit,
     type MessageLike,
     stripStructuralNoise,
     type TagTarget,
@@ -396,6 +398,18 @@ export async function recoverTsAuthorityProject(args: {
         })),
     );
 
+    // A restarted TypeScript host may find a project that is still module-owned.
+    // Record MODULE routing before the authority drain clears its marker so the
+    // later return to TypeScript is legible as a routing transition.
+    if (
+        statuses.some(
+            ({ authority }) =>
+                authority !== null && authority !== undefined && authority.state !== "TS",
+        )
+    ) {
+        observeAuthorityRouting(args.projectPath, "MODULE");
+    }
+
     let drainedDomain = false;
     for (const { domain, authority } of statuses) {
         if (!authority || authority.state === "TS") continue;
@@ -434,6 +448,7 @@ export async function recoverTsAuthorityProject(args: {
     // view re-renders any changes mirrored during recovery.
     if (drainedDomain && !getAuthorityManagedMarker(args.db, args.projectPath)) {
         bumpProjectMemoryEpoch(args.db, args.projectPath);
+        observeAuthorityRouting(args.projectPath, "TS");
         return "completed";
     }
     return "retryable";
@@ -694,6 +709,21 @@ export function createTransform(deps: TransformDeps) {
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
 
+    const observeCommitNudgeTransition = (
+        sessionId: string,
+        hasRecentCommit: boolean,
+        isSubagent: boolean,
+    ): void => {
+        const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
+        const sawCommitLastPass = deps.commitSeenLastPass?.get(sessionId) ?? false;
+        // The first pass establishes a restart-safe baseline. Only a later
+        // absent→present edge is a new commit, and subagents never deliver note nudges.
+        if (!isSubagent && hadPriorCommitState && hasRecentCommit && !sawCommitLastPass) {
+            onNoteTrigger(deps.db, sessionId, "commit_detected");
+        }
+        deps.commitSeenLastPass?.set(sessionId, hasRecentCommit);
+    };
+
     const transform = async (
         _input: Record<string, never>,
         output: { messages: unknown[] },
@@ -833,13 +863,27 @@ export function createTransform(deps: TransformDeps) {
                 sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
                 return;
             }
+            if (!compactionOff) {
+                observeCommitNudgeTransition(
+                    sessionId,
+                    hasRecentAssistantCommit(messages),
+                    sessionMeta.isSubagent,
+                );
+            }
             await rustModeTransform.run(sessionId, messages, output, sessionMeta);
+            // Rust returns before the TypeScript post-pass hook below. Run the
+            // host-owned embedding trigger after either implementation publishes.
+            deps.maybeAutoEmbedSession?.(sessionId);
             return;
         }
 
         // System prompt change detection is handled in experimental.chat.system.transform
         // (see system-prompt-hash.ts), not here. The messages transform only receives
         // user/assistant messages, not the system prompt.
+
+        // Freeze the harness-derived suffix shape before tagging, structural-noise
+        // sentinels, and synthetic injections can alter the live message graph.
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
 
         const reducedMode = sessionMeta.isSubagent;
         const fullFeatureMode = !reducedMode;
@@ -1334,7 +1378,11 @@ export function createTransform(deps: TransformDeps) {
             effectiveExecuteThresholdPercentage,
         });
 
-        const { midTurnAdjustedSchedulerDecision, sideEffect } = applyMidTurnDeferral({
+        const {
+            midTurnAdjustedSchedulerDecision,
+            sideEffect,
+            deferReason: schedulerDeferReason,
+        } = applyMidTurnDeferral({
             base: schedulerDecisionEarly,
             bypassReason,
             midTurn,
@@ -1828,21 +1876,7 @@ export function createTransform(deps: TransformDeps) {
                 messageTagNumbers = result.messageTagNumbers;
                 batch = result.batch;
                 hasRecentReduceCall = result.hasRecentReduceCall;
-                const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
-                const sawCommitLastPass = deps.commitSeenLastPass?.get(sessionId) ?? false;
-                // Only trigger on NEW commits — not on first pass after restart where
-                // we have no baseline. First pass establishes the baseline silently.
-                // Subagents never deliver note nudges (gated in postprocess), so skip
-                // accumulating orphan trigger state.
-                if (
-                    fullFeatureMode &&
-                    hadPriorCommitState &&
-                    result.hasRecentCommit &&
-                    !sawCommitLastPass
-                ) {
-                    onNoteTrigger(db, sessionId, "commit_detected");
-                }
-                deps.commitSeenLastPass?.set(sessionId, result.hasRecentCommit);
+                observeCommitNudgeTransition(sessionId, result.hasRecentCommit, !fullFeatureMode);
                 logTransformTiming(sessionId, "tagMessages", t0);
                 taggingSucceeded = true;
             } catch (error) {
@@ -2172,6 +2206,7 @@ export function createTransform(deps: TransformDeps) {
             contextUsage,
             usableWindow: resolvedContextLimit ?? 0,
             schedulerDecision,
+            schedulerDeferReason,
             fullFeatureMode,
             compactionOff,
             canRunCompartments,
@@ -2217,6 +2252,7 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            trailingBlankSourceDecisions,
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
             m0M1: {
@@ -2230,6 +2266,7 @@ export function createTransform(deps: TransformDeps) {
                 projectPath: projectIdentity,
                 projectDirectory: sessionDirectory,
                 injectDocs: deps.injectDocs,
+                memoryEnabled: deps.memoryConfig?.enabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
                 temporalAwareness: deps.experimentalTemporalAwareness,
@@ -2517,11 +2554,6 @@ export function createTransform(deps: TransformDeps) {
         // cadence and run the existing Channel-2 lease logic.
         const channelBaseline = deps.channel1StateBySession?.get(sessionId);
         if (ctxReduceCallable && !compactionOff && channelBaseline) {
-            const measuredU = Math.min(
-                Math.max(0, channelBaseline.baselineT + channelBaseline.turnDeltaT),
-                Math.max(0, channelBaseline.baselineU + channelBaseline.turnDeltaU),
-            );
-            resetLastNudgeCycleIfTailShrank(db, sessionId, measuredU);
             if (
                 channelBaseline.evaluable &&
                 !channelBaseline.generationInvalidated &&

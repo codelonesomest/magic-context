@@ -17,7 +17,10 @@ import {
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
-import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import {
+    getMagicContextStorageDir,
+    getMagicContextStorageResolution,
+} from "@magic-context/core/shared/data-path";
 import {
     isPrototypePollutionKey,
     sanitizeParsedJson,
@@ -41,6 +44,7 @@ import {
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
     formatLocalEmbeddingRuntimeWasmFallback,
+    formatLocalEmbeddingRuntimeWasmSelected,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import {
@@ -625,8 +629,10 @@ async function runHealthChecks(options: {
         );
     }
 
-    const storageDir = getMagicContextStorageDir();
+    const storage = getMagicContextStorageResolution();
+    const storageDir = storage.path;
     const dbPath = join(storageDir, "context.db");
+    add(results, "info", `Shared storage: ${storageDir} (source: ${storage.source})`);
     const existedBeforeOpen = existsSync(dbPath);
     if (existedBeforeOpen) add(results, "pass", `Shared context DB exists at ${dbPath}`);
     else
@@ -779,12 +785,26 @@ async function runHealthChecks(options: {
         let runtimeReported = false;
         let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
         for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {
-            const runtime = checkLocalEmbeddingRuntimeByResolution(pluginDir);
+            const runtime = checkLocalEmbeddingRuntimeByResolution(
+                pluginDir,
+                process.platform,
+                process.arch,
+                loadedConfig.config.embedding.provider === "local"
+                    ? loadedConfig.config.embedding.local_runtime
+                    : "auto",
+                // Pi runs extensions under Node even when the CLI itself was launched by Bun.
+                { isBun: false, isElectron: false },
+            );
+            if (runtime.state === "wasm-selected") {
+                add(results, "info", formatLocalEmbeddingRuntimeWasmSelected(runtime));
+                runtimeReported = true;
+                break;
+            }
             if (runtime.state === "ok") {
                 add(
                     results,
                     "pass",
-                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime OK)`,
+                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime selected and OK)`,
                 );
                 runtimeReported = true;
                 break;
@@ -805,7 +825,7 @@ async function runHealthChecks(options: {
             add(
                 results,
                 "warn",
-                `Embedding provider ${loadedConfig.config.embedding.provider}: native runtime unverified (${runtimeUnverifiedReason})`,
+                `Embedding provider ${loadedConfig.config.embedding.provider}: selected runtime unverified (${runtimeUnverifiedReason})`,
             );
         }
     }

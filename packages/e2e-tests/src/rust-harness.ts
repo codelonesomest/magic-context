@@ -77,7 +77,7 @@ export interface SdkClient {
                 parts: Array<{ type: "text"; text: string }>;
                 agent?: string;
             };
-        }) => Promise<{ data?: unknown }>;
+        }) => Promise<{ data?: unknown; error?: unknown }>;
         revert: (opts: {
             path: { id: string };
             body: { messageID: string; partID?: string };
@@ -132,6 +132,7 @@ export class RustTestHarness {
     private modelContextLimit: number | undefined;
     private mockDefault: MockResponse;
     private readonly mockBaseURL: string;
+    private readonly historianProducerAvailable: boolean;
 
     private constructor(args: {
         mock: MockProvider;
@@ -143,6 +144,7 @@ export class RustTestHarness {
         logPath: string;
         modelContextLimit: number | undefined;
         mockDefault: MockResponse;
+        historianProducerAvailable: boolean;
     }) {
         this.mock = args.mock;
         this.mockBaseURL = args.mockBaseURL;
@@ -153,6 +155,7 @@ export class RustTestHarness {
         this.logPath = args.logPath;
         this.modelContextLimit = args.modelContextLimit;
         this.mockDefault = args.mockDefault;
+        this.historianProducerAvailable = args.historianProducerAvailable;
     }
 
     /**
@@ -222,6 +225,7 @@ export class RustTestHarness {
             logPath,
             modelContextLimit: options.modelContextLimit,
             mockDefault,
+            historianProducerAvailable: options.startHistorianProducer ?? true,
         });
     }
 
@@ -238,7 +242,12 @@ export class RustTestHarness {
             existingEnv: args.env,
             modelContextLimit: args.options.modelContextLimit,
             openCodeConfigExtra: args.options.openCodeConfigExtra,
-            magicContextConfig: args.options.magicContextConfig,
+            magicContextConfig: {
+                ...(args.options.startHistorianProducer ?? true
+                    ? { historian: { opencode: { model: "mock-anthropic/mock-sonnet" } } }
+                    : {}),
+                ...(args.options.magicContextConfig ?? {}),
+            },
             // The connection_file value is only used to flip `userTierHasSubc`
             // true (the resolver gate). The actual transport still reads the
             // DEFAULT connection path — which this same file happens to be.
@@ -282,6 +291,7 @@ export class RustTestHarness {
             options: {
                 modelContextLimit: this.modelContextLimit,
                 magicContextConfig: opts.magicContextConfig,
+                startHistorianProducer: this.historianProducerAvailable,
             },
             rustMode: opts.rust ?? true,
         });
@@ -455,6 +465,14 @@ export class RustTestHarness {
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencodeInstance
                     .stderr()
                     .slice(-2000)}\nmodule log:\n${this.subc.moduleLog().slice(-2000)}`,
+            );
+        }
+        if (result.data === undefined) {
+            throw new Error(
+                `sendPrompt returned without session data: ${JSON.stringify(result.error ?? null)}\n` +
+                    `stdout:\n${this.opencodeInstance.stdout().slice(-2000)}\n` +
+                    `stderr:\n${this.opencodeInstance.stderr().slice(-2000)}\n` +
+                    `module log:\n${this.subc.moduleLog().slice(-2000)}`,
             );
         }
         return result;

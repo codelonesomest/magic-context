@@ -2,9 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { resolveHistorianModel } from "../shared/model-resolution";
+import { createTestTempDir } from "../shared/test-temp-dir";
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
 import { resolveConfigProfile } from "./profiles";
+import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "./schema/magic-context";
 import { RUST_COMPACTION_OFF_WARNING } from "./transform-mode";
 
 /**
@@ -109,6 +112,44 @@ function loadWithUserAndProjectConfig(
         }
     }
 }
+
+describe("loadPluginConfig — preload user-config isolation", () => {
+    it("resolves schema-default embedding config for a fixture with no config (#388)", () => {
+        const projectDir = mkdtempSync(join(tmpdir(), "mc-config-preload-fixture-"));
+        try {
+            // The test preload owns this default. A per-test XDG_CONFIG_HOME assignment
+            // still overrides it through loadWithUserConfig below.
+            expect(process.env.XDG_CONFIG_HOME).toContain("mc-plugin-test-xdg-pid-");
+            expect(loadPluginConfig(projectDir).embedding).toEqual({
+                provider: "local",
+                model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+                local_runtime: "auto",
+            });
+        } finally {
+            rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
+
+    it("allows a test-scoped XDG_CONFIG_HOME to override the preload default", () => {
+        const preloadConfigHome = process.env.XDG_CONFIG_HOME;
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "https://fixture.example/v1",
+                    model: "fixture-model",
+                },
+            }),
+        );
+
+        expect(result.embedding).toMatchObject({
+            provider: "openai-compatible",
+            endpoint: "https://fixture.example/v1",
+            model: "fixture-model",
+        });
+        expect(process.env.XDG_CONFIG_HOME).toBe(preloadConfigHome);
+    });
+});
 
 describe("loadPluginConfig — graduated mural config", () => {
     it("adopts legacy experimental.mural at the top-level and warns once", () => {
@@ -655,7 +696,8 @@ describe("loadPluginConfig — legacy agent enabled migration", () => {
 
 describe("loadPluginConfig — variable expansion scope", () => {
     it("keeps {env:} and {file:} expansion enabled for user config", () => {
-        const secretFile = join(mkdtempSync(join(tmpdir(), "mc-config-secret-")), "secret.txt");
+        const { dir: secretDir, cleanup } = createTestTempDir("mc-config-secret-");
+        const secretFile = join(secretDir, "secret.txt");
         writeFileSync(secretFile, "file-secret", "utf-8");
 
         try {
@@ -677,12 +719,13 @@ describe("loadPluginConfig — variable expansion scope", () => {
             }
             expect(result.configWarnings).toBeUndefined();
         } finally {
-            rmSync(secretFile, { force: true });
+            cleanup();
         }
     });
 
     it("leaves {env:} and {file:} tokens literal in project config and warns", () => {
-        const secretFile = join(mkdtempSync(join(tmpdir(), "mc-config-secret-")), "secret.txt");
+        const { dir: secretDir, cleanup } = createTestTempDir("mc-config-secret-");
+        const secretFile = join(secretDir, "secret.txt");
         writeFileSync(secretFile, "project-file-secret", "utf-8");
 
         try {
@@ -705,7 +748,7 @@ describe("loadPluginConfig — variable expansion scope", () => {
             expect(warnings).toContain("security reasons");
             expect(warnings).toContain("embedding.endpoint/provider");
         } finally {
-            rmSync(secretFile, { force: true });
+            cleanup();
         }
     });
 

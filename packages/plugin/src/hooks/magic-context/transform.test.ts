@@ -142,6 +142,36 @@ function toolOutput(message: TestMessage, index: number): string {
 }
 
 describe("createTransform", () => {
+    it("keeps the raw array untouched when session metadata is unreadable", async () => {
+        useTempDataHome("context-transform-meta-fault-");
+        const db = openDatabase();
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => "execute" as const) },
+            contextUsageMap: new Map<string, { usage: ContextUsage; updatedAt: number }>(),
+            db,
+            historyRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTags: 0,
+        });
+        const messages: TestMessage[] = [
+            {
+                info: { id: "meta-fault-user", role: "user", sessionID: "ses-meta-fault" },
+                parts: [{ type: "text", text: "raw must survive" }],
+            },
+        ];
+        const original = structuredClone(messages);
+        const output = { messages };
+        db.exec("DROP TABLE session_meta");
+
+        await transform({}, output);
+
+        expect(output.messages).toBe(messages);
+        expect(messages).toEqual(original);
+    });
+
     it("persists distinct TypeScript transform decision reasons from ordinary passes", async () => {
         useTempDataHome("context-transform-decision-fence-");
         const sessionId = "ses-transform-decision-fence";
@@ -1080,9 +1110,12 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — main transform stripped step-start with the recovered provider,
-        // and postprocess used that same provider for the whole-message sentinel.
-        expect(messages[1].parts[1]).toEqual({ type: "text", text: "" });
+        //#then — main transform strips the step-start with the recovered provider.
+        // The raw suffix decision is `strip`, so postprocess also removes that
+        // Magic Context sentinel instead of freezing it as a provider blank.
+        expect(messages[1].parts).toHaveLength(1);
+        expect(messages[1].parts[0]).toMatchObject({ type: "text" });
+        expect(messages[1].parts[0]?.text).toContain("visible");
         expect(messages[2].parts).toEqual([{ type: "text", text: "" }]);
     });
 
@@ -1634,7 +1667,7 @@ describe("createTransform", () => {
         expect(channel1StateBySession.has("ses-sub-ch1")).toBe(true);
     });
 
-    it("resets the persisted Channel 1 band when baseline refresh sees a smaller tail", async () => {
+    it("preserves Channel 1 crossing state when a baseline refresh sees a smaller tail", async () => {
         useTempDataHome("context-transform-band-reset-");
         const sessionId = "ses-band-reset";
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
@@ -1675,13 +1708,15 @@ describe("createTransform", () => {
             },
         );
 
-        expect(getLastNudgeUndropped(db, sessionId)).toBe(0);
-        expect(getChannel1NudgeState(db, sessionId)).toEqual({ level: "", ordinal: 0 });
+        // The next tool-output decision observes a lower band and rearms it.
+        // Clearing here would turn the same post-reduce band into a full crossing.
+        expect(getLastNudgeUndropped(db, sessionId)).toBe(80_000);
+        expect(getChannel1NudgeState(db, sessionId)).toEqual({ level: "urgent", ordinal: 12 });
         expect(
             db
                 .prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?")
                 .get(sessionId),
-        ).toEqual({ last_nudge_level: '{"level":"","ordinal":0}' });
+        ).toEqual({ last_nudge_level: '{"level":"urgent","ordinal":12}' });
     });
 
     it("Unit B: primary without callable ctx_reduce gets NO Channel 1 baseline (latent-gap fix)", async () => {
@@ -3039,6 +3074,121 @@ describe("createTransform historian failure handling", () => {
 
         expect(abort).not.toHaveBeenCalled();
         expect(emergencyNotifications).toHaveLength(0);
+    });
+
+    it("escalates a latched force-pressure episode to provider-overflow fail-closed recovery", async () => {
+        useTempDataHome("transform-latched-episode-liveness-");
+        const sessionId = "ses-latched-episode-liveness";
+        createOpenCodeDbForTransform(sessionId, [
+            { id: "m-raw-1", role: "user", text: "recent protected history" },
+        ]);
+        await refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "test-provider",
+                                models: { "episode-100k": { limit: { input: 100_000 } } },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+        const db = openDatabase();
+        const abort = mock(async () => ({ data: true }));
+        const prompt = mock(async () => ({}));
+        const usage = new Map<string, { usage: ContextUsage; updatedAt: number }>();
+        const setUsage = (percentage: number, inputTokens: number) => {
+            usage.set(sessionId, {
+                usage: { percentage, inputTokens },
+                updatedAt: Date.now(),
+            });
+        };
+        const buildMessages = () => {
+            const toolParts = Array.from({ length: 30 }, (_, index) => ({
+                type: "tool" as const,
+                tool: "bash",
+                callID: `call-${index + 1}`,
+                state: {
+                    status: "completed",
+                    output: "x".repeat(12_000),
+                },
+            }));
+            return [
+                {
+                    info: {
+                        id: "m-user",
+                        role: "user",
+                        sessionID: sessionId,
+                    },
+                    parts: [{ type: "text" as const, text: "continue" }],
+                },
+                {
+                    info: {
+                        id: "m-assistant",
+                        role: "assistant",
+                        providerID: "test-provider",
+                        modelID: "episode-100k",
+                    },
+                    parts: toolParts,
+                },
+            ];
+        };
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => "defer" as const) },
+            contextUsageMap: usage,
+            db,
+            historyRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTags: 0,
+            client: {
+                session: {
+                    get: mock(async () => ({ data: { directory: "/tmp", title: "Episode" } })),
+                    prompt,
+                    abort,
+                },
+            } as unknown as PluginContext["client"],
+            directory: "/tmp",
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "test-provider", modelID: "episode-100k" }],
+            ]),
+            getModelKey: () => "test-provider/episode-100k",
+        });
+        const droppedToolCount = () =>
+            getTagsBySession(db, sessionId).filter(
+                (tag) => tag.type === "tool" && tag.status === "dropped",
+            ).length;
+
+        setUsage(10, 10_000);
+        await transform({}, { messages: buildMessages() });
+        setEmergencyDropSample(db, sessionId, 90_000);
+        setUsage(90, 90_000);
+        await transform({}, { messages: buildMessages() });
+        expect(droppedToolCount()).toBe(0);
+        expect(getEmergencyInputSample(db, sessionId)).toBeGreaterThan(0);
+
+        setUsage(94, 94_000);
+        await transform({}, { messages: buildMessages() });
+        expect(droppedToolCount()).toBe(0);
+        expect(abort).not.toHaveBeenCalled();
+
+        recordOverflowDetected(
+            db,
+            sessionId,
+            100_000,
+            "test-provider/episode-100k",
+            "provider_overflow",
+        );
+        setUsage(96, 96_000);
+        await transform({}, { messages: buildMessages() });
+
+        expect(abort).toHaveBeenCalledTimes(1);
+        expect(getEmergencyInputSample(db, sessionId)).toBe(0);
     });
 
     it("notifies before awaiting self-abort for provider-proven overflow", async () => {

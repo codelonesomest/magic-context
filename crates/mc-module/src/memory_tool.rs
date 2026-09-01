@@ -105,11 +105,19 @@ pub struct MemorySearchResult {
     /// compartment sequence for compartment results, and note id for note results.
     pub id: i64,
     pub snippet: String,
+    /// Integer hundredths keep sorting and rendered `score=N.NN` deterministic.
+    pub score_hundredths: i64,
     pub category: Option<String>,
     pub sequence: Option<i64>,
     pub title: Option<String>,
+    pub start_ordinal: Option<i64>,
+    pub end_ordinal: Option<i64>,
     pub note_status: Option<String>,
     pub surface_condition: Option<String>,
+    pub note_created_at_ms: Option<i64>,
+    pub note_anchor_ordinal: Option<i64>,
+    pub note_session_id: Option<String>,
+    pub source_project_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -117,6 +125,32 @@ struct RankedSearchResult {
     result: MemorySearchResult,
     rank: u8,
     recency: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MemorySearchOptions<'a> {
+    pub limit: usize,
+    pub include_memories: bool,
+    pub include_messages: bool,
+    pub include_notes: bool,
+    pub excluded_memory_ids: &'a BTreeSet<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemorySearchDiagnostics {
+    pub suppressed_visible_memory_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySearchOutcome {
+    pub results: Vec<MemorySearchResult>,
+    pub diagnostics: MemorySearchDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryIdSearchOutcome {
+    pub results: Option<Vec<MemorySearchResult>>,
+    pub diagnostics: MemorySearchDiagnostics,
 }
 
 /// Update an owned, primary (active/permanent and not superseded) memory.
@@ -300,9 +334,9 @@ pub fn search_memories_and_compartments(
     )
 }
 
-/// Keyword search over visible project memories and the resolved session's compartments.
-/// Ranking is intentionally simple and honest: memory content substring hits first, then
-/// compartment-title hits, then compartment body/tier-text hits; recency breaks ties.
+/// Keyword search over the corpora the module store actually owns: visible project memories,
+/// durable compartment summaries, and notes. The facade layer maps compartments to the shared
+/// `message` source vocabulary; raw message, Primer, and git-commit indexes do not exist here.
 pub fn search_memories_and_compartments_for_session(
     store: &McStore,
     project_path: &str,
@@ -311,32 +345,85 @@ pub fn search_memories_and_compartments_for_session(
     limit: usize,
     include_memories: bool,
 ) -> Result<Vec<MemorySearchResult>, MemoryToolError> {
+    let excluded_memory_ids = BTreeSet::new();
+    search_available_corpora_for_session(
+        store,
+        project_path,
+        session_id,
+        query,
+        MemorySearchOptions {
+            limit,
+            include_memories,
+            include_messages: true,
+            include_notes: true,
+            excluded_memory_ids: &excluded_memory_ids,
+        },
+    )
+}
+
+pub fn search_available_corpora_for_session(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    query: &str,
+    options: MemorySearchOptions<'_>,
+) -> Result<Vec<MemorySearchResult>, MemoryToolError> {
+    Ok(search_available_corpora_for_session_with_diagnostics(
+        store,
+        project_path,
+        session_id,
+        query,
+        options,
+    )?
+    .results)
+}
+
+pub fn search_available_corpora_for_session_with_diagnostics(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    query: &str,
+    options: MemorySearchOptions<'_>,
+) -> Result<MemorySearchOutcome, MemoryToolError> {
     let query = query.trim();
-    if query.is_empty() || limit == 0 {
-        return Ok(Vec::new());
+    if query.is_empty() || options.limit == 0 {
+        return Ok(MemorySearchOutcome {
+            results: Vec::new(),
+            diagnostics: MemorySearchDiagnostics::default(),
+        });
     }
 
     let mut ranked = Vec::new();
-    if include_memories {
+    let mut suppressed_visible_memory_ids = Vec::new();
+    if options.include_memories {
         for memory in store.search_visible_memory_contents(project_path, query)? {
-            if first_match(&memory.content, query).is_some() {
-                ranked.push(memory_search_hit(memory, query));
+            if first_match(&memory.content, query).is_none() {
+                continue;
+            }
+            if options.excluded_memory_ids.contains(&memory.id) {
+                suppressed_visible_memory_ids.push(memory.id);
+                continue;
+            }
+            ranked.push(memory_search_hit(memory, query));
+        }
+    }
+    if options.include_messages {
+        for compartment in store.search_compartments_like(session_id, query)? {
+            if let Some(hit) = compartment_search_hit(compartment, query) {
+                ranked.push(hit);
             }
         }
     }
-    for compartment in store.search_compartments_like(session_id, query)? {
-        if let Some(hit) = compartment_search_hit(compartment, query) {
-            ranked.push(hit);
-        }
-    }
-    for note in store.search_notes_like(project_path, session_id, query)? {
-        if first_match(&note.content, query).is_some()
-            || note
-                .surface_condition
-                .as_deref()
-                .is_some_and(|condition| first_match(condition, query).is_some())
-        {
-            ranked.push(note_search_hit(note, query));
+    if options.include_notes {
+        for note in store.search_notes_like(project_path, session_id, query)? {
+            if first_match(&note.content, query).is_some()
+                || note
+                    .surface_condition
+                    .as_deref()
+                    .is_some_and(|condition| first_match(condition, query).is_some())
+            {
+                ranked.push(note_search_hit(note, query));
+            }
         }
     }
 
@@ -346,8 +433,93 @@ pub fn search_memories_and_compartments_for_session(
             .then_with(|| right.recency.cmp(&left.recency))
             .then_with(|| left.result.id.cmp(&right.result.id))
     });
-    ranked.truncate(limit);
-    Ok(ranked.into_iter().map(|r| r.result).collect())
+    ranked.truncate(options.limit);
+    suppressed_visible_memory_ids.sort_unstable();
+    Ok(MemorySearchOutcome {
+        results: ranked.into_iter().map(|ranked| ranked.result).collect(),
+        diagnostics: MemorySearchDiagnostics {
+            suppressed_visible_memory_ids,
+        },
+    })
+}
+
+/// Resolve a whole-query memory-id list through the same visibility rules as keyword search,
+/// excluding memories already rendered in the current prompt. `None` means no id resolved, so
+/// the caller should fall through to lexical search.
+pub fn resolve_memory_ids_for_search(
+    store: &McStore,
+    project_path: &str,
+    ids: &[i64],
+    limit: usize,
+    excluded_memory_ids: &BTreeSet<i64>,
+) -> Result<Option<Vec<MemorySearchResult>>, MemoryToolError> {
+    Ok(resolve_memory_ids_for_search_with_diagnostics(
+        store,
+        project_path,
+        ids,
+        limit,
+        excluded_memory_ids,
+    )?
+    .results)
+}
+
+pub fn resolve_memory_ids_for_search_with_diagnostics(
+    store: &McStore,
+    project_path: &str,
+    ids: &[i64],
+    limit: usize,
+    excluded_memory_ids: &BTreeSet<i64>,
+) -> Result<MemoryIdSearchOutcome, MemoryToolError> {
+    if ids.is_empty() || limit == 0 {
+        return Ok(MemoryIdSearchOutcome {
+            results: None,
+            diagnostics: MemorySearchDiagnostics::default(),
+        });
+    }
+    let visible = store.get_visible_memories_by_ids(project_path, ids)?;
+    let mut results = Vec::new();
+    let mut suppressed_visible_memory_ids = Vec::new();
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(*id) {
+            continue;
+        }
+        let Some(memory) = visible.get(id) else {
+            continue;
+        };
+        if excluded_memory_ids.contains(id) {
+            suppressed_visible_memory_ids.push(*id);
+            continue;
+        }
+        let rank = i64::try_from(results.len()).unwrap_or(i64::MAX);
+        results.push(MemorySearchResult {
+            source_kind: MemorySearchSourceKind::Memory,
+            id: memory.id,
+            snippet: preview_text(&memory.content),
+            score_hundredths: (100 - rank).max(0),
+            category: Some(memory.category.clone()),
+            sequence: None,
+            title: None,
+            start_ordinal: None,
+            end_ordinal: None,
+            note_status: None,
+            surface_condition: None,
+            note_created_at_ms: None,
+            note_anchor_ordinal: None,
+            note_session_id: None,
+            source_project_path: Some(memory.project_path.clone()),
+        });
+        if results.len() >= limit {
+            break;
+        }
+    }
+    suppressed_visible_memory_ids.sort_unstable();
+    Ok(MemoryIdSearchOutcome {
+        results: (!results.is_empty()).then_some(results),
+        diagnostics: MemorySearchDiagnostics {
+            suppressed_visible_memory_ids,
+        },
+    })
 }
 
 fn load_owned_memory(
@@ -396,11 +568,18 @@ fn memory_search_hit(memory: StoredMemorySearchRow, query: &str) -> RankedSearch
             source_kind: MemorySearchSourceKind::Memory,
             id: memory.id,
             snippet: snippet_around_match(&memory.content, query),
+            score_hundredths: 100,
             category: Some(memory.category),
             sequence: None,
             title: None,
+            start_ordinal: None,
+            end_ordinal: None,
             note_status: None,
             surface_condition: None,
+            note_created_at_ms: None,
+            note_anchor_ordinal: None,
+            note_session_id: None,
+            source_project_path: Some(memory.project_path),
         },
     }
 }
@@ -420,11 +599,18 @@ fn note_search_hit(note: StoredNoteSearchRow, query: &str) -> RankedSearchResult
             source_kind: MemorySearchSourceKind::Note,
             id: note.id,
             snippet: snippet_around_match(matched_text, query),
+            score_hundredths: 95,
             category: None,
             sequence: None,
             title: None,
+            start_ordinal: None,
+            end_ordinal: None,
             note_status: Some(note.status),
             surface_condition: note.surface_condition,
+            note_created_at_ms: Some(note.created_at_ms),
+            note_anchor_ordinal: note.anchor_ordinal,
+            note_session_id: Some(note.session_id),
+            source_project_path: None,
         },
     }
 }
@@ -441,11 +627,18 @@ fn compartment_search_hit(
                 source_kind: MemorySearchSourceKind::CompartmentTitle,
                 id: compartment.sequence,
                 snippet: snippet_around_match(&compartment.title, query),
+                score_hundredths: 95,
                 category: None,
                 sequence: Some(compartment.sequence),
                 title: Some(compartment.title),
+                start_ordinal: Some(compartment.start_ordinal),
+                end_ordinal: Some(compartment.end_ordinal),
                 note_status: None,
                 surface_condition: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
         });
     }
@@ -458,11 +651,18 @@ fn compartment_search_hit(
             source_kind: MemorySearchSourceKind::CompartmentBody,
             id: compartment.sequence,
             snippet: snippet_around_match(&body, query),
+            score_hundredths: 90,
             category: None,
             sequence: Some(compartment.sequence),
             title: Some(compartment.title),
+            start_ordinal: Some(compartment.start_ordinal),
+            end_ordinal: Some(compartment.end_ordinal),
             note_status: None,
             surface_condition: None,
+            note_created_at_ms: None,
+            note_anchor_ordinal: None,
+            note_session_id: None,
+            source_project_path: None,
         },
     })
 }
@@ -491,6 +691,22 @@ fn push_unique_text(parts: &mut Vec<String>, text: &str) {
 
 fn first_match(text: &str, query: &str) -> Option<usize> {
     text.to_lowercase().find(&query.to_lowercase())
+}
+
+fn preview_text(text: &str) -> String {
+    const LIMIT: usize = 220;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= LIMIT {
+        return normalized;
+    }
+    let mut preview = normalized
+        .chars()
+        .take(LIMIT - 1)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    preview.push('…');
+    preview
 }
 
 fn snippet_around_match(text: &str, query: &str) -> String {

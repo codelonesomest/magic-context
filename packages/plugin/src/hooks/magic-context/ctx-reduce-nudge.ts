@@ -13,20 +13,10 @@ export interface ToolReclaimHint {
     toolName: string | null;
 }
 
-export interface Channel1State {
-    baselineU: number;
-    baselineT: number;
-    turnDeltaU: number;
-    turnDeltaT: number;
+export interface Channel1State extends TailHygieneBaseline {
     usableWindow: number;
     /** Monotonic count of real (not Magic Context-injected) user turns in this pass. */
     realUserTurnCount: number;
-    baselineGeneration: number;
-    computedAt: number;
-    evaluable: boolean;
-    generationInvalidated: boolean;
-    baselineParts: TailHygienePartMeasurement[];
-    contentSignature: string;
     reducedSinceRefresh: boolean;
     /** Do not trigger a reduction nudge on the pass that applied queued agent drops. */
     agentDropsAppliedThisPass?: boolean;
@@ -78,12 +68,17 @@ export interface TailTokenEstimate {
 
 export interface Channel1Decision {
     fire: boolean;
+    /** Re-fires inside an already-observed band always use the calm one-line copy. */
+    sticky: boolean;
     level: Channel1Level;
     undroppedTokens: number;
     tailTokens: number;
     severity: number;
     nextLastNudge: number;
+    /** The currently observed band, not merely the last band that emitted copy. */
     nextLastNudgeLevel: Channel1Level | "";
+    /** True once post-reduce grace has ended and its durable fields should be cleared. */
+    clearPostReduceGrace: boolean;
 }
 
 export function decideChannel1(input: {
@@ -93,50 +88,102 @@ export function decideChannel1(input: {
     turnDeltaT: number;
     lastNudgeUndropped: number;
     lastNudgeLevel: Channel1Level | "";
+    lastFireOrdinal?: number;
+    currentRealUserTurnCount?: number;
     hasRecentReduce: boolean;
+    postReduceGracePending?: boolean;
+    postReduceGraceBaselineU?: number;
+    postReduceGracePreLevel?: Channel1Level | "";
     evaluable?: boolean;
     generationInvalidated?: boolean;
 }): Channel1Decision {
     const tailTokens = Math.max(0, input.baselineT + input.turnDeltaT);
     const undroppedTokens = Math.min(tailTokens, Math.max(0, input.baselineU + input.turnDeltaU));
     const severity = Math.min(1, Math.max(0, undroppedTokens / Math.max(tailTokens, 1)));
-    const resetCycle = input.hasRecentReduce || undroppedTokens < input.lastNudgeUndropped;
-    const lastNudge = resetCycle ? 0 : input.lastNudgeUndropped;
-    const lastLevel = resetCycle ? "" : input.lastNudgeLevel;
-    const quiet = (): Channel1Decision => ({
+    const previousLevel = input.lastNudgeLevel;
+    let lastNudge = Math.max(0, input.lastNudgeUndropped);
+    let nextLevel = previousLevel;
+    let clearPostReduceGrace = false;
+    const quiet = (level: Channel1Level = "gentle"): Channel1Decision => ({
         fire: false,
-        level: "gentle",
+        sticky: false,
+        level,
         undroppedTokens,
         tailTokens,
         severity,
         nextLastNudge: lastNudge,
-        nextLastNudgeLevel: lastLevel,
+        nextLastNudgeLevel: nextLevel,
+        clearPostReduceGrace,
     });
 
     if (input.evaluable === false || input.generationInvalidated === true) return quiet();
-    if (input.hasRecentReduce) return quiet();
-    if (tailTokens < CHANNEL1_MIN_TOKENS) return quiet();
-    if (undroppedTokens < CHANNEL1_FLOOR_TOKENS || undroppedTokens === 0) return quiet();
-    if (severity < S_GENTLE) return quiet();
+    // The dirty in-memory baseline and a grace-pending durable blob both lack the
+    // post-drop U needed to start the grace interval safely.
+    if (input.hasRecentReduce || input.postReduceGracePending) return quiet();
 
-    let level: Channel1Level;
-    if (severity >= S_URGENT) level = "urgent";
-    else if (severity >= S_FIRM) level = "firm";
-    else level = "gentle";
+    let level: Channel1Level | "" = "";
+    if (
+        tailTokens >= CHANNEL1_MIN_TOKENS &&
+        undroppedTokens >= CHANNEL1_FLOOR_TOKENS &&
+        severity >= S_GENTLE
+    ) {
+        if (severity >= S_URGENT) level = "urgent";
+        else if (severity >= S_FIRM) level = "firm";
+        else level = "gentle";
+    }
 
-    const escalated = lastLevel === "" || LEVEL_RANK[level] > LEVEL_RANK[lastLevel];
+    const previousRank = previousLevel === "" ? 0 : LEVEL_RANK[previousLevel];
+    const currentRank = level === "" ? 0 : LEVEL_RANK[level];
+    const graceBaseline = input.postReduceGraceBaselineU;
+    if (graceBaseline !== undefined) {
+        const preReduceLevel = input.postReduceGracePreLevel ?? previousLevel;
+        const preReduceRank = preReduceLevel === "" ? 0 : LEVEL_RANK[preReduceLevel];
+        const regrowthReached =
+            undroppedTokens - Math.max(0, graceBaseline) >= channel1RefireTokens(tailTokens);
+        const escalatedAbovePreReduceBand = currentRank > preReduceRank;
+        if (!regrowthReached && !escalatedAbovePreReduceBand) {
+            return quiet(level === "" ? "gentle" : level);
+        }
+        clearPostReduceGrace = true;
+    }
+
+    if (level === "") {
+        nextLevel = "";
+        lastNudge = 0;
+        return quiet();
+    }
+
+    // A drop into a lower band is an observation, not a fresh crossing. Recording
+    // it quietly lets a later upward transition render one full reminder again.
+    if (currentRank < previousRank) {
+        nextLevel = level;
+        lastNudge = undroppedTokens;
+        return quiet(level);
+    }
+
+    const crossedFromBelow = currentRank > previousRank;
     const cadenceReached =
-        lastLevel !== "" && undroppedTokens - lastNudge >= channel1RefireTokens(tailTokens);
-    if (!escalated && !cadenceReached) return quiet();
+        currentRank === previousRank &&
+        undroppedTokens - lastNudge >= channel1RefireTokens(tailTokens);
+    const currentTurn = input.currentRealUserTurnCount;
+    const lastFireTurn = input.lastFireOrdinal;
+    const stickyTurnGapReached =
+        currentTurn === undefined ||
+        lastFireTurn === undefined ||
+        lastFireTurn > currentTurn ||
+        currentTurn - lastFireTurn >= CHANNEL1_STICKY_REAL_USER_TURN_GAP;
+    if (!crossedFromBelow && (!cadenceReached || !stickyTurnGapReached)) return quiet(level);
 
     return {
         fire: true,
+        sticky: !crossedFromBelow,
         level,
         undroppedTokens,
         tailTokens,
         severity,
         nextLastNudge: undroppedTokens,
         nextLastNudgeLevel: level,
+        clearPostReduceGrace,
     };
 }
 
@@ -204,23 +251,34 @@ function formatOldestReclaimableHint(hint?: readonly ToolReclaimHint[]): string 
     return rendered.length > 0 ? `\noldest reclaimable: ${rendered}.` : "";
 }
 
+export function reclaimableToolOutputCount(parts: readonly TailHygienePartMeasurement[]): number {
+    return parts.filter((part) => part.kind === "toolOutput" && part.uTokens > 0).length;
+}
+
+function formatReclaimableOutputSummary(count: number, tokens: number): string {
+    const outputCount = Math.max(0, Math.floor(count));
+    const outputs =
+        outputCount === 0
+            ? "spent tool outputs"
+            : `${outputCount} spent tool output${outputCount === 1 ? "" : "s"}`;
+    return `${outputs} (~${approxThousands(tokens)} tokens)`;
+}
+
 export function buildChannel2Reminder(
     undroppedTokens: number,
-    usableWindowTokens: number,
+    reclaimableToolOutputs: number,
     hint?: readonly ToolReclaimHint[],
 ): string {
-    const amount = approxThousands(undroppedTokens);
-    const usableWindow = approxThousands(usableWindowTokens);
+    const summary = formatReclaimableOutputSummary(reclaimableToolOutputs, undroppedTokens);
     const hintText = formatOldestReclaimableHint(hint);
     return (
         `<system-reminder>\n` +
-        `Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. ` +
-        `Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~${amount} of ~${usableWindow} reclaimable).${hintText}\n` +
+        `Routine housekeeping: ${summary} are reclaimable — make a ctx_reduce pass at a natural stopping point.${hintText}\n` +
         `</system-reminder>`
     );
 }
 
-export const CHANNEL1_STICKY_REAL_USER_TURN_GAP = 3;
+export const CHANNEL1_STICKY_REAL_USER_TURN_GAP = 5;
 
 export function shouldUseStickyChannel1Reminder(input: {
     lastLevel: Channel1Level | "";
@@ -228,49 +286,34 @@ export function shouldUseStickyChannel1Reminder(input: {
     level: Channel1Level;
     currentRealUserTurnCount: number;
 }): boolean {
-    // Never-fired is encoded by an empty lastLevel, never by ordinal zero: a
-    // conversation whose window holds no real user rows (a pure tool stream)
-    // legitimately fires at count 0 and must still dampen its re-fires.
-    if (input.lastLevel !== input.level) return false;
-    // Older persisted blobs wrote a raw message ordinal. That value is larger
-    // than the real-user counter whenever synthetic rows intervened, so expire
-    // the incomparable state once and overwrite it on this fire.
-    if (input.lastOrdinal > input.currentRealUserTurnCount) return false;
-    const gap = input.currentRealUserTurnCount - input.lastOrdinal;
-    return gap >= 0 && gap < CHANNEL1_STICKY_REAL_USER_TURN_GAP;
+    // The ordinal controls whether a same-band reminder may fire; it never
+    // promotes a re-fire back to imperative copy after the crossing was shown.
+    return input.lastLevel === input.level;
 }
 
 export function buildChannel1Reminder(
     level: Channel1Level,
     undroppedTokens: number,
-    usableWindowTokens: number,
+    reclaimableToolOutputs: number,
     hint?: readonly ToolReclaimHint[],
     sticky = false,
 ): string {
+    const summary = formatReclaimableOutputSummary(reclaimableToolOutputs, undroppedTokens);
     const hintText = formatOldestReclaimableHint(hint);
     if (sticky) {
-        return `\n\n<system-reminder>\nReminder: ctx_reduce housekeeping still pending —${hintText}\n</system-reminder>`;
+        return `\n\n<system-reminder>\nReminder: ${summary} are still reclaimable — ctx_reduce them at a natural stopping point.${hintText}\n</system-reminder>`;
     }
 
-    const amount = approxThousands(undroppedTokens);
-    const usableWindow = approxThousands(usableWindowTokens);
     let body: string;
     switch (level) {
         case "gentle":
-            body =
-                `Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. ` +
-                `Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.`;
+            body = `Housekeeping: ${summary} are reclaimable — drop the ones you have already processed with ctx_reduce at a natural stopping point.`;
             break;
         case "firm":
-            body =
-                `Housekeeping: ~${amount} of this session's ~${usableWindow} window is spent tool output. ` +
-                `Drop what you have already processed with ctx_reduce at a natural stopping point. ` +
-                `Not a limit — nothing is lost either way.`;
+            body = `Housekeeping: ${summary} are reclaimable — make a ctx_reduce pass at a natural stopping point.`;
             break;
         case "urgent":
-            body =
-                `Housekeeping backlog: ~${amount} of this session's ~${usableWindow} window is spent tool output — worth a ctx_reduce pass now. ` +
-                `This is routine and lossless; it is never a reason to change scope.`;
+            body = `Housekeeping backlog: ${summary} are reclaimable — a ctx_reduce pass is due.`;
             break;
     }
     return `\n\n<system-reminder>\n${body}${hintText}\n</system-reminder>`;

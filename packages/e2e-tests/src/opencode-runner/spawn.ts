@@ -8,7 +8,14 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    realpathSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { prepareContextDatabase } from "../prepare-context-db";
@@ -96,15 +103,110 @@ export interface SpawnOptions {
 }
 
 /**
- * Pick a random free port by asking the OS for one. Uses Bun.serve + immediate stop.
+ * Orphan containment. Three layers, each covering a failure mode the previous
+ * one cannot reach:
+ *
+ * 1. Children spawn DETACHED into their own process group, and `kill()` signals
+ *    the whole group — so helpers the serve itself forks die with it.
+ * 2. Runner-exit safety net: every live group is tracked module-wide and killed
+ *    synchronously from process exit/signal handlers, covering suites that die
+ *    without running their teardown (thrown errors, SIGINT/SIGTERM).
+ * 3. Startup sweep: a SIGKILLed runner can hook nothing, so the NEXT run reaps
+ *    any `opencode serve` that has reparented to ppid 1 and whose cwd sits under
+ *    an opencode-e2e fixture dir — stale by construction (live runs always have
+ *    a live parent). Without this, each crashed run permanently leaks servers
+ *    (observed: 28 orphans / ~15GB RSS nearly halting the shared host).
  */
-async function pickFreePort(): Promise<number> {
-    const server = Bun.serve({ port: 0, fetch: () => new Response() });
-    const port: number = server.port ?? 0;
-    server.stop(true);
-    if (!port) throw new Error("could not allocate a free port");
-    return port;
+const liveChildGroups = new Set<number>();
+let exitReapersInstalled = false;
+
+function killGroup(pid: number, signal: NodeJS.Signals): void {
+    try {
+        process.kill(-pid, signal);
+    } catch {
+        // Group already gone — fall back to the lone pid in case the child
+        // never became a group leader (spawn raced its own setsid).
+        try {
+            process.kill(pid, signal);
+        } catch {
+            // Already dead: containment goal reached.
+        }
+    }
 }
+
+function installExitReapers(): void {
+    if (exitReapersInstalled) return;
+    exitReapersInstalled = true;
+    // `exit` handlers must stay synchronous; process.kill is.
+    process.once("exit", () => {
+        for (const pid of liveChildGroups) killGroup(pid, "SIGKILL");
+    });
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+        process.once(signal, () => {
+            for (const pid of liveChildGroups) killGroup(pid, "SIGKILL");
+            process.exit(1);
+        });
+    }
+}
+
+// Canonicalize the temp base: macOS tmpdir() returns /var/folders/... but
+// lsof reports process cwds under the resolved /private/var/folders/... —
+// comparing un-canonicalized prefixes silently matches nothing (the Bug #20
+// symlink-lineage class), turning the sweep into a lying instrument.
+const E2E_FIXTURE_PREFIX = join(realpathSync(tmpdir()), "opencode-e2e-");
+let orphanSweepDone = false;
+
+/** cwd of a pid via lsof; null when unreadable (gone or not ours to see). */
+function processCwd(pid: number): string | null {
+    const res = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    if (res.exitCode !== 0) return null;
+    const line = res.stdout
+        .toString()
+        .split("\n")
+        .find((l) => l.startsWith("n"));
+    return line ? line.slice(1) : null;
+}
+
+/**
+ * Reap ppid-1 `opencode serve` orphans left under our fixture prefix by a
+ * previously killed runner. Runs once per test process, before the first spawn.
+ */
+export function sweepOrphanedServes(): number {
+    // Best-effort hygiene: minimal container images (the Docker e2e host) ship
+    // no `ps`, and a fresh PID-namespaced container has no orphans to reap by
+    // construction. Missing tooling must degrade to "nothing swept", never
+    // throw ENOENT into the first spawn of every test file.
+    if (!Bun.which("ps")) return 0;
+    let ps: ReturnType<typeof Bun.spawnSync>;
+    try {
+        ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="]);
+    } catch {
+        return 0;
+    }
+    if (ps.exitCode !== 0 || !ps.stdout) return 0;
+    let reaped = 0;
+    for (const line of ps.stdout.toString().split("\n")) {
+        const m = line.match(/^\s*(\d+)\s+1\s+(.*opencode serve .*)$/);
+        if (!m) continue;
+        const pid = Number(m[1]);
+        const rawCwd = processCwd(pid);
+        if (!rawCwd) continue;
+        let cwd = rawCwd;
+        try {
+            cwd = realpathSync(rawCwd);
+        } catch {
+            // cwd already deleted — an orphan whose fixture dir is gone is still
+            // stale by construction, but without a resolvable path we cannot
+            // prove it is OURS; leave it rather than kill on a guess.
+            continue;
+        }
+        if (!cwd.startsWith(E2E_FIXTURE_PREFIX)) continue;
+        killGroup(pid, "SIGKILL");
+        reaped += 1;
+    }
+    return reaped;
+}
+
 
 /**
  * Create isolated config/data/cache dirs under a unique temp subdir.
@@ -439,6 +541,10 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
               ...opts,
               existingEnv: resources.env,
               userSubcConnectionFile: resources.connectionFile,
+              magicContextConfig: {
+                  historian: { opencode: { model: "mock-anthropic/mock-sonnet" } },
+                  ...(opts.magicContextConfig ?? {}),
+              },
               projectMagicContextConfig: {
                   ...(opts.projectMagicContextConfig ?? {}),
                   transform_mode: "rust",
@@ -449,7 +555,10 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     // Reuse a caller-provided env for the Rust-mode harness (connection file
     // pre-placed, data dir shared across a serve restart); otherwise allocate.
     const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
-    const port = resolvedOpts.port ?? (await pickFreePort());
+    // Let OpenCode keep the listening socket it obtains from port 0. Selecting a
+    // free port in a separate process creates a release/rebind race with sibling
+    // test workers, which surfaces as an opaque ServeError under full-leg load.
+    let port = resolvedOpts.port ?? 0;
 
     if (resolvedOpts.prepareContextDatabase !== false) prepareContextDatabase(env.dataDir);
     writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
@@ -497,22 +606,38 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     childEnv.MAGIC_CONTEXT_LOG_PATH = pluginLogPath;
     const pluginLogStartOffset = existsSync(pluginLogPath) ? statSync(pluginLogPath).size : 0;
 
-    // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
-    // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results
-    // in Bun's `fetch()` timing out even though `curl` succeeds. Binding all
-    // interfaces removes any loopback-specific stack-resolution edge case
-    // (IPv4-only AF_INET vs IPv4-mapped IPv6, AF_UNSPEC name resolution, etc.).
-    // Clients still connect to `127.0.0.1:${port}` — only the listen socket
-    // changes. Safe locally too: process is short-lived, port is random.
+    installExitReapers();
+    if (!orphanSweepDone) {
+        orphanSweepDone = true;
+        sweepOrphanedServes();
+    }
+
+    // Hostname: 0.0.0.0 only on CI — empirically on GitHub-hosted runners,
+    // opencode binding to 127.0.0.1 sometimes results in Bun's `fetch()` timing
+    // out even though `curl` succeeds; binding all interfaces removes the
+    // loopback-specific stack-resolution edge case (IPv4-only AF_INET vs
+    // IPv4-mapped IPv6, AF_UNSPEC name resolution, etc.). Locally we keep the
+    // loopback bind so a leaked process never listens on external interfaces.
+    // Clients always connect to `127.0.0.1:${port}` either way.
+    const listenHost = process.env.CI ? "0.0.0.0" : "127.0.0.1";
+    // `detached: true` gives the child its own process group so kill()/reapers
+    // can signal the entire tree (serve + anything it forks) as one unit.
     const child: ChildProcess = spawn(
         "opencode",
-        ["serve", "--port", String(port), "--hostname", "0.0.0.0"],
+        ["serve", "--port", String(port), "--hostname", listenHost],
         {
             cwd: env.workdir,
             env: childEnv,
             stdio: ["ignore", "pipe", "pipe"],
+            detached: true,
         },
     );
+    if (child.pid) {
+        liveChildGroups.add(child.pid);
+        child.once("exit", () => {
+            if (child.pid) liveChildGroups.delete(child.pid);
+        });
+    }
 
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -523,8 +648,26 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         stderrBuf += chunk.toString();
     });
 
-    const url = `http://127.0.0.1:${port}`;
+    let url = "";
     try {
+        if (port === 0) {
+            const portDeadline = Date.now() + 30_000;
+            while (Date.now() < portDeadline) {
+                const match = stdoutBuf.match(/opencode server listening on https?:\/\/[^:\s]+:(\d+)/);
+                if (match) {
+                    port = Number(match[1]);
+                    break;
+                }
+                if (child.exitCode !== null || child.signalCode !== null) {
+                    throw new Error(`opencode serve exited before reporting its bound port`);
+                }
+                await Bun.sleep(20);
+            }
+            if (port === 0) {
+                throw new Error(`opencode serve did not report its bound port within 30000ms`);
+            }
+        }
+        url = `http://127.0.0.1:${port}`;
         await waitForReady(url, env.workdir, 300_000, {
             expectedMagicContextState: resolvedOpts.expectedMagicContextState,
             pluginLogPath,
@@ -555,11 +698,11 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         rustStack: resources?.stack,
         kill: async () => {
             try {
-                if (child.exitCode === null && child.signalCode === null) {
-                    child.kill("SIGTERM");
+                if (child.exitCode === null && child.signalCode === null && child.pid) {
+                    killGroup(child.pid, "SIGTERM");
                     await new Promise<void>((resolveKill) => {
                         const timer = setTimeout(() => {
-                            child.kill("SIGKILL");
+                            if (child.pid) killGroup(child.pid, "SIGKILL");
                             resolveKill();
                         }, 3000);
                         child.once("exit", () => {
@@ -569,6 +712,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
                     });
                 }
             } finally {
+                if (child.pid) liveChildGroups.delete(child.pid);
                 await stopProvisionedRustStack();
             }
         },

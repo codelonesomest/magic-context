@@ -3,15 +3,18 @@ import {
     addStaleReduceStrippedIds,
     applyStrippedPlaceholderDelta,
     type ContextDatabase,
+    captureChannel1PostReduceGraceBaseline,
     clearDeferredExecutePendingIfMatches,
     clearPendingCompactionMarkerStateIf,
     clearPersistedTodoSyntheticAnchor,
     getActiveTagsBySession,
     getAutoSearchHintDecisions,
+    getChannel1NudgeState,
     getMaxM0MutationId,
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
     getPendingOps,
+    getPendingOpsCount,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
     getProcessedImageStrippedIds,
@@ -28,6 +31,9 @@ import {
 import {
     addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
+    clearEmergencyDropSample,
+    demoteTrailingBlankKeepDecisions,
+    getEmergencyInputSample,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getTrailingBlankDecisions,
@@ -47,6 +53,7 @@ import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { runAutoSearchHint } from "./auto-search-runner";
+import type { SchedulerDeferReason } from "./boundary-execution";
 import {
     rearmChannel2AfterCoverageAdvancingHardFold,
     rearmChannel2AfterMeasuredCollapse,
@@ -90,18 +97,25 @@ import {
     findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripCandidateIds,
     findTrailingBlankDecisionCandidates,
+    snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
     type TrailingBlankDecision,
+    type TrailingBlankSourceDecisions,
 } from "./strip-content";
-import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
+import {
+    buildEditSupersessionReclaim,
+    buildSupersessionReclaimOps,
+    recentSupersessionOwnerMessageIds,
+} from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
 import {
     assertTailHygieneContentUnchanged,
     countRealUserMessages,
+    effectiveTailHygiene,
     refreshTailHygieneBaseline,
     sameTailHygieneStructuralSignature,
     type TailHygieneStructuralSignature,
@@ -130,9 +144,11 @@ const DEGRADE_CACHE_WARNING_THRESHOLD = 10;
 // Bounded (LRU, max 100) so a crashed/never-reset session can't leak an entry
 // forever in a long-running process — matches the other per-session caches.
 const degradedCacheCountBySession = new BoundedSessionMap<number>(100);
+const routinePressureAppliedBySession = new BoundedSessionMap<boolean>(100);
 
 export function resetDegradedCacheCount(sessionId: string): void {
     degradedCacheCountBySession.delete(sessionId);
+    routinePressureAppliedBySession.delete(sessionId);
 }
 
 export type DeferredCompactionMarkerClearOutcome =
@@ -575,6 +591,8 @@ interface RunPostTransformPhaseArgs {
     /** Usable tokens available for soft scheduling thresholds and usage-ratio calculation. */
     usableWindow: number;
     schedulerDecision: "execute" | "defer";
+    /** Use the defer reason resolved with the scheduler decision at the boundary; do not recompute it from this phase's inputs, which may no longer reflect that decision. */
+    schedulerDeferReason?: SchedulerDeferReason | null;
     fullFeatureMode: boolean;
     /**
      * Compaction-off mode (issue #266), boot-resolved. Every mutating gate in
@@ -654,12 +672,16 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
+    /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
+    trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
         projectPath?: string;
         projectDirectory?: string;
         injectDocs?: boolean;
+        /** False suppresses every memory-derived m[0]/m[1] surface. */
+        memoryEnabled?: boolean;
         memoryInjectionBudgetTokens?: number;
         historyBudgetTokens?: number;
         temporalAwareness?: boolean;
@@ -832,6 +854,8 @@ export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const compactionOff = args.compactionOff === true;
+    const trailingBlankSourceDecisions =
+        args.trailingBlankSourceDecisions ?? snapshotTrailingBlankSourceDecisions(args.messages);
     // Capture before todo/history synthesis can add assistant messages. Reasoning replay skips a
     // metadata-only OpenCode request shell, while trailing-blank freezing still tracks that newest
     // host message because its shape can change before the next pass.
@@ -873,6 +897,23 @@ export async function runPostTransformPhase(
     // ≥ the force-materialize threshold.
     const emergencyDropEligible =
         !compactionOff && args.contextUsage.percentage >= args.forceMaterializationPercentage;
+    const executePressureEligible = args.schedulerDecision === "execute" || emergencyDropEligible;
+    if (!executePressureEligible) {
+        routinePressureAppliedBySession.delete(args.sessionId);
+    } else if (args.fullFeatureMode && alreadyRanThisTurn) {
+        // The shared once-per-turn map proves an earlier pass in this pressure
+        // episode already ran even when this process-local episode map is cold.
+        routinePressureAppliedBySession.set(args.sessionId, true);
+    }
+    const routinePressureAlreadyApplied =
+        args.fullFeatureMode &&
+        executePressureEligible &&
+        routinePressureAppliedBySession.get(args.sessionId) === true;
+    // A pressure episode ends below the force band. Clear its emergency edge
+    // latch here so a later re-entry can originate one new batched reclaim.
+    if (!emergencyDropEligible && getEmergencyInputSample(args.db, args.sessionId) > 0) {
+        clearEmergencyDropSample(args.db, args.sessionId);
+    }
     const activeCompartmentRun = args.canRunCompartments
         ? getActiveCompartmentRun(args.sessionId)
         : undefined;
@@ -906,6 +947,7 @@ export async function runPostTransformPhase(
                   projectPath: args.m0M1.projectPath,
                   projectDirectory: args.m0M1.projectDirectory,
                   injectDocs: args.m0M1.injectDocs,
+                  memoryEnabled: args.m0M1.memoryEnabled,
                   muralEnabled: args.m0M1.muralEnabled,
                   memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                   historyBudgetTokens: args.m0M1.historyBudgetTokens,
@@ -933,6 +975,7 @@ export async function runPostTransformPhase(
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
                 injectDocs: args.m0M1.injectDocs,
+                memoryEnabled: args.m0M1.memoryEnabled,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
                 temporalAwareness: args.m0M1.temporalAwareness,
@@ -1003,6 +1046,10 @@ export async function runPostTransformPhase(
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
+    const formatPendingOpsDepth = (): string => {
+        const depth = getPendingOpsCount(args.db, args.sessionId);
+        return depth === null ? "not loaded (deferred pass)" : String(depth);
+    };
     // Keep pending-op materialization coupled to the force signal itself. This
     // prevents an escalation-band change from letting emergency cleanup mutate
     // the wire while queued operations remain deferred.
@@ -1123,6 +1170,8 @@ export async function runPostTransformPhase(
             args.sessionId,
             `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=${args.currentTurnId}`,
         );
+    } else if (args.schedulerDeferReason !== undefined && args.schedulerDeferReason !== null) {
+        sessionLog(args.sessionId, `heuristics WILL NOT RUN — reason=${args.schedulerDeferReason}`);
     }
     // Only show "skipping" log for primary sessions — subagents bypass the
     // once-per-turn guard and DO re-run, so logging "skipping" would be wrong.
@@ -1135,6 +1184,16 @@ export async function runPostTransformPhase(
         sessionLog(
             args.sessionId,
             `transform: skipping heuristics (already ran for turn ${args.currentTurnId})`,
+        );
+    }
+    if (
+        !shouldApplyPendingOps &&
+        args.schedulerDeferReason !== undefined &&
+        args.schedulerDeferReason !== null
+    ) {
+        sessionLog(
+            args.sessionId,
+            `pending ops WILL NOT APPLY — reason=${args.schedulerDeferReason} pendingOps=${formatPendingOpsDepth()} context=${args.contextUsage.percentage.toFixed(1)}%`,
         );
     }
     if (compartmentRunning && hasPendingUserOps) {
@@ -1185,7 +1244,7 @@ export async function runPostTransformPhase(
                     : `scheduler_execute (scheduler=${args.schedulerDecision})`;
             sessionLog(
                 args.sessionId,
-                `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,
+                `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${formatPendingOpsDepth()}, context=${args.contextUsage.percentage.toFixed(1)}%`,
             );
             const tApply = performance.now();
             // P0 perf: don't pass `args.tags` here. applyPendingOperations
@@ -1232,10 +1291,38 @@ export async function runPostTransformPhase(
             const heuristicTags = shouldApplyPendingOps
                 ? getActiveTagsBySession(args.db, args.sessionId)
                 : args.tags;
+            const independentMutationBeforeHeuristics =
+                pendingOpsDidMutate ||
+                args.didMutateFromFlushedStatuses ||
+                foldExecutedThisPass ||
+                args.historyRebuiltThisPass ||
+                args.compartmentInjectionRebuiltFromDb ||
+                args.rebuiltHistoryFromInitialPrepare;
+            // An independent mutation is already pricing this pass. Rearm the
+            // emergency batch so all candidates accumulated during sustained
+            // force pressure can ride it instead of waiting for another episode.
+            if (
+                emergencyDropEligible &&
+                independentMutationBeforeHeuristics &&
+                getEmergencyInputSample(args.db, args.sessionId) > 0
+            ) {
+                clearEmergencyDropSample(args.db, args.sessionId);
+            }
+            // Routine age-sensitive rewrites get one originating application per
+            // continuous execute-pressure episode, not one per user turn. Later
+            // force-band passes may run emergency selection, but caveman/reasoning/
+            // dedup first-apply only when another mutation is already priced. The
+            // pressure latch clears on a real defer, so a 50% threshold cannot make
+            // every new turn a fresh rewrite opportunity while usage stays high.
+            let routineCleanupApplied =
+                !args.fullFeatureMode ||
+                !routinePressureAlreadyApplied ||
+                materializationRequested ||
+                independentMutationBeforeHeuristics;
             // Pending ops run just before heuristics and can drop active tags.
             // Emergency floor math must see that post-op active set; otherwise
             // already-reclaimed tags stay in floorTags and the planner over-evicts.
-            const cleanup = applyHeuristicCleanup(
+            let cleanup = applyHeuristicCleanup(
                 args.sessionId,
                 args.db,
                 args.targets,
@@ -1256,10 +1343,42 @@ export async function runPostTransformPhase(
                                   ceilingTokens: args.emergencyCeilingTokens,
                               }
                             : undefined,
+                    routine: routineCleanupApplied,
                     caveman: cavemanConfig,
                 },
                 heuristicTags,
             );
+            if (!routineCleanupApplied && cleanup.emergencyDroppedTools > 0) {
+                // The emergency selector just created the episode's one pressure
+                // bust. Drain the routine lanes into that same pass, then keep them
+                // frozen on later force-band passes.
+                const ridingCleanup = applyHeuristicCleanup(
+                    args.sessionId,
+                    args.db,
+                    args.targets,
+                    args.messageTagNumbers,
+                    {
+                        protectedTags: args.protectedTags,
+                        routine: true,
+                        caveman: cavemanConfig,
+                    },
+                    getActiveTagsBySession(args.db, args.sessionId),
+                );
+                cleanup = {
+                    droppedTools: cleanup.droppedTools + ridingCleanup.droppedTools,
+                    deduplicatedTools: cleanup.deduplicatedTools + ridingCleanup.deduplicatedTools,
+                    droppedInjections: cleanup.droppedInjections + ridingCleanup.droppedInjections,
+                    emergencyDroppedTools: cleanup.emergencyDroppedTools,
+                    emergencyReclaimedTokens: cleanup.emergencyReclaimedTokens,
+                    compressedTextTags:
+                        cleanup.compressedTextTags + ridingCleanup.compressedTextTags,
+                    mutatedTextTags: cleanup.mutatedTextTags + ridingCleanup.mutatedTextTags,
+                };
+                routineCleanupApplied = true;
+            }
+            if (routineCleanupApplied && args.fullFeatureMode && executePressureEligible) {
+                routinePressureAppliedBySession.set(args.sessionId, true);
+            }
             logTransformTiming(
                 args.sessionId,
                 "applyHeuristicCleanup",
@@ -1292,22 +1411,21 @@ export async function runPostTransformPhase(
             // providers keep their reasoning intact. Inline-thinking stripping
             // below stays provider-independent (it removes literal <thinking> tags
             // from text, never touches typed reasoning parts).
-            const clearedReasoning = canUseEmptySentinels
-                ? clearOldReasoning(
-                      args.messages,
-                      args.reasoningByMessage,
-                      args.messageTagNumbers,
-                      args.clearReasoningAge,
-                  )
-                : 0;
-            if (canUseEmptySentinels) {
+            const clearedReasoning =
+                routineCleanupApplied && canUseEmptySentinels
+                    ? clearOldReasoning(
+                          args.messages,
+                          args.reasoningByMessage,
+                          args.messageTagNumbers,
+                          args.clearReasoningAge,
+                      )
+                    : 0;
+            if (routineCleanupApplied && canUseEmptySentinels) {
                 stripClearedReasoning(args.messages);
             }
-            const strippedInline = stripInlineThinking(
-                args.messages,
-                args.messageTagNumbers,
-                args.clearReasoningAge,
-            );
+            const strippedInline = routineCleanupApplied
+                ? stripInlineThinking(args.messages, args.messageTagNumbers, args.clearReasoningAge)
+                : 0;
             if (clearedReasoning > 0 || strippedInline > 0) {
                 // Compute and persist the reasoning watermark so future defer passes
                 // can replay the same clearing without re-computing the cutoff.
@@ -1359,10 +1477,18 @@ export async function runPostTransformPhase(
         }
 
         const toolReclaimExecutePass = !compactionOff && args.schedulerDecision === "execute";
-        const alreadyMutatingThisPass = pendingOpsDidMutate || heuristicOrReasoningDidMutate;
+        const alreadyMutatingThisPass =
+            pendingOpsDidMutate ||
+            heuristicOrReasoningDidMutate ||
+            args.didMutateFromFlushedStatuses ||
+            foldExecutedThisPass ||
+            args.historyRebuiltThisPass ||
+            args.compartmentInjectionRebuiltFromDb ||
+            args.rebuiltHistoryFromInitialPrepare;
+        const toolReclaimApplicationOpportunity = toolReclaimExecutePass && alreadyMutatingThisPass;
         let autoReclaimTargetCount = 0;
         let autoReclaimDidMutate = false;
-        if (toolReclaimExecutePass && alreadyMutatingThisPass && !emergencyDropEligible) {
+        if (toolReclaimApplicationOpportunity && !emergencyDropEligible) {
             const syntheticPendingOps = buildSyntheticToolReclaimOps({
                 db: args.db,
                 sessionId: args.sessionId,
@@ -1375,14 +1501,18 @@ export async function runPostTransformPhase(
             // superseded edits to an edit_marker (keep filePath + region hint).
             // Merged into the same gated apply as the age-based sweep. Dedupe
             // against those ops (a tag can qualify under more than one rule).
+            // The newest 20 owner messages remain untouched, matching the module
+            // lane's continuation floor independently of protected_tags.
             const editMarkerTagIds = new Set<number>();
             if (args.smartDrops) {
+                const recentMessageIds = recentSupersessionOwnerMessageIds(args.db, args.sessionId);
                 const selectedIds = new Set(syntheticPendingOps.map((op) => op.tagId));
                 const supersessionOps = buildSupersessionReclaimOps({
                     db: args.db,
                     sessionId: args.sessionId,
                     targets: args.targets,
                     pendingOps,
+                    recentMessageIds,
                 });
                 for (const op of supersessionOps) {
                     if (!selectedIds.has(op.tagId)) {
@@ -1395,6 +1525,7 @@ export async function runPostTransformPhase(
                     sessionId: args.sessionId,
                     targets: args.targets,
                     pendingOps,
+                    recentMessageIds,
                 });
                 for (const op of editReclaim.ops) {
                     // A superseded edit only compresses if no earlier rule already
@@ -1431,7 +1562,11 @@ export async function runPostTransformPhase(
             }
         }
         args.batch?.finalize();
-        if (toolReclaimExecutePass) {
+        // Advance whenever reclaim could have applied, even if no tags were
+        // selected. Plain execute-band residency does not advance the watermark;
+        // otherwise each newly eligible tag could drop separately instead of
+        // waiting for the next independently priced batch.
+        if (toolReclaimApplicationOpportunity) {
             const maxTagNumber = advanceToolReclaimWatermarkToCurrentMax(args.db, args.sessionId);
             args.sessionMeta.toolReclaimWatermark = Math.max(
                 args.sessionMeta.toolReclaimWatermark ?? 0,
@@ -1540,6 +1675,7 @@ export async function runPostTransformPhase(
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
                 injectDocs: args.m0M1.injectDocs,
+                memoryEnabled: args.m0M1.memoryEnabled,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
                 temporalAwareness: args.m0M1.temporalAwareness,
@@ -1668,7 +1804,7 @@ export async function runPostTransformPhase(
         // Step 1: Replay — re-apply sentinel to messages whose IDs were neutralized
         // on a prior bust pass. Preserves array length — no splice.
         if (persistedIds.size > 0) {
-            const { replayed, missingIds } = replaySentinelByMessageIds(
+            const { replayed } = replaySentinelByMessageIds(
                 args.messages,
                 persistedIds,
                 args.resolvedProviderID,
@@ -1679,15 +1815,12 @@ export async function runPostTransformPhase(
                     `sentinel replay: neutralized ${replayed} previously-stripped messages`,
                 );
             }
-            // Prune IDs that no longer appear in the live message set (e.g., after
-            // compaction trimmed them out entirely). Don't prune if they're present
-            // but already sentinel — those are working as intended.
-            if (missingIds.length > 0) {
-                for (const id of missingIds) persistedIds.delete(id);
-                // CAS delta (remove) so a sibling process discovering new IDs in
-                // parallel isn't clobbered by this prune's whole-set overwrite.
-                applyStrippedPlaceholderDelta(args.db, args.sessionId, { remove: missingIds });
-            }
+            // Absence from one transform array is not deletion. Advancing the
+            // compaction marker can temporarily hide source rows on the fold pass
+            // and project them again on the next pass. Their frozen sentinel IDs
+            // must survive that gap so the reappearing rows keep the bytes already
+            // served at the seam. The message.deleted handler removes IDs only
+            // after OpenCode confirms that the durable source row was deleted.
         }
 
         // Step 2: Detect — only on cache-busting passes, find NEW eligible messages
@@ -2125,6 +2258,62 @@ export async function runPostTransformPhase(
         typeof trailingBlankNewestAssistant?.info.id === "string"
             ? trailingBlankNewestAssistant.info.id
             : undefined;
+
+    if (isCacheBustingPass && trailingBlankDecisions.size > 0) {
+        // A source snapshot can outlive the message's projection when a marker trims history.
+        // Heal only IDs still present now so the first strip cannot land later on a defer serve.
+        const visibleMessageIds = new Set(
+            args.messages.flatMap((message) =>
+                typeof message.info.id === "string" ? [message.info.id] : [],
+            ),
+        );
+        const poisonedKeepIds: string[] = [];
+        for (const [id, decision] of trailingBlankDecisions) {
+            if (
+                id === newestAssistantId ||
+                !visibleMessageIds.has(id) ||
+                trailingBlankSourceDecisions.get(id) !== "strip"
+            ) {
+                continue;
+            }
+            if (decision === "keep" || decision.startsWith("keep:")) {
+                poisonedKeepIds.push(id);
+            }
+        }
+        if (poisonedKeepIds.length > 0) {
+            try {
+                const demotedIds = demoteTrailingBlankKeepDecisions(
+                    args.db,
+                    args.sessionId,
+                    poisonedKeepIds,
+                );
+                if (demotedIds === null) {
+                    args.passOutcome?.record("trailing-blank-heal-persistence-failure");
+                    sessionLog(
+                        args.sessionId,
+                        "trailing blank heal: persistence failed; retaining frozen keep decisions",
+                    );
+                } else {
+                    for (const id of demotedIds) {
+                        trailingBlankDecisions.set(id, "strip");
+                        bustedThisPass = true;
+                        sessionLog(
+                            args.sessionId,
+                            `trailing blank heal: demoted message ${id} from keep to strip because its source has no trailing blank`,
+                        );
+                    }
+                }
+            } catch (error) {
+                args.passOutcome?.record("trailing-blank-heal-exception");
+                sessionLog(
+                    args.sessionId,
+                    "transform failed healing trailing blank decisions:",
+                    error,
+                );
+            }
+        }
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -2149,7 +2338,10 @@ export async function runPostTransformPhase(
         const detectedCandidates = findTrailingBlankDecisionCandidates(
             args.messages,
             trailingBlankDecisions,
-            { refreshMessageId: newestAssistantId },
+            {
+                refreshMessageId: newestAssistantId,
+                sourceDecisions: trailingBlankSourceDecisions,
+            },
         );
         // A defer pass can safely establish only the newest assistant's shape: it
         // has no cached continuation after it. Historical messages without a prior
@@ -2239,6 +2431,25 @@ export async function runPostTransformPhase(
                     previous,
                 });
                 const structuralSignature = tailHygieneStructuralSignature(args.messages);
+                const effective = effectiveTailHygiene(baseline);
+                const durableGrace =
+                    baseline.evaluable && !baseline.generationInvalidated
+                        ? captureChannel1PostReduceGraceBaseline(
+                              args.db,
+                              args.sessionId,
+                              effective.u,
+                          )
+                        : getChannel1NudgeState(args.db, args.sessionId);
+                baseline.channel1PostReduceGrace =
+                    durableGrace.postReduceGracePending ||
+                    durableGrace.postReduceGraceBaselineU !== undefined
+                        ? {
+                              pending: durableGrace.postReduceGracePending === true,
+                              baselineU: durableGrace.postReduceGraceBaselineU,
+                              preReduceLevel:
+                                  durableGrace.postReduceGracePreLevel ?? durableGrace.level,
+                          }
+                        : undefined;
                 args.channel1StateBySession.set(args.sessionId, {
                     ...baseline,
                     usableWindow: args.usableWindow,

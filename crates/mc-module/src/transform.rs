@@ -45,9 +45,10 @@ use crate::selection::{
     SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
-    effective_tail_hygiene, hygiene_band, measure_tail_hygiene_with_pending_drops,
-    queued_tag_numbers, real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand,
-    CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
+    channel1_refire_tokens, effective_tail_hygiene, hygiene_band,
+    measure_tail_hygiene_with_pending_drops, post_reduce_grace_holds, queued_tag_numbers,
+    real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand, CHANNEL1_FLOOR_TOKENS,
+    CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -55,8 +56,9 @@ use mc_store::{
     LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
     MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
     PendingAgentDrop, PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint,
-    StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TemporalMarkInput,
-    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TailHygienePartKind,
+    TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
+    UserHintDecisionInput, UserHintRow,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -104,8 +106,6 @@ const CAV_KEY_PREFIX: &str = "cav:";
 /// separated upstream session keys. Five edges corresponds to three arm/clear cycles
 /// when the initial arm is not counted as evidence of multiplexing by itself.
 const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
-const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 25_000;
-const CHANNEL1_GENTLE_FRACTION: f64 = 0.20;
 const CHANNEL2_DIRECTIVE_LEASE_TTL_MS: i64 = 10 * 60 * 1_000;
 const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
 const USER_HINT_FRAGMENT_CHAR_CAP: usize = 80;
@@ -714,6 +714,10 @@ pub struct TransformRequest {
     /// Minimum source byte length for an eligible caveman text block.
     #[serde(default = "default_caveman_min_chars")]
     pub caveman_min_chars: usize,
+    /// Top-level tool-input key order captured by the TypeScript wire adapter. The
+    /// map is used only for edit-marker payload bytes and never reaches provider input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_input_key_orders: BTreeMap<String, Vec<String>>,
     /// Whether this request advertises the canonical reduction tool. Missing input is
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
@@ -816,6 +820,12 @@ pub struct TransformRequest {
     /// route can outlive a config reload; absent values use the bind-time fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_budget_tokens: Option<f64>,
+    /// When set, this is the host-approved model order for OpenCode historian requests. Before
+    /// building the request, the host applies the user's profile and removes model choices from
+    /// repository config. An absent value lets Claude Code choose models from module config;
+    /// a present but empty list disables historian dispatch for this OpenCode route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historian_model_chain: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
     /// Composed fake-compaction edge delivered by the lineage owner. Missing fields retain
@@ -915,6 +925,8 @@ struct TransformRequestWire {
     #[serde(default = "default_caveman_min_chars")]
     caveman_min_chars: usize,
     #[serde(default)]
+    tool_input_key_orders: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     tool_present: bool,
     #[serde(default)]
     todo_tool_present: Option<bool>,
@@ -969,6 +981,8 @@ struct TransformRequestWire {
     #[serde(default)]
     history_budget_tokens: Option<f64>,
     #[serde(default)]
+    historian_model_chain: Option<Vec<String>>,
+    #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
     #[serde(default)]
     lineage_switched: bool,
@@ -1017,6 +1031,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             auto_search_min_prompt_chars: wire.auto_search_min_prompt_chars,
             caveman_enabled: wire.caveman_enabled,
             caveman_min_chars: wire.caveman_min_chars,
+            tool_input_key_orders: wire.tool_input_key_orders,
             tool_present: wire.tool_present,
             todo_tool_present: wire.todo_tool_present,
             prompt_surface_preset: wire.prompt_surface_preset,
@@ -1043,6 +1058,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             detected_context_limit: wire.detected_context_limit,
             detected_context_limit_model_key: wire.detected_context_limit_model_key,
             history_budget_tokens: wire.history_budget_tokens,
+            historian_model_chain: wire.historian_model_chain,
             declared_trim: wire.declared_trim,
             lineage_switched: wire.lineage_switched,
             descent_edge_id: wire.descent_edge_id,
@@ -1715,10 +1731,12 @@ struct ActiveTagForNudge {
 #[derive(Debug, Clone)]
 struct Channel1Decision {
     fire: bool,
+    sticky: bool,
     level: Channel1Level,
     reclaimable_tokens: i64,
     next_last_nudge: i64,
     next_last_level: String,
+    clear_post_reduce_grace: bool,
 }
 
 #[derive(Debug, Default)]
@@ -2514,7 +2532,10 @@ fn compose_additive_m0(
     } else {
         crate::project_docs::ProjectDocs::default()
     };
-    let mural = crate::m0_compose::resolved_mural(m0_mural_input(req, serializer_profile));
+    let mural = ctx
+        .memory_enabled
+        .then(|| crate::m0_compose::resolved_mural(m0_mural_input(req, serializer_profile)))
+        .flatten();
     let mut m0_bytes = render_m0(
         &M0Inputs {
             project_docs: &docs.rendered_block,
@@ -3175,6 +3196,9 @@ fn apply_once(
         }
     }
     let req = rebased_req.as_ref().unwrap_or(ingress_req);
+    // Snapshot the store-derived request before any renderer mutation can add sentinels,
+    // canonical blanks, or synthetic composition artifacts.
+    let trailing_blank_source_decisions = snapshot_trailing_blank_source_decisions(req);
 
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
     let projection = if rebased_req.is_some() {
@@ -3995,8 +4019,9 @@ fn apply_once(
                 .map(|tokens| (row.block_id.as_str(), tokens))
         })
         .collect();
-    let tail_for_selection =
+    let mut tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
+    attach_edit_input_key_orders(&mut tail_for_selection, &req.tool_input_key_orders);
     // Todo state is deferred work just like an m1 or reduction delta: it may ride an
     // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
     // Compute only the call-id transition here; the complete pair is built after classification.
@@ -5171,7 +5196,7 @@ fn apply_once(
         &protected_block_ids,
         &pending_drop_target_ids,
     );
-    let current_hygiene_baseline = if is_bust_pass {
+    let mut current_hygiene_baseline = if is_bust_pass {
         let refreshed = refresh_tail_hygiene_baseline(
             hygiene_measurement,
             true,
@@ -5195,6 +5220,29 @@ fn apply_once(
     rearm_channel2_after_measured_collapse(&mut meta, is_bust_pass);
     let agent_drops_applied_this_pass =
         pending_agent_drops_applied_this_pass(&pending_agent_drops, &loaded.core, &core);
+    if meta.channel1_reduce_suppressed || agent_drops_applied_this_pass {
+        if let Some(baseline) = current_hygiene_baseline
+            .as_mut()
+            .filter(|baseline| baseline.evaluable && !baseline.generation_invalidated)
+        {
+            // Measurement already excludes queued drops from U. Capturing any
+            // earlier value would make compliance grace expire immediately.
+            let post_reduce_u = effective_tail_hygiene(baseline).0;
+            baseline.channel1_post_reduce_grace_baseline_u = Some(post_reduce_u);
+            baseline.channel1_post_reduce_grace_pre_level = meta.channel1_last_nudge_level.clone();
+            meta.channel1_reduce_suppressed = false;
+            if let Some(persisted) = meta.tail_hygiene_baseline.as_mut() {
+                persisted.channel1_post_reduce_grace_baseline_u = Some(post_reduce_u);
+                persisted.channel1_post_reduce_grace_pre_level =
+                    baseline.channel1_post_reduce_grace_pre_level.clone();
+            } else {
+                meta.tail_hygiene_baseline = Some(baseline.clone());
+            }
+        } else {
+            // Keep the pending bit until a trustworthy post-drop U exists.
+            meta.channel1_reduce_suppressed = true;
+        }
+    }
 
     if tagging_active {
         if let Some(row) = maybe_append_channel1_nudge(
@@ -5290,13 +5338,40 @@ fn apply_once(
             true,
         )?;
     }
-    // Recheck trailing blanks on every pass, including deferred passes. The build
-    // above already applied stored decisions, so removing a provider-added blank
-    // from an older message restores its previously served bytes. On a deferred
+    // A stored keep is stale when the original assistant has no trailing blank. Demote it only
+    // while that assistant is also in the current output and this pass is already invalidating the
+    // provider cache, so the first strip cannot be delayed until a later deferred pass.
+    let healed_trailing_blank_ids = heal_poisoned_trailing_blank_decisions(
+        &mut core,
+        req,
+        &trailing_blank_source_decisions,
+        &built_output.messages,
+        is_provider_prefix_mutation_pass,
+    );
+    if !healed_trailing_blank_ids.is_empty() {
+        built_output = build_output_with_tags(
+            &core,
+            output_meta,
+            &projection,
+            req,
+            (tagging_active || auto_search_active).then_some(&tag_overlay),
+            tail_reclaim_enabled && !req.is_subagent,
+            mutation_exempt_mid,
+            &tag_numbers,
+            meta.reasoning_cleared_through_tag
+                .max(meta.reasoning_cleared_through_ordinal),
+            transition_committed,
+            output_cache_snapshot.as_ref(),
+            true,
+        )?;
+    }
+    // Recheck trailing blanks on every pass, including deferred passes. Decisions come only from
+    // the immutable ingress snapshot and are intersected with the served projection. On a deferred
     // pass, record only the newest assistant because no cached message follows it.
     let (trailing_blank_decisions_updated, newest_keep_updated) = refresh_trailing_blank_decisions(
         &mut core,
         req,
+        &trailing_blank_source_decisions,
         &built_output.messages,
         is_provider_prefix_mutation_pass,
     );
@@ -5520,6 +5595,12 @@ fn apply_once(
             req.session_id,
             transition_shapes.poisoned_reasoning_arc_ids.join(","),
             row_version,
+        );
+    }
+    for mid in &healed_trailing_blank_ids {
+        eprintln!(
+            "mc-module: trailing-blank-heal session={} mid={} reason=source_without_trailing_blank pass_row={}",
+            req.session_id, mid, row_version,
         );
     }
     timings.store_memories = m1_revision_read_timings.memories_ms;
@@ -6973,6 +7054,27 @@ fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usi
         byte_size: block.bytes.len(),
         token_count: tag_tokens_by_block.get(block.id.as_str()).copied(),
         arc_id: block.arc_id.clone(),
+    }
+}
+
+fn attach_edit_input_key_orders(items: &mut [SelItem], key_orders: &BTreeMap<String, Vec<String>>) {
+    for item in items {
+        let Some(key_order) = key_orders.get(&item.id) else {
+            continue;
+        };
+        let SelKind::ToolCall { name, input } = &mut item.kind else {
+            continue;
+        };
+        if !crate::selection::is_edit_tool(name) {
+            continue;
+        }
+        let Some(object) = input.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            crate::selection::EDIT_INPUT_KEY_ORDER_MARKER.to_string(),
+            serde_json::to_value(key_order).unwrap_or(Value::Null),
+        );
     }
 }
 
@@ -8904,6 +9006,13 @@ fn run_user_hint_lexical_search(
                     title: None,
                     note_status: None,
                     surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
                 },
             });
         }
@@ -8934,6 +9043,13 @@ fn run_user_hint_lexical_search(
                 title: Some(compartment.title),
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
         });
     }
@@ -9113,6 +9229,86 @@ pub(crate) fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
+// Rust strings cannot contain JavaScript's lone UTF-16 surrogates. These Unicode
+// noncharacters reserve an internal representation until the JSON response is encoded.
+const JS_SURROGATE_MARKER_OPEN: char = '\u{FDD0}';
+const JS_SURROGATE_MARKER_CLOSE: char = '\u{FDD1}';
+
+pub(crate) fn string_from_js_utf16_prefix(units: &[u16], requested: usize) -> String {
+    let end = requested.min(units.len());
+    if end > 0 && (0xD800..=0xDBFF).contains(&units[end - 1]) {
+        let mut prefix = String::from_utf16(&units[..end - 1])
+            .expect("a prefix before a leading surrogate remains valid UTF-16");
+        let _ = write!(
+            prefix,
+            "{JS_SURROGATE_MARKER_OPEN}{:04x}{JS_SURROGATE_MARKER_CLOSE}",
+            units[end - 1]
+        );
+        prefix
+    } else {
+        String::from_utf16(&units[..end]).expect("a complete JavaScript prefix is valid UTF-16")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn js_utf16_units_from_internal(text: &str) -> Vec<u16> {
+    let mut units = Vec::new();
+    let mut rest = text;
+    while let Some(marker_start) = rest.find(JS_SURROGATE_MARKER_OPEN) {
+        units.extend(rest[..marker_start].encode_utf16());
+        let marker = &rest[marker_start + JS_SURROGATE_MARKER_OPEN.len_utf8()..];
+        let bytes = marker.as_bytes();
+        let encoded_marker = bytes.len() >= 4
+            && bytes[..4].iter().all(u8::is_ascii_hexdigit)
+            && marker[4..].starts_with(JS_SURROGATE_MARKER_CLOSE);
+        if encoded_marker {
+            if let Ok(unit) = u16::from_str_radix(&marker[..4], 16) {
+                if (0xD800..=0xDBFF).contains(&unit) {
+                    units.push(unit);
+                    rest = &marker[4 + JS_SURROGATE_MARKER_CLOSE.len_utf8()..];
+                    continue;
+                }
+            }
+        }
+        units.extend(JS_SURROGATE_MARKER_OPEN.to_string().encode_utf16());
+        rest = marker;
+    }
+    units.extend(rest.encode_utf16());
+    units
+}
+
+pub(crate) fn encode_js_surrogate_markers(encoded: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = String::from_utf8(encoded) else {
+        unreachable!("serde_json always emits UTF-8")
+    };
+    if !text.contains(JS_SURROGATE_MARKER_OPEN) {
+        return text.into_bytes();
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(marker_start) = rest.find(JS_SURROGATE_MARKER_OPEN) {
+        output.push_str(&rest[..marker_start]);
+        let marker = &rest[marker_start + JS_SURROGATE_MARKER_OPEN.len_utf8()..];
+        let bytes = marker.as_bytes();
+        let encoded_marker = bytes.len() >= 4
+            && bytes[..4].iter().all(u8::is_ascii_hexdigit)
+            && marker[4..].starts_with(JS_SURROGATE_MARKER_CLOSE)
+            && u16::from_str_radix(&marker[..4], 16)
+                .is_ok_and(|unit| (0xD800..=0xDBFF).contains(&unit));
+        if encoded_marker {
+            output.push_str("\\u");
+            output.push_str(&marker[..4]);
+            rest = &marker[4 + JS_SURROGATE_MARKER_CLOSE.len_utf8()..];
+        } else {
+            output.push(JS_SURROGATE_MARKER_OPEN);
+            rest = marker;
+        }
+    }
+    output.push_str(rest);
+    output.into_bytes()
+}
+
 /// Keep whole Unicode scalars while measuring the prefix in UTF-16 code units, matching the
 /// TypeScript wire renderer without producing an invalid half-surrogate in Rust output.
 pub(crate) fn utf16_prefix(text: &str, limit: usize) -> &str {
@@ -9199,28 +9395,20 @@ fn maybe_append_channel1_nudge(
         input.mutation_exempt_mid,
     );
     let queued_tag_numbers = queued_tag_numbers(input.tag_rows, input.pending_drop_target_ids);
-    let measured_reclaimable = input
-        .baseline
-        .map_or(0, |baseline| effective_tail_hygiene(baseline).0);
-    let cycle_reset = input.agent_drops_applied_this_pass
-        || meta.channel1_reduce_suppressed
-        || measured_reclaimable < meta.channel1_last_nudge_undropped.max(0);
-    if cycle_reset {
-        meta.channel1_last_fire_level.clear();
-        meta.channel1_last_fire_ordinal = 0;
-    }
-    if input.agent_drops_applied_this_pass {
-        meta.channel1_last_nudge_undropped = 0;
-        meta.channel1_last_nudge_level.clear();
-        meta.channel1_reduce_suppressed = false;
+    if input.agent_drops_applied_this_pass || meta.channel1_reduce_suppressed {
         return None;
     }
-    let decision = decide_channel1(input.baseline, meta);
+    let current_real_user_turn_count = real_user_turn_count(input.projection);
+    let decision = decide_channel1(input.baseline, meta, current_real_user_turn_count);
     meta.channel1_last_nudge_undropped = decision.next_last_nudge;
     meta.channel1_last_nudge_level = decision.next_last_level;
-    let was_suppressed = meta.channel1_reduce_suppressed;
-    meta.channel1_reduce_suppressed = false;
-    if was_suppressed || !decision.fire {
+    if decision.clear_post_reduce_grace {
+        if let Some(baseline) = meta.tail_hygiene_baseline.as_mut() {
+            baseline.channel1_post_reduce_grace_baseline_u = None;
+            baseline.channel1_post_reduce_grace_pre_level.clear();
+        }
+    }
+    if !decision.fire {
         return None;
     }
     let existing_blocks = input
@@ -9236,19 +9424,12 @@ fn maybe_append_channel1_nudge(
         input.mutation_exempt_mid,
     )?;
     let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags, &queued_tag_numbers);
-    let current_real_user_turn_count = real_user_turn_count(input.projection);
-    let sticky = should_use_sticky_channel1_reminder(
-        &meta.channel1_last_fire_level,
-        meta.channel1_last_fire_ordinal,
-        decision.level,
-        current_real_user_turn_count,
-    );
     let reminder = build_channel1_reminder(
         decision.level,
         decision.reclaimable_tokens,
-        input.usable_window_tokens,
+        reclaimable_tool_output_count(input.baseline),
         &hint,
-        sticky,
+        decision.sticky,
     );
     meta.channel1_last_fire_level = decision.level.as_str().to_string();
     meta.channel1_last_fire_ordinal = current_real_user_turn_count;
@@ -9415,6 +9596,7 @@ struct Channel2DirectiveInput<'a> {
 struct Channel2Pressure {
     due: bool,
     reclaimable_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: Vec<(i64, String)>,
 }
 
@@ -9445,7 +9627,7 @@ fn channel2_directives(
                     channel2_nudge: Some(Channel2NudgeDirective {
                         text: build_channel2_host_reminder(
                             pressure.reclaimable_tokens,
-                            input.usable_window_tokens,
+                            pressure.reclaimable_tool_outputs,
                             &pressure.hint,
                         ),
                     }),
@@ -9493,6 +9675,7 @@ fn channel2_pressure(
     Some(Channel2Pressure {
         due,
         reclaimable_tokens,
+        reclaimable_tool_outputs: reclaimable_tool_output_count(input.baseline),
         hint,
     })
 }
@@ -9582,7 +9765,7 @@ fn claude_code_channel2_directive(
     let pending = PendingChannel2Directive {
         text: build_channel2_reminder_text(
             pressure.reclaimable_tokens,
-            input.usable_window_tokens,
+            pressure.reclaimable_tool_outputs,
             &pressure.hint,
         ),
         directive_id: channel2_directive_id(session_id, arming_watermark),
@@ -9647,95 +9830,140 @@ fn oldest_channel2_hint(
 
 fn build_channel2_reminder_text(
     reclaimable_tokens: i64,
-    usable_window_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: &[(i64, String)],
 ) -> String {
-    let amount = approx_thousands(reclaimable_tokens);
-    let usable_window = approx_thousands(usable_window_tokens);
+    let summary = format_reclaimable_output_summary(reclaimable_tool_outputs, reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
     format!(
-        "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~{amount} of ~{usable_window} reclaimable).{hint_text}"
+        "Routine housekeeping: {summary} are reclaimable — make a ctx_reduce pass at a natural stopping point.{hint_text}"
     )
 }
 
 fn build_channel2_host_reminder(
     reclaimable_tokens: i64,
-    usable_window_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: &[(i64, String)],
 ) -> String {
-    let text = build_channel2_reminder_text(reclaimable_tokens, usable_window_tokens, hint);
+    let text = build_channel2_reminder_text(reclaimable_tokens, reclaimable_tool_outputs, hint);
     format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
-fn decide_channel1(baseline: Option<&TailHygieneBaseline>, meta: &ModuleMeta) -> Channel1Decision {
+fn decide_channel1(
+    baseline: Option<&TailHygieneBaseline>,
+    meta: &ModuleMeta,
+    current_real_user_turn_count: u64,
+) -> Channel1Decision {
     let (reclaimable_tokens, tail_tokens) = baseline.map_or((0, 0), effective_tail_hygiene);
-    let severity = reclaimable_tokens as f64 / tail_tokens.max(1) as f64;
-    let reset_cycle = meta.channel1_reduce_suppressed
-        || reclaimable_tokens < meta.channel1_last_nudge_undropped.max(0);
-    let last_nudge = if reset_cycle {
-        0
-    } else {
-        meta.channel1_last_nudge_undropped.max(0)
-    };
-    let last_level = if reset_cycle {
-        None
-    } else {
-        Channel1Level::parse(&meta.channel1_last_nudge_level)
-    };
-    let last_level_string = |level: Option<Channel1Level>| {
-        level
-            .map(|level| level.as_str().to_string())
-            .unwrap_or_default()
-    };
-    let quiet = |next_last_nudge: i64, next_last_level: String| Channel1Decision {
+    let previous_level = Channel1Level::parse(&meta.channel1_last_nudge_level);
+    let mut next_last_nudge = meta.channel1_last_nudge_undropped.max(0);
+    let mut next_last_level = meta.channel1_last_nudge_level.clone();
+    let mut clear_post_reduce_grace = false;
+    let quiet = |level: Channel1Level,
+                 next_last_nudge: i64,
+                 next_last_level: String,
+                 clear_post_reduce_grace: bool| Channel1Decision {
         fire: false,
-        level: Channel1Level::Gentle,
+        sticky: false,
+        level,
         reclaimable_tokens,
         next_last_nudge,
         next_last_level,
+        clear_post_reduce_grace,
     };
 
-    if baseline.is_none_or(|baseline| !baseline.evaluable || baseline.generation_invalidated) {
-        return quiet(last_nudge, last_level_string(last_level));
-    }
+    let Some(baseline) =
+        baseline.filter(|baseline| baseline.evaluable && !baseline.generation_invalidated)
+    else {
+        return quiet(
+            Channel1Level::Gentle,
+            next_last_nudge,
+            next_last_level,
+            false,
+        );
+    };
     if meta.channel1_reduce_suppressed {
-        return quiet(0, String::new());
+        return quiet(
+            Channel1Level::Gentle,
+            next_last_nudge,
+            next_last_level,
+            false,
+        );
     }
-    if tail_tokens < CHANNEL1_MIN_TOKENS || reclaimable_tokens < CHANNEL1_FLOOR_TOKENS {
-        return quiet(last_nudge, last_level_string(last_level));
+
+    let measured_band = hygiene_band(reclaimable_tokens, tail_tokens);
+    if post_reduce_grace_holds(baseline, reclaimable_tokens, tail_tokens, measured_band) {
+        let level = match measured_band {
+            HygieneBand::Firm => Channel1Level::Firm,
+            HygieneBand::Urgent | HygieneBand::Channel2 => Channel1Level::Urgent,
+            HygieneBand::Quiet | HygieneBand::Gentle => Channel1Level::Gentle,
+        };
+        return quiet(level, next_last_nudge, next_last_level, false);
     }
-    if severity < CHANNEL1_GENTLE_FRACTION {
-        return quiet(last_nudge, last_level_string(last_level));
+    if baseline.channel1_post_reduce_grace_baseline_u.is_some() {
+        clear_post_reduce_grace = true;
     }
-    let level = match hygiene_band(reclaimable_tokens, tail_tokens) {
+
+    let level = match measured_band {
         HygieneBand::Urgent | HygieneBand::Channel2 => Channel1Level::Urgent,
         HygieneBand::Firm => Channel1Level::Firm,
         HygieneBand::Gentle => Channel1Level::Gentle,
-        HygieneBand::Quiet => return quiet(last_nudge, last_level_string(last_level)),
+        HygieneBand::Quiet => {
+            return quiet(
+                Channel1Level::Gentle,
+                0,
+                String::new(),
+                clear_post_reduce_grace,
+            )
+        }
     };
-    let escalated = last_level.is_none_or(|last| level.rank() > last.rank());
-    let cadence_reached = last_level.is_some()
-        && reclaimable_tokens.saturating_sub(last_nudge) >= channel1_refire_tokens(tail_tokens);
-    if !escalated && !cadence_reached {
-        return quiet(last_nudge, last_level_string(last_level));
+    let previous_rank = previous_level.map_or(0, Channel1Level::rank);
+    let current_rank = level.rank();
+
+    // Entering a lower band is recorded without rendering. A later upward
+    // transition is then a genuine crossing eligible for one full reminder.
+    if current_rank < previous_rank {
+        next_last_nudge = reclaimable_tokens;
+        next_last_level = level.as_str().to_string();
+        return quiet(
+            level,
+            next_last_nudge,
+            next_last_level,
+            clear_post_reduce_grace,
+        );
     }
+
+    let crossed_from_below = current_rank > previous_rank;
+    let cadence_reached = current_rank == previous_rank
+        && reclaimable_tokens.saturating_sub(next_last_nudge)
+            >= channel1_refire_tokens(tail_tokens);
+    let sticky_turn_gap_reached = meta.channel1_last_fire_ordinal > current_real_user_turn_count
+        || current_real_user_turn_count.saturating_sub(meta.channel1_last_fire_ordinal)
+            >= CHANNEL1_STICKY_REAL_USER_TURN_GAP;
+    if !crossed_from_below && (!cadence_reached || !sticky_turn_gap_reached) {
+        return quiet(
+            level,
+            next_last_nudge,
+            next_last_level,
+            clear_post_reduce_grace,
+        );
+    }
+
     Channel1Decision {
         fire: true,
+        sticky: !crossed_from_below,
         level,
         reclaimable_tokens,
         next_last_nudge: reclaimable_tokens,
         next_last_level: level.as_str().to_string(),
+        clear_post_reduce_grace,
     }
-}
-
-fn channel1_refire_tokens(tail_tokens: i64) -> i64 {
-    let scaled = (0.08 * tail_tokens.max(0) as f64).round() as i64;
-    CHANNEL1_REFIRE_FLOOR_TOKENS.max(scaled)
 }
 
 #[cfg(test)]
 mod nudge_formula_tests {
     use super::*;
+    use serde::Deserialize;
 
     fn baseline(u: i64, t: i64) -> TailHygieneBaseline {
         TailHygieneBaseline {
@@ -9754,7 +9982,7 @@ mod nudge_formula_tests {
     }
 
     fn decision(meta: &ModuleMeta) -> Channel1Decision {
-        decide_channel1(meta.tail_hygiene_baseline.as_ref(), meta)
+        decide_channel1(meta.tail_hygiene_baseline.as_ref(), meta, 5)
     }
 
     fn pending(id: &str, armed_at_ms: i64, watermark: u64) -> PendingChannel2Directive {
@@ -9794,6 +10022,74 @@ mod nudge_formula_tests {
         assert!(decision(&before_cadence).fire);
         assert_eq!(channel1_refire_tokens(200_000), 25_000);
         assert_eq!(channel1_refire_tokens(400_000), 32_000);
+    }
+
+    #[test]
+    fn post_reduce_grace_uses_post_drop_u_and_breaks_on_escalation() {
+        let mut meta = nudge_meta(60_000, 150_000);
+        meta.channel1_last_nudge_undropped = 30_000;
+        meta.channel1_last_nudge_level = "firm".to_string();
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_baseline_u = Some(60_000);
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_pre_level = "firm".to_string();
+
+        let immediate = decision(&meta);
+        assert!(!immediate.fire);
+        assert!(!immediate.clear_post_reduce_grace);
+        meta.tail_hygiene_baseline.as_mut().unwrap().baseline_u = 84_999;
+        assert!(!decision(&meta).fire);
+        meta.tail_hygiene_baseline.as_mut().unwrap().baseline_u = 85_000;
+        let regrown = decision(&meta);
+        assert!(regrown.fire);
+        assert!(regrown.sticky);
+        assert!(regrown.clear_post_reduce_grace);
+
+        // Mutation control: without grace, the immediate same-band cadence fires.
+        meta.tail_hygiene_baseline.as_mut().unwrap().baseline_u = 60_000;
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_baseline_u = None;
+        assert!(decision(&meta).fire);
+
+        meta.tail_hygiene_baseline = Some(baseline(61_000, 100_000));
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_baseline_u = Some(60_000);
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_pre_level = "firm".to_string();
+        let escalated = decide_channel1(meta.tail_hygiene_baseline.as_ref(), &meta, 0);
+        assert!(escalated.fire);
+        assert_eq!(escalated.level, Channel1Level::Urgent);
+        assert!(!escalated.sticky);
+        assert!(escalated.clear_post_reduce_grace);
+    }
+
+    #[test]
+    fn same_band_full_copy_is_once_and_sticky_waits_five_turns() {
+        let first = decision(&nudge_meta(30_000, 75_000));
+        assert!(first.fire);
+        assert!(!first.sticky);
+
+        let mut same_band = nudge_meta(55_000, 137_500);
+        same_band.channel1_last_nudge_undropped = first.next_last_nudge;
+        same_band.channel1_last_nudge_level = first.next_last_level;
+        same_band.channel1_last_fire_ordinal = 0;
+        let within_turn = decide_channel1(same_band.tail_hygiene_baseline.as_ref(), &same_band, 0);
+        assert!(!within_turn.fire);
+        let four_turns = decide_channel1(same_band.tail_hygiene_baseline.as_ref(), &same_band, 4);
+        assert!(!four_turns.fire);
+        let five_turns = decide_channel1(same_band.tail_hygiene_baseline.as_ref(), &same_band, 5);
+        assert!(five_turns.fire);
+        assert!(five_turns.sticky);
     }
 
     #[test]
@@ -9874,19 +10170,94 @@ mod nudge_formula_tests {
         assert!(format_reclaimable_hint(&hint).is_empty());
     }
 
+    #[derive(Debug, Deserialize)]
+    struct ReminderCopyGolden {
+        schema: u32,
+        cases: Vec<ReminderCopyGoldenCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ReminderCopyGoldenCase {
+        id: String,
+        channel: String,
+        level: Option<String>,
+        reclaimable_tool_outputs: usize,
+        reclaimable_tokens: i64,
+        #[serde(default)]
+        sticky: bool,
+        hint: Vec<ReminderCopyGoldenHint>,
+        expected: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ReminderCopyGoldenHint {
+        tag_number: i64,
+        tool_name: String,
+    }
+
     #[test]
-    fn reminder_wording_uses_the_usable_window_and_keeps_gentle_number_free() {
-        let gentle = build_channel1_reminder(Channel1Level::Gentle, 42_000, 128_000, &[], false);
-        assert!(gentle.contains("Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope."));
-        assert!(!gentle.chars().any(|character| character.is_ascii_digit()));
+    fn reminder_copy_matches_the_typescript_golden_without_capacity_gauges() {
+        let golden: ReminderCopyGolden = serde_json::from_str(include_str!(
+            "../testdata/ctx-reduce-nudge-copy-golden.json"
+        ))
+        .expect("parse ctx_reduce nudge copy golden");
+        assert_eq!(golden.schema, 1);
 
-        let firm = build_channel1_reminder(Channel1Level::Firm, 42_000, 128_000, &[], false);
-        assert!(firm.contains("Housekeeping: ~42k of this session's ~128k window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."));
-        let urgent = build_channel1_reminder(Channel1Level::Urgent, 61_000, 128_000, &[], false);
-        assert!(urgent.contains("Housekeeping backlog: ~61k of this session's ~128k window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."));
-
-        let channel2 = build_channel2_reminder_text(55_000, 128_000, &[]);
-        assert_eq!(channel2, "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~55k of ~128k reclaimable).");
+        for reminder in golden.cases {
+            let hint = reminder
+                .hint
+                .iter()
+                .map(|hint| (hint.tag_number, hint.tool_name.clone()))
+                .collect::<Vec<_>>();
+            let rendered = match reminder.channel.as_str() {
+                "channel1" => build_channel1_reminder(
+                    Channel1Level::parse(reminder.level.as_deref().unwrap_or_default())
+                        .expect("channel1 golden must name a known level"),
+                    reminder.reclaimable_tokens,
+                    reminder.reclaimable_tool_outputs,
+                    &hint,
+                    reminder.sticky,
+                ),
+                "channel2" => build_channel2_host_reminder(
+                    reminder.reclaimable_tokens,
+                    reminder.reclaimable_tool_outputs,
+                    &hint,
+                ),
+                unknown => panic!("unknown reminder golden channel: {unknown}"),
+            };
+            assert_eq!(rendered, reminder.expected, "{} copy drifted", reminder.id);
+            assert!(
+                !rendered.contains("of ~"),
+                "{} exposed a denominator",
+                reminder.id
+            );
+            assert!(
+                !rendered.contains("of this session"),
+                "{} exposed session capacity",
+                reminder.id
+            );
+            assert_eq!(
+                Regex::new(r"~\d+(?:\.\d+)?k\b")
+                    .unwrap()
+                    .find_iter(&rendered)
+                    .count(),
+                1,
+                "{} exposed more than the reclaimable token mass",
+                reminder.id
+            );
+            assert!(
+                !Regex::new(r"\b\d+(?:\.\d+)?\s*%")
+                    .unwrap()
+                    .is_match(&rendered),
+                "{} exposed a percentage",
+                reminder.id
+            );
+            assert!(
+                !Regex::new(r"(?i)\bwindow\b").unwrap().is_match(&rendered),
+                "{} exposed context capacity",
+                reminder.id
+            );
+        }
     }
 
     #[test]
@@ -9905,14 +10276,14 @@ mod nudge_formula_tests {
             Channel1Level::Firm,
             3,
         ));
-        assert!(!should_use_sticky_channel1_reminder(
+        assert!(should_use_sticky_channel1_reminder(
             "firm",
             1,
             Channel1Level::Firm,
-            4,
+            6,
         ));
-        // A legacy raw message ordinal must not compare as a user-turn count.
-        assert!(!should_use_sticky_channel1_reminder(
+        // Legacy numeric ordinal values cannot promote a same-band sticky reminder back to full form.
+        assert!(should_use_sticky_channel1_reminder(
             "firm",
             160_750,
             Channel1Level::Firm,
@@ -9924,17 +10295,19 @@ mod nudge_formula_tests {
             Channel1Level::Urgent,
             1,
         ));
-        let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 128_000, &[], true);
-        assert!(sticky.contains("Reminder: ctx_reduce housekeeping still pending —"));
-        assert!(!sticky.contains("Not a limit"));
-        let escalation =
-            build_channel1_reminder(Channel1Level::Urgent, 80_000, 128_000, &[], false);
+        let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 16, &[], true);
+        assert!(
+            sticky.contains("Reminder: 16 spent tool outputs (~70k tokens) are still reclaimable")
+        );
+        let escalation = build_channel1_reminder(Channel1Level::Urgent, 80_000, 16, &[], false);
         assert!(escalation.contains("Housekeeping backlog:"));
     }
 
     #[test]
     fn channel2_aggregate_uses_persisted_all_class_walk_and_holds_invalid_baselines() {
-        let measured = baseline(60_000, 90_000);
+        let mut measured = baseline(60_000, 90_000);
+        measured.channel1_post_reduce_grace_baseline_u = Some(59_000);
+        measured.channel1_post_reduce_grace_pre_level = "urgent".to_string();
         assert_eq!(
             channel2_token_aggregate(Some(&measured)),
             Some((60_000, 90_000))
@@ -10096,52 +10469,65 @@ fn oldest_reclaimable_hint(
     candidates
 }
 
-const CHANNEL1_STICKY_REAL_USER_TURN_GAP: u64 = 3;
+const CHANNEL1_STICKY_REAL_USER_TURN_GAP: u64 = 5;
 
+#[cfg(test)]
 fn should_use_sticky_channel1_reminder(
     last_level: &str,
     last_ordinal: u64,
     level: Channel1Level,
     current_real_user_turn_count: u64,
 ) -> bool {
-    // Never-fired is encoded by an empty last_level, never by ordinal zero: a
-    // window with no real user rows (a pure tool stream) legitimately fires at
-    // count 0 and must still dampen its re-fires. Older module metadata stored
-    // a raw message ordinal here; a raw ordinal greater than the real-user
-    // counter is an incompatible legacy unit, so let one full reminder replace
-    // it instead of damping accidentally.
+    // Turn cadence decides whether the re-fire happens; once a band crossing
+    // has rendered, every later reminder in that band stays calm and sticky.
+    let _ = (last_ordinal, current_real_user_turn_count);
     last_level == level.as_str()
-        && current_real_user_turn_count >= last_ordinal
-        && current_real_user_turn_count - last_ordinal < CHANNEL1_STICKY_REAL_USER_TURN_GAP
+}
+
+fn reclaimable_tool_output_count(baseline: Option<&TailHygieneBaseline>) -> usize {
+    baseline
+        .into_iter()
+        .flat_map(|baseline| baseline.baseline_parts.iter())
+        .filter(|part| part.kind == TailHygienePartKind::ToolOutput && part.u_tokens > 0)
+        .count()
 }
 
 fn build_channel1_reminder(
     level: Channel1Level,
     reclaimable_tokens: i64,
-    usable_window_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: &[(i64, String)],
     sticky: bool,
 ) -> String {
+    let summary = format_reclaimable_output_summary(reclaimable_tool_outputs, reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
     if sticky {
         return format!(
-            "\n\n<system-reminder>\nReminder: ctx_reduce housekeeping still pending —{hint_text}\n</system-reminder>"
+            "\n\n<system-reminder>\nReminder: {summary} are still reclaimable — ctx_reduce them at a natural stopping point.{hint_text}\n</system-reminder>"
         );
     }
 
-    let amount = approx_thousands(reclaimable_tokens);
-    let usable_window = approx_thousands(usable_window_tokens);
     let body = match level {
-        Channel1Level::Gentle =>
-            "Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.".to_string(),
+        Channel1Level::Gentle => format!(
+            "Housekeeping: {summary} are reclaimable — drop the ones you have already processed with ctx_reduce at a natural stopping point."
+        ),
         Channel1Level::Firm => format!(
-            "Housekeeping: ~{amount} of this session's ~{usable_window} window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."
+            "Housekeeping: {summary} are reclaimable — make a ctx_reduce pass at a natural stopping point."
         ),
         Channel1Level::Urgent => format!(
-            "Housekeeping backlog: ~{amount} of this session's ~{usable_window} window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."
+            "Housekeeping backlog: {summary} are reclaimable — a ctx_reduce pass is due."
         ),
     };
     format!("\n\n<system-reminder>\n{body}{hint_text}\n</system-reminder>")
+}
+
+fn format_reclaimable_output_summary(reclaimable_tool_outputs: usize, tokens: i64) -> String {
+    let outputs = match reclaimable_tool_outputs {
+        0 => "spent tool outputs".to_string(),
+        1 => "1 spent tool output".to_string(),
+        count => format!("{count} spent tool outputs"),
+    };
+    format!("{outputs} (~{} tokens)", approx_thousands(tokens))
 }
 
 fn approx_thousands(tokens: i64) -> String {
@@ -11684,6 +12070,43 @@ enum FrozenTrailingBlankDecision {
     Strip,
 }
 
+type TrailingBlankSourceDecisions = HashMap<String, (FrozenTrailingBlankDecision, usize)>;
+
+fn trailing_blank_source_decision(
+    message: &CkIngressMessage,
+) -> Option<(FrozenTrailingBlankDecision, usize)> {
+    if message.ck.role != "assistant" {
+        return None;
+    }
+    let trailing_count = message
+        .ck
+        .content
+        .iter()
+        .rev()
+        .take_while(|block| is_sentinel_invisible_text_block(block))
+        .count();
+    if message.ck.content.is_empty() || trailing_count == message.ck.content.len() {
+        Some((FrozenTrailingBlankDecision::Keep, 1))
+    } else if trailing_count == 0 {
+        Some((FrozenTrailingBlankDecision::Strip, 0))
+    } else if trailing_count <= 10_000 {
+        Some((FrozenTrailingBlankDecision::Keep, trailing_count))
+    } else {
+        None
+    }
+}
+
+fn snapshot_trailing_blank_source_decisions(
+    req: &TransformRequest,
+) -> TrailingBlankSourceDecisions {
+    req.messages
+        .iter()
+        .filter_map(|message| {
+            trailing_blank_source_decision(message).map(|decision| (message.mid.clone(), decision))
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UserTerminatedTailDecision {
     Unchanged,
@@ -11810,7 +12233,7 @@ fn canonical_blank_block() -> CkWireBlock {
     })
 }
 
-fn apply_frozen_trailing_blank_decision(
+pub(crate) fn apply_frozen_trailing_blank_decision(
     core: &CoreState,
     profile: SerializerProfile,
     provider_id: Option<&str>,
@@ -11834,10 +12257,12 @@ fn apply_frozen_trailing_blank_decision(
         .iter()
         .rposition(|block| !is_sentinel_invisible_text_block(block))
     else {
-        if message.content.len() == 1 && message.content.first() == Some(&canonical_blank) {
+        if message.content.is_empty()
+            || (message.content.len() == 1 && message.content.first() == Some(&canonical_blank))
+        {
             return 0;
         }
-        let mutations = message.content.len().max(1);
+        let mutations = message.content.len();
         message.content = vec![canonical_blank];
         message.mark_modified();
         return mutations;
@@ -11855,6 +12280,11 @@ fn apply_frozen_trailing_blank_decision(
         0
     };
     if keep_count > 0 {
+        // A keep may canonicalize a suffix supplied by the harness, but cannot recreate a suffix
+        // that is absent from the current source shape.
+        if trailing_count == 0 {
+            return 0;
+        }
         let blank_index = last_meaningful_index + 1;
         let suffix_is_canonical = trailing_count == keep_count
             && message.content[blank_index..]
@@ -11880,9 +12310,66 @@ fn apply_frozen_trailing_blank_decision(
     trailing_count
 }
 
+fn heal_poisoned_trailing_blank_decisions(
+    core: &mut CoreState,
+    req: &TransformRequest,
+    source_decisions: &TrailingBlankSourceDecisions,
+    rendered_messages: &[ServedMessage],
+    can_mutate_provider_prefix: bool,
+) -> Vec<String> {
+    if !can_mutate_provider_prefix
+        || SerializerProfile::parse(&req.serializer_profile)
+            != Some(SerializerProfile::OpencodeAiSdk)
+        || req.provider_id.as_deref() != Some("anthropic")
+    {
+        return Vec::new();
+    }
+
+    let newest_assistant_mid = latest_assistant_mid(&req.messages);
+    let visible_assistant_ids = rendered_messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| message.meta.harness_id.as_deref())
+        .collect::<HashSet<_>>();
+    let mut healed_ids = source_decisions
+        .iter()
+        .filter_map(|(mid, (decision, _))| {
+            (*decision == FrozenTrailingBlankDecision::Strip
+                && newest_assistant_mid != Some(mid.as_str())
+                && visible_assistant_ids.contains(mid.as_str())
+                && frozen_trailing_blank_decision(core, mid)
+                    == Some(FrozenTrailingBlankDecision::Keep))
+            .then(|| mid.clone())
+        })
+        .collect::<Vec<_>>();
+    healed_ids.sort();
+    if healed_ids.is_empty() {
+        return healed_ids;
+    }
+
+    let replaced_keys = healed_ids
+        .iter()
+        .flat_map(|mid| {
+            [
+                format!("strip:trailing_blank_keep:{mid}"),
+                format!("strip:trailing_blank_strip:{mid}"),
+            ]
+        })
+        .collect::<HashSet<_>>();
+    core.frozen_units
+        .retain(|unit| !replaced_keys.contains(&unit.key));
+    core.frozen_units.extend(
+        healed_ids
+            .iter()
+            .map(|mid| strip_unit("trailing_blank_strip", mid, "")),
+    );
+    healed_ids
+}
+
 fn refresh_trailing_blank_decisions(
     core: &mut CoreState,
     req: &TransformRequest,
+    source_decisions: &TrailingBlankSourceDecisions,
     rendered_messages: &[ServedMessage],
     record_historical: bool,
 ) -> (usize, bool) {
@@ -11901,22 +12388,9 @@ fn refresh_trailing_blank_decisions(
         if rendered.role != "assistant" {
             continue;
         }
-        let trailing_count = rendered
-            .content
-            .iter()
-            .rev()
-            .take_while(|block| is_sentinel_invisible_text_block(block))
-            .count();
-        let (decision, keep_count) =
-            if rendered.content.is_empty() || trailing_count == rendered.content.len() {
-                (FrozenTrailingBlankDecision::Keep, 1)
-            } else if trailing_count == 0 {
-                (FrozenTrailingBlankDecision::Strip, 0)
-            } else if trailing_count <= 10_000 {
-                (FrozenTrailingBlankDecision::Keep, trailing_count)
-            } else {
-                continue;
-            };
+        let Some(&(decision, keep_count)) = source_decisions.get(mid) else {
+            continue;
+        };
         let frozen = frozen_trailing_blank_decision(core, mid);
         let frozen_matches = frozen == Some(decision)
             && (decision == FrozenTrailingBlankDecision::Strip
@@ -12918,15 +13392,12 @@ fn empty_reasoning_sentinel(part: &Value) -> Value {
     let Some(object) = part.as_object() else {
         return Value::Object(sentinel);
     };
-    let part_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("reasoning");
-    sentinel.insert("type".to_string(), Value::String(part_type.to_string()));
-    if object.contains_key("thinking") && !object.contains_key("text") {
-        sentinel.insert("thinking".to_string(), Value::String(String::new()));
-    } else {
-        sentinel.insert("text".to_string(), Value::String(String::new()));
+    sentinel.insert("type".to_string(), Value::String("text".to_string()));
+    sentinel.insert("text".to_string(), Value::String(String::new()));
+    for key in ["cache_control", "cacheControl"] {
+        if let Some(value) = object.get(key) {
+            sentinel.insert(key.to_string(), value.clone());
+        }
     }
     Value::Object(sentinel)
 }
@@ -12935,13 +13406,14 @@ fn is_empty_reasoning_sentinel(part: &Value) -> bool {
     let Some(object) = part.as_object() else {
         return false;
     };
-    if object.len() != 2 || !object.contains_key("type") {
-        return false;
-    }
-    object
-        .get("text")
-        .or_else(|| object.get("thinking"))
-        .is_some_and(|value| value.as_str() == Some(""))
+    object.get("type").and_then(Value::as_str) == Some("text")
+        && object.get("text").and_then(Value::as_str) == Some("")
+        && object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "type" | "text" | "cache_control" | "cacheControl"
+            )
+        })
 }
 
 fn is_sentinel_invisible_text_block(block: &CkWireBlock) -> bool {
@@ -14361,6 +14833,7 @@ pub(crate) mod tests {
             clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
             caveman_enabled: false,
             caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
+            tool_input_key_orders: BTreeMap::new(),
             tool_present: false,
             todo_tool_present: Some(true),
             prompt_surface_preset: PromptSurfacePreset::Full,
@@ -14387,6 +14860,7 @@ pub(crate) mod tests {
             detected_context_limit: 0,
             detected_context_limit_model_key: None,
             history_budget_tokens: None,
+            historian_model_chain: None,
             declared_trim: None,
             lineage_switched: false,
             descent_edge_id: 0,
@@ -15456,6 +15930,26 @@ pub(crate) mod tests {
             serde_json::from_str(include_str!("../testdata/ingress-projection-golden.json"))
                 .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn tail_state_requires_a_result_paired_to_the_newest_assistant_call() {
+        let mut messages = vec![
+            assistant_tool_call("older_call", 1, "call-old"),
+            tool_result("older_result", 2, "call-old", "done"),
+            assistant_tool_call("newest_call", 3, "call-new"),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let live = projection.blocks.iter().collect::<Vec<_>>();
+        assert!(
+            tail_state_from_live(&live).mid_tool_use,
+            "an unrelated result must not end the newest unpaired tool arc"
+        );
+
+        messages.push(tool_result("newest_result", 4, "call-new", "done"));
+        let projection = project_messages(&messages).unwrap();
+        let live = projection.blocks.iter().collect::<Vec<_>>();
+        assert!(!tail_state_from_live(&live).mid_tool_use);
     }
 
     #[test]
@@ -18510,6 +19004,38 @@ pub(crate) mod tests {
         keep_core
             .frozen_units
             .push(strip_unit("trailing_blank_keep", "target", ""));
+        let mut missing_trailing = assistant(stable_content(false));
+        let missing_trailing_bytes = serde_json::to_vec(&missing_trailing).unwrap();
+        assert_eq!(
+            apply_frozen_trailing_blank_decision(
+                &keep_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                "target",
+                &mut missing_trailing,
+            ),
+            0
+        );
+        assert_eq!(
+            serde_json::to_vec(&missing_trailing).unwrap(),
+            missing_trailing_bytes,
+            "a frozen keep must not manufacture an absent suffix"
+        );
+        let mut empty = assistant(Vec::new());
+        assert_eq!(
+            apply_frozen_trailing_blank_decision(
+                &keep_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                "target",
+                &mut empty,
+            ),
+            0
+        );
+        assert!(empty.content.is_empty());
+
         let mut newest_with_trailing = assistant(stable_content(true));
         apply_frozen_trailing_blank_decision(
             &keep_core,
@@ -18643,6 +19169,119 @@ pub(crate) mod tests {
                 &mut non_anthropic,
             ),
             0
+        );
+    }
+
+    #[test]
+    fn trailing_blank_decisions_mint_from_ingress_instead_of_rendered_sentinels() {
+        let target = CkIngressMessage {
+            mid: "target".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "store-derived answer".to_string(),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("target".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let mut request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "trailing-source-only",
+            "cfg",
+            vec![target.clone()],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        let source_decisions = snapshot_trailing_blank_source_decisions(&request);
+        let mut composed = target.ck;
+        composed.content.push(canonical_blank_block());
+        let rendered = vec![ServedMessage::from_message(composed)];
+        let mut core = CoreState::default();
+
+        assert_eq!(
+            refresh_trailing_blank_decisions(
+                &mut core,
+                &request,
+                &source_decisions,
+                &rendered,
+                true,
+            ),
+            (1, false)
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&core, "target"),
+            Some(FrozenTrailingBlankDecision::Strip),
+            "the rendered sentinel must not mint a keep"
+        );
+    }
+
+    #[test]
+    fn trailing_blank_poison_heal_excludes_newest_and_legitimate_keeps() {
+        fn source_assistant(mid: &str, ordinal: u64, trailing: bool) -> CkIngressMessage {
+            let mut content = vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: format!("answer-{mid}"),
+            })];
+            if trailing {
+                content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: " ".to_string(),
+                }));
+            }
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        let historical = source_assistant("legitimate", 1, true);
+        let newest = source_assistant("newest", 2, false);
+        let mut request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "trailing-heal-exclusions",
+            "cfg",
+            vec![historical.clone(), newest.clone()],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        let source_decisions = snapshot_trailing_blank_source_decisions(&request);
+        let rendered = vec![
+            ServedMessage::from_message(historical.ck),
+            ServedMessage::from_message(newest.ck),
+        ];
+        let mut core = CoreState::default();
+        core.frozen_units
+            .push(strip_unit("trailing_blank_keep", "legitimate", ""));
+        core.frozen_units
+            .push(strip_unit("trailing_blank_keep", "newest", ""));
+
+        assert!(heal_poisoned_trailing_blank_decisions(
+            &mut core,
+            &request,
+            &source_decisions,
+            &rendered,
+            true,
+        )
+        .is_empty());
+        assert_eq!(
+            frozen_trailing_blank_decision(&core, "legitimate"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&core, "newest"),
+            Some(FrozenTrailingBlankDecision::Keep)
         );
     }
 
@@ -19014,6 +19653,195 @@ pub(crate) mod tests {
         assert_eq!(
             message_bytes(&structural_replay, "structural"),
             structural_bytes
+        );
+    }
+
+    fn trailing_regression_assistant(
+        mid: &str,
+        ordinal: u64,
+        trailing_text: Option<&str>,
+        structural_finish: bool,
+    ) -> CkIngressMessage {
+        let mut content = vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+            text: format!("answer-{mid}"),
+        })];
+        if structural_finish {
+            content.push(CkWireBlock::bare(ck_wire::CkKind::Opaque(
+                ck_wire::OpaqueBlock {
+                    source: json!({ "source": "opencode" }),
+                    kind: "step-finish".to_string(),
+                    raw: json!({ "type": "step-finish", "reason": "tool-calls" }),
+                    arc: None,
+                },
+            )));
+        }
+        if let Some(text) = trailing_text {
+            content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: text.to_string(),
+            }));
+        }
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                content,
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn trailing_regression_request(
+        session: &str,
+        messages: Vec<CkIngressMessage>,
+    ) -> TransformRequest {
+        let mut request = profile_req(SerializerProfile::OpencodeAiSdk, session, "cfg", messages);
+        request.provider_id = Some("anthropic".to_string());
+        request
+    }
+
+    fn trailing_regression_message_bytes(response: &TransformResponse, mid: &str) -> Vec<u8> {
+        response
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+            .expect("trailing-blank regression target must be served")
+            .canonical_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn poisoned_trailing_blank_keep_heals_only_on_a_visible_bust_and_replays_stably() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-poison-heal";
+        let bootstrap = run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+        assert_eq!(bootstrap.action, "HARD");
+
+        let mut loaded = store.load(session).unwrap();
+        loaded
+            .core
+            .frozen_units
+            .push(strip_unit("trailing_blank_keep", "poisoned", ""));
+        store
+            .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let messages = || {
+            vec![
+                item("user-0", 1, "start"),
+                trailing_regression_assistant("poisoned", 2, None, true),
+                trailing_regression_assistant("newest", 3, None, false),
+            ]
+        };
+        let defer = run(
+            &store,
+            &trailing_regression_request(session, messages()),
+            &spine(),
+        );
+        assert_eq!(defer.action, "SOFT+");
+        let defer_target = defer
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("poisoned"))
+            .unwrap();
+        assert_eq!(defer_target.content.last(), Some(&canonical_blank_block()));
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "poisoned"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+
+        let mut bust_request = trailing_regression_request(session, messages());
+        bust_request.render_config = "cfg-bust".to_string();
+        let bust = run(&store, &bust_request, &spine());
+        assert_eq!(bust.action, "HARD");
+        let bust_bytes = trailing_regression_message_bytes(&bust, "poisoned");
+        let bust_target = bust
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("poisoned"))
+            .unwrap();
+        assert!(matches!(
+            &bust_target.content.last().unwrap().kind,
+            ck_wire::CkKind::Text { text } if text == "answer-poisoned"
+        ));
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "poisoned"),
+            Some(FrozenTrailingBlankDecision::Strip)
+        );
+
+        for _ in 0..2 {
+            let mut replay_request = trailing_regression_request(session, messages());
+            replay_request.render_config = "cfg-bust".to_string();
+            let replay = run(&store, &replay_request, &spine());
+            assert_eq!(replay.action, "SOFT+");
+            assert_eq!(
+                trailing_regression_message_bytes(&replay, "poisoned"),
+                bust_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn decisionless_historical_late_blank_is_bounded_by_the_next_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-decisionless-late";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+
+        let messages = || {
+            vec![
+                item("user-0", 1, "start"),
+                trailing_regression_assistant("late", 2, Some(" \t"), false),
+                trailing_regression_assistant("newest", 3, None, false),
+            ]
+        };
+        let defer = run(
+            &store,
+            &trailing_regression_request(session, messages()),
+            &spine(),
+        );
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "late"),
+            None
+        );
+        let defer_bytes = trailing_regression_message_bytes(&defer, "late");
+
+        let mut bust_request = trailing_regression_request(session, messages());
+        bust_request.render_config = "cfg-bust".to_string();
+        let bust = run(&store, &bust_request, &spine());
+        assert_eq!(bust.action, "HARD");
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "late"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+        let bust_bytes = trailing_regression_message_bytes(&bust, "late");
+        assert_ne!(
+            bust_bytes, defer_bytes,
+            "the already-priced bust canonicalizes the late store blank once"
+        );
+
+        let mut replay_request = trailing_regression_request(session, messages());
+        replay_request.render_config = "cfg-bust".to_string();
+        let replay = run(&store, &replay_request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            trailing_regression_message_bytes(&replay, "late"),
+            bust_bytes
         );
     }
 
@@ -20417,10 +21245,7 @@ pub(crate) mod tests {
             1,
             "the newest assistant is exempt even after completion"
         );
-        assert_eq!(
-            native[0]["parts"][0],
-            json!({ "type": "reasoning", "text": "" })
-        );
+        assert_eq!(native[0]["parts"][0], json!({ "type": "text", "text": "" }));
         assert_eq!(native[1]["parts"][0]["text"], "thinking-latest");
         let first_pass = native.clone();
         assert_eq!(
@@ -24707,6 +25532,13 @@ pub(crate) mod tests {
             title: None,
             note_status: None,
             surface_condition: None,
+            score_hundredths: 100,
+            start_ordinal: None,
+            end_ordinal: None,
+            note_created_at_ms: None,
+            note_anchor_ordinal: None,
+            note_session_id: None,
+            source_project_path: None,
         }];
         let singular = render_user_hint(&single).unwrap();
         assert!(singular.contains("Your memory may contain 1 related fragment:"));
@@ -24721,6 +25553,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             })
             .collect::<Vec<_>>();
         let hint = render_user_hint(&results).unwrap();
@@ -24744,6 +25583,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
             crate::memory_tool::MemorySearchResult {
                 source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
@@ -24754,6 +25600,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
             crate::memory_tool::MemorySearchResult {
                 source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
@@ -24764,6 +25617,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
         ])
         .unwrap();
@@ -24791,6 +25651,37 @@ pub(crate) mod tests {
         );
         let astral_capped = truncate_hint_to_total_cap(&astral_wrapped, USER_HINT_TOTAL_CHAR_CAP);
         assert!(astral_capped.encode_utf16().count() <= USER_HINT_TOTAL_CHAR_CAP);
+    }
+
+    #[test]
+    fn reasoning_sentinel_matches_typescript_cache_metadata_golden() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "reasoning_cache_control")
+            .unwrap();
+        let original = &fixture["raw_messages"][1]["parts"][0];
+        assert_eq!(
+            empty_reasoning_sentinel(original),
+            fixture["expected_sentinel"]
+        );
+    }
+
+    #[test]
+    fn response_encoder_emits_javascript_lone_surrogate_escape() {
+        let units = "a😀b".encode_utf16().collect::<Vec<_>>();
+        let internal = string_from_js_utf16_prefix(&units, 2);
+        assert_eq!(js_utf16_units_from_internal(&internal), units[..2]);
+        let encoded = serde_json::to_vec(&internal).unwrap();
+        assert_eq!(
+            encode_js_surrogate_markers(encoded),
+            br#""a\ud83d""#.to_vec()
+        );
     }
 
     #[test]
@@ -26197,8 +27088,43 @@ pub(crate) mod tests {
             assert_eq!(tail_bytes(&replay, "result2"), first_result);
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
 
+            let mut grace_meta = s.load("nudge").unwrap();
+            let grace_u =
+                effective_tail_hygiene(grace_meta.meta.tail_hygiene_baseline.as_ref().unwrap()).0;
+            let grace_level = grace_meta.meta.channel1_last_nudge_level.clone();
+            let grace_baseline = grace_meta.meta.tail_hygiene_baseline.as_mut().unwrap();
+            grace_baseline.channel1_post_reduce_grace_baseline_u = Some(grace_u);
+            grace_baseline.channel1_post_reduce_grace_pre_level = grace_level;
+            s.commit(
+                "nudge",
+                grace_meta.row_version,
+                &grace_meta.core,
+                &grace_meta.meta,
+            )
+            .unwrap();
+            let grace_replay = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&grace_replay, "result2"), first_result);
+            assert_eq!(
+                grace_replay
+                    .messages()
+                    .iter()
+                    .map(|message| message.canonical_bytes())
+                    .collect::<Vec<_>>(),
+                replay
+                    .messages()
+                    .iter()
+                    .map(|message| message.canonical_bytes())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+
             let mut refire_meta = s.load("nudge").unwrap();
+            let refire_baseline = refire_meta.meta.tail_hygiene_baseline.as_mut().unwrap();
+            refire_baseline.channel1_post_reduce_grace_baseline_u = None;
+            refire_baseline.channel1_post_reduce_grace_pre_level.clear();
             refire_meta.meta.channel1_last_nudge_undropped = 0;
+            // Exercise reminder wording after the five-real-user-turn cadence gate without adding another fixture turn.
+            refire_meta.meta.channel1_last_fire_ordinal = u64::MAX;
             s.commit(
                 "nudge",
                 refire_meta.row_version,
@@ -26215,8 +27141,13 @@ pub(crate) mod tests {
             let refire_request = with_usage(refire_request, 900, 1024);
             let sticky = run(&s, &refire_request, &spine());
             let sticky_result = tail_bytes(&sticky, "result3").to_string();
+            assert_eq!(
+                tail_bytes(&sticky, "result2"),
+                first_result,
+                "the first reminder span is frozen while the new cache-busting tail appends its own span"
+            );
             assert!(
-                sticky_result.contains("Reminder: ctx_reduce housekeeping still pending —"),
+                sticky_result.contains("Reminder: "),
                 "expected sticky refire, got {sticky_result}"
             );
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
@@ -26291,13 +27222,17 @@ pub(crate) mod tests {
             );
             assert!(!tail_bytes(&applying, "result5").contains("<system-reminder>"));
             assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+            assert!(after_applying
+                .meta
+                .tail_hygiene_baseline
+                .as_ref()
+                .and_then(|baseline| baseline.channel1_post_reduce_grace_baseline_u)
+                .is_some());
 
             let resumed = run(&s, &applying_request, &spine());
             let resumed_result = tail_bytes(&resumed, "result5");
-            assert!(resumed_result.contains("<system-reminder>"));
-            assert!(resumed_result.contains("Housekeeping"));
-            assert!(!resumed_result.contains("Reminder: ctx_reduce housekeeping still pending"));
-            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 2);
+            assert!(!resumed_result.contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
         });
     }
 
@@ -27810,6 +28745,10 @@ pub(crate) mod tests {
                 session_id: Some("writer"),
                 content: "ready note survives pressure refold",
                 surface_condition: Some("condition true"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 1,
@@ -28633,6 +29572,16 @@ pub(crate) mod tests {
         request.caveman_enabled = true;
         request.caveman_min_chars = 1;
         request.protected_tags = 0;
+        request.messages[0].ck.role = "assistant".to_string();
+        request.messages[0]
+            .ck
+            .content
+            .push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: "mixed-call".to_string(),
+                name: "read".to_string(),
+                input: json!({ "filePath": "src/lib.rs" }),
+                provider_executed: false,
+            }));
         let projection = project_messages(&request.messages).unwrap();
         let live = projection
             .blocks

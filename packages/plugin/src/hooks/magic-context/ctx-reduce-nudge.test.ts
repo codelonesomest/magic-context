@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
     buildChannel1Reminder,
     buildChannel2Reminder,
@@ -6,6 +7,7 @@ import {
     CHANNEL1_MIN_TOKENS,
     CHANNEL2_FLOOR_TOKENS,
     CHANNEL2_SEVERITY_THRESHOLD,
+    type Channel1Level,
     channel1RefireTokens,
     decideChannel1,
     evaluateChannel2,
@@ -150,7 +152,7 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
         expect(channel1RefireTokens(1_000_000)).toBe(80_000);
     });
 
-    it("post-reduce suppression clears cadence and band state", () => {
+    it("holds dirty post-reduce input without resetting the observed band", () => {
         const decision = decideChannel1({
             ...base,
             baselineU: 70_000,
@@ -159,53 +161,174 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
             hasRecentReduce: true,
         });
         expect(decision.fire).toBe(false);
-        expect(decision.nextLastNudge).toBe(0);
-        expect(decision.nextLastNudgeLevel).toBe("");
+        expect(decision.nextLastNudge).toBe(60_000);
+        expect(decision.nextLastNudgeLevel).toBe("urgent");
     });
 
-    it("a measured U collapse re-arms the cycle", () => {
-        const decision = decideChannel1({
+    it("records a measured U collapse quietly and re-arms an upward crossing", () => {
+        const collapse = decideChannel1({
             ...base,
             baselineU: 30_000,
             baselineT: 100_000,
             lastNudgeUndropped: 80_000,
             lastNudgeLevel: "urgent",
         });
-        expect(decision.fire).toBe(true);
-        expect(decision.level).toBe("gentle");
+        expect(collapse.fire).toBe(false);
+        expect(collapse.nextLastNudge).toBe(30_000);
+        expect(collapse.nextLastNudgeLevel).toBe("gentle");
+        const recrossing = decideChannel1({
+            ...base,
+            baselineU: 45_000,
+            baselineT: 100_000,
+            lastNudgeUndropped: collapse.nextLastNudge,
+            lastNudgeLevel: collapse.nextLastNudgeLevel,
+        });
+        expect(recrossing.fire).toBe(true);
+        expect(recrossing.level).toBe("firm");
+        expect(recrossing.sticky).toBe(false);
+    });
+
+    it("pins post-reduce grace to post-drop U until full regrowth", () => {
+        const specimen = {
+            ...base,
+            baselineU: 60_000,
+            baselineT: 150_000,
+            lastNudgeUndropped: 30_000,
+            lastNudgeLevel: "firm" as const,
+            lastFireOrdinal: 0,
+            currentRealUserTurnCount: 5,
+            postReduceGraceBaselineU: 60_000,
+            postReduceGracePreLevel: "firm" as const,
+        };
+        const immediate = decideChannel1(specimen);
+        expect(immediate.fire).toBe(false);
+        expect(immediate.clearPostReduceGrace).toBe(false);
+        const almost = decideChannel1({ ...specimen, baselineU: 84_999 });
+        expect(almost.fire).toBe(false);
+        const regrown = decideChannel1({ ...specimen, baselineU: 85_000 });
+        expect(regrown.fire).toBe(true);
+        expect(regrown.sticky).toBe(true);
+        expect(regrown.clearPostReduceGrace).toBe(true);
+
+        // Mutation control: removing grace makes the immediate same-band cadence fire.
+        expect(
+            decideChannel1({
+                ...specimen,
+                postReduceGraceBaselineU: undefined,
+                postReduceGracePreLevel: undefined,
+            }).fire,
+        ).toBe(true);
+    });
+
+    it("breaks grace on a band escalation while Channel 2 remains independent", () => {
+        const escalation = decideChannel1({
+            ...base,
+            baselineU: 61_000,
+            baselineT: 100_000,
+            lastNudgeUndropped: 60_000,
+            lastNudgeLevel: "firm",
+            lastFireOrdinal: 8,
+            currentRealUserTurnCount: 8,
+            postReduceGraceBaselineU: 60_000,
+            postReduceGracePreLevel: "firm",
+        });
+        expect(escalation.fire).toBe(true);
+        expect(escalation.level).toBe("urgent");
+        expect(escalation.sticky).toBe(false);
+        expect(escalation.clearPostReduceGrace).toBe(true);
+
+        const channel1Held = decideChannel1({
+            ...base,
+            baselineU: 75_000,
+            baselineT: 100_000,
+            lastNudgeUndropped: 74_000,
+            lastNudgeLevel: "urgent",
+            postReduceGraceBaselineU: 74_000,
+            postReduceGracePreLevel: "urgent",
+        });
+        expect(channel1Held.fire).toBe(false);
+        expect(
+            evaluateChannel2({
+                ...base,
+                baselineU: 75_000,
+                baselineT: 100_000,
+            }).shouldTrigger,
+        ).toBe(true);
     });
 });
 
+type ReminderCopyGolden = {
+    schema: number;
+    cases: Array<{
+        id: string;
+        channel: "channel1" | "channel2";
+        level?: Channel1Level;
+        reclaimable_tool_outputs: number;
+        reclaimable_tokens: number;
+        sticky?: boolean;
+        hint: Array<{ tag_number: number; tool_name: string | null }>;
+        expected: string;
+    }>;
+};
+
+const reminderCopyGolden = JSON.parse(
+    readFileSync(
+        new URL(
+            "../../../../../crates/mc-module/testdata/ctx-reduce-nudge-copy-golden.json",
+            import.meta.url,
+        ),
+        "utf8",
+    ),
+) as ReminderCopyGolden;
+
+function renderReminderGoldenCase(reminder: ReminderCopyGolden["cases"][number]): string {
+    const hint = reminder.hint.map(({ tag_number, tool_name }) => ({
+        tagNumber: tag_number,
+        toolName: tool_name,
+    }));
+    if (reminder.channel === "channel2") {
+        return buildChannel2Reminder(
+            reminder.reclaimable_tokens,
+            reminder.reclaimable_tool_outputs,
+            hint,
+        );
+    }
+    if (!reminder.level) throw new Error(`${reminder.id} needs a Channel-1 level`);
+    return buildChannel1Reminder(
+        reminder.level,
+        reminder.reclaimable_tokens,
+        reminder.reclaimable_tool_outputs,
+        hint,
+        reminder.sticky,
+    );
+}
+
 describe("reminder rendering", () => {
-    it("renders the user-approved gentle body without numbers", () => {
-        const reminder = buildChannel1Reminder("gentle", 42_000, 128_000);
-        expect(reminder).toContain(
-            "Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.",
-        );
-        expect(reminder).not.toMatch(/\d/);
+    it("matches the TypeScript copy golden for every rendered band", () => {
+        expect(reminderCopyGolden.schema).toBe(1);
+        for (const reminder of reminderCopyGolden.cases) {
+            expect(renderReminderGoldenCase(reminder), reminder.id).toBe(reminder.expected);
+        }
     });
 
-    it("renders firm and urgent denominators plus the unchanged hint line", () => {
-        const firm = buildChannel1Reminder("firm", 42_000, 128_000, [
-            { tagNumber: 123, toolName: "read" },
-            { tagNumber: 145, toolName: null },
-        ]);
-        expect(firm).toContain(
-            "Housekeeping: ~42k of this session's ~128k window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way.",
-        );
-        expect(firm).toContain("oldest reclaimable: §123§ read · §145§ tool.");
-
-        const urgent = buildChannel1Reminder("urgent", 61_000, 128_000);
-        expect(urgent).toContain(
-            "Housekeeping backlog: ~61k of this session's ~128k window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope.",
-        );
-    });
-
-    it("renders the user-approved Channel-2 carrier with its denominator", () => {
-        const reminder = buildChannel2Reminder(55_000, 128_000);
-        expect(reminder).toContain(
-            "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~55k of ~128k reclaimable).",
-        );
+    it("never exposes a context-capacity gauge in any rendered band", () => {
+        for (const reminder of reminderCopyGolden.cases) {
+            const rendered = renderReminderGoldenCase(reminder);
+            expect(rendered, `${reminder.id} must not expose a denominator`).not.toContain("of ~");
+            expect(rendered, `${reminder.id} must not expose session capacity`).not.toContain(
+                "of this session",
+            );
+            expect(
+                rendered.match(/~\d+(?:\.\d+)?k\b/g) ?? [],
+                `${reminder.id} must expose only the reclaimable token mass`,
+            ).toHaveLength(1);
+            expect(rendered, `${reminder.id} must not expose a percentage`).not.toMatch(
+                /\b\d+(?:\.\d+)?\s*%/,
+            );
+            expect(rendered, `${reminder.id} must not expose context capacity`).not.toMatch(
+                /\bwindow\b/i,
+            );
+        }
     });
 
     it("dampens re-fires in a window with zero real user turns (pure tool stream)", () => {
@@ -230,7 +353,7 @@ describe("reminder rendering", () => {
         ).toBe(false);
     });
 
-    it("dampens same-level refires before three real user turns but not escalations", () => {
+    it("keeps every same-band re-fire sticky while escalations stay full", () => {
         expect(
             shouldUseStickyChannel1Reminder({
                 lastLevel: "firm",
@@ -244,9 +367,9 @@ describe("reminder rendering", () => {
                 lastLevel: "firm",
                 lastOrdinal: 10,
                 level: "firm",
-                currentRealUserTurnCount: 13,
+                currentRealUserTurnCount: 15,
             }),
-        ).toBe(false);
+        ).toBe(true);
         expect(
             shouldUseStickyChannel1Reminder({
                 lastLevel: "firm",
@@ -263,13 +386,16 @@ describe("reminder rendering", () => {
                 level: "firm",
                 currentRealUserTurnCount: 12,
             }),
-        ).toBe(false);
+        ).toBe(true);
 
-        const sticky = buildChannel1Reminder("firm", 70_000, 128_000, undefined, true);
-        expect(sticky).toContain("Reminder: ctx_reduce housekeeping still pending —");
-        expect(sticky).not.toContain("Not a limit");
-        const escalation = buildChannel1Reminder("urgent", 80_000, 128_000, undefined, false);
-        expect(escalation).toContain("Housekeeping backlog:");
+        const sticky = buildChannel1Reminder("firm", 70_000, 16, undefined, true);
+        expect(sticky).toContain(
+            "Reminder: 16 spent tool outputs (~70k tokens) are still reclaimable",
+        );
+        const escalation = buildChannel1Reminder("urgent", 80_000, 16, undefined, false);
+        expect(escalation).toContain("Housekeeping backlog: 16 spent tool outputs (~80k tokens)");
+        expect(escalation).toContain("a ctx_reduce pass is due");
+        expect(sticky).not.toContain("a ctx_reduce pass is due");
     });
 });
 

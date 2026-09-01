@@ -9,10 +9,12 @@ import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { getPendingOps } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getTagsBySession } from "../../features/magic-context/storage-tags";
+import { getMagicContextStorageResolution } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
 import type { TailHygieneStatus } from "../../shared/rpc-types";
+import { RUST_MODE_HOST_PATHS_LINE } from "../../shared/rust-mode-status";
 import type { Database } from "../../shared/sqlite";
 import { formatTailHygiene } from "../../shared/tail-hygiene-status";
 import {
@@ -69,6 +71,8 @@ export function executeStatus(
     dreamer?: { backlog?: DreamTaskBacklogMap; progress?: DreamTaskProgress | null },
     windowGeometry?: WindowGeometryResult,
     tailHygiene?: TailHygieneStatus,
+    contextUsage?: { inputTokens: number; percentage: number },
+    rustMode = false,
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
     // which config source won (tokens vs percentage). Previously /ctx-status
@@ -113,11 +117,13 @@ export function executeStatus(
             executeThresholdPercentage,
         );
 
+        const displayInputTokens = contextUsage?.inputTokens ?? meta.lastInputTokens;
+        const displayPercentage = contextUsage?.percentage ?? meta.lastContextPercentage;
         const displayContextLimit =
             contextLimit && contextLimit > 0
                 ? contextLimit
-                : meta.lastContextPercentage > 0
-                  ? Math.round(meta.lastInputTokens / (meta.lastContextPercentage / 100))
+                : displayPercentage > 0
+                  ? Math.round(displayInputTokens / (displayPercentage / 100))
                   : 0;
 
         const lines: string[] = [
@@ -146,11 +152,16 @@ export function executeStatus(
             "",
             "### Execute Threshold",
             `- Execute threshold: ${formatExecuteThreshold(thresholdDetail, displayContextLimit)}`,
-            `- Last input tokens: ${meta.lastInputTokens.toLocaleString()} tokens`,
+            `- Last input tokens: ${displayInputTokens.toLocaleString()} tokens`,
             "",
             `**Protected tags:** ${protectedTags}`,
             `**Subagent session:** ${meta.isSubagent}`,
         ];
+
+        const storage = getMagicContextStorageResolution();
+        lines.push("", `**Storage:** ${storage.path} (${storage.source})`);
+
+        if (rustMode) lines.push("", "### Rust Mode", `- ${RUST_MODE_HOST_PATHS_LINE}`);
 
         if (tailHygiene !== undefined) {
             lines.push(
@@ -174,15 +185,15 @@ export function executeStatus(
             );
         }
 
-        if (meta.lastContextPercentage > 0 || meta.lastInputTokens > 0) {
+        if (displayPercentage > 0 || displayInputTokens > 0) {
             lines.push(
                 "",
                 "### Context Usage",
-                `- Last percentage: ${meta.lastContextPercentage.toFixed(1)}%`,
-                `- Last input tokens: ${meta.lastInputTokens.toLocaleString()}`,
+                `- Last percentage: ${displayPercentage.toFixed(1)}%`,
+                `- Last input tokens: ${displayInputTokens.toLocaleString()}`,
                 `- Resolved context limit: ${displayContextLimit > 0 ? displayContextLimit.toLocaleString() : "unknown"}`,
                 ...(windowGeometry
-                    ? [`- ${formatWindowDerivationLine(meta.lastInputTokens, windowGeometry)}`]
+                    ? [`- ${formatWindowDerivationLine(displayInputTokens, windowGeometry)}`]
                     : []),
                 `- Proactive compartment evaluation: ${proactiveCompartmentTrigger}%`,
                 `- Post-drop target for historian: ${(executeThresholdPercentage * POST_DROP_TARGET_RATIO).toFixed(0)}% (${executeThresholdPercentage}% * ${POST_DROP_TARGET_RATIO})`,

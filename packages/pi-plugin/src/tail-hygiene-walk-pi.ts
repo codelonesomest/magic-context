@@ -581,7 +581,7 @@ export function measurePiTailHygiene(
 					}
 					continue;
 				}
-				const content = part.text;
+				const content = stripChannel1ReminderSpans(part.text);
 				const tag =
 					parseVisibleTag(content, tagsByNumber) ??
 					messageTags.get(`${messageKey}:p${textOrdinal}`);
@@ -714,6 +714,7 @@ export function refreshPiTailHygieneBaseline(
 			generationInvalidated: false,
 			baselineParts: measured.parts,
 			contentSignature: measured.contentSignature,
+			channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
 		};
 	}
 

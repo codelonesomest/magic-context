@@ -1,7 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import * as logger from "../../shared/logger";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import type { AuthorityModuleClient, AuthorityStatus, ChangefeedPage } from "./context-authority";
 import {
@@ -12,12 +15,15 @@ import {
     ensureContextStoreUuid,
     ensureLiveMemoryResnapshot,
     getAuthorityManagedMarker,
+    getMirrorCursor,
     getModuleNoteEvaluationBridge,
     installAuthorityManagedMarker,
+    observeAuthorityRouting,
     prepareAuthority,
     pullAndApplyMirrorPage,
     reconcileAuthorityProject,
     registerModuleNoteEvaluationBridge,
+    resetAuthorityRoutingObservationsForTest,
 } from "./context-authority";
 import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/storage-memory";
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
@@ -30,6 +36,75 @@ function db(): Database {
     initializeDatabase(value);
     runMigrations(value);
     return value;
+}
+
+function memoryIdentityFingerprint(
+    database: Database,
+    projectPath: string,
+): {
+    ids: number[];
+    count: number;
+    contentHash: string;
+    supersededHash: string;
+} {
+    const rows = database
+        .prepare(
+            "SELECT id, content, superseded_by_memory_id FROM memories WHERE project_path = ? ORDER BY id",
+        )
+        .all(projectPath) as Array<{
+        id: number;
+        content: string;
+        superseded_by_memory_id: number | null;
+    }>;
+    const digest = (values: string[]): string =>
+        createHash("sha256").update(values.join("\n")).digest("hex");
+    return {
+        ids: rows.map((row) => row.id),
+        count: rows.length,
+        contentHash: digest(rows.map((row) => `${row.id}${row.content}`)),
+        supersededHash: digest(rows.map((row) => `${row.id}>${row.superseded_by_memory_id ?? ""}`)),
+    };
+}
+
+function completeMemorySnapshot(
+    storeUuid: string,
+    contextRowId: number,
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+    return {
+        id: 9397,
+        project_path: "/repo",
+        category: "CONSTRAINTS",
+        content: "module memory",
+        normalized_hash: "module-hash",
+        importance: 60,
+        scope: "project",
+        shareable: 0,
+        source_session_id: "module-session",
+        source_type: "historian",
+        seen_count: 1,
+        retrieval_count: 0,
+        first_seen_at: 10,
+        created_at: 10,
+        updated_at: 100,
+        last_seen_at: 100,
+        last_retrieved_at: null,
+        status: "active",
+        expires_at: null,
+        verification_status: "unverified",
+        verified_at: null,
+        classified_at: 100,
+        superseded_by_memory_id: null,
+        merged_from: null,
+        metadata_json: null,
+        context_store_uuid: storeUuid,
+        context_row_id: contextRowId,
+        mural_cue: null,
+        mural_cue_hash: null,
+        mural_cue_at: null,
+        mural_cue_rejection_count: 0,
+        ...overrides,
+    };
 }
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -78,6 +153,52 @@ function protocol(seedCalls: { bytes: number[] }): AuthorityModuleClient {
 }
 
 describe("memory authority protocol", () => {
+    test("declares host-path routing once for each ownership transition", () => {
+        resetAuthorityRoutingObservationsForTest();
+        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            observeAuthorityRouting("/repo/transition", "TS");
+            observeAuthorityRouting("/repo/transition", "MODULE");
+            observeAuthorityRouting("/repo/transition", "MODULE");
+            observeAuthorityRouting("/repo/transition", "TS");
+            observeAuthorityRouting("/repo/transition", "TS");
+
+            const declarations = logSpy.mock.calls
+                .map(([message]) => message)
+                .filter((message) => message.includes("project /repo/transition authority"));
+            expect(
+                declarations.filter((message) => message.includes("authority → MODULE")),
+            ).toHaveLength(1);
+            expect(
+                declarations.filter((message) => message.includes("authority → TS")),
+            ).toHaveLength(1);
+            expect(declarations[0]).toContain(
+                "host backends → MODULE: ctx_memory, ctx_note; historian: module-side",
+            );
+        } finally {
+            logSpy.mockRestore();
+            resetAuthorityRoutingObservationsForTest();
+        }
+    });
+
+    test("declares a boot-time MODULE authority once", () => {
+        resetAuthorityRoutingObservationsForTest();
+        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            observeAuthorityRouting("/repo/boot", "MODULE");
+            observeAuthorityRouting("/repo/boot", "MODULE");
+
+            const declarations = logSpy.mock.calls
+                .map(([message]) => message)
+                .filter((message) => message.includes("project /repo/boot authority → MODULE"));
+            expect(declarations).toHaveLength(1);
+            expect(declarations[0]).toContain("ctx_memory, ctx_note; historian: module-side");
+        } finally {
+            logSpy.mockRestore();
+            resetAuthorityRoutingObservationsForTest();
+        }
+    });
+
     test("historical sparse note feed rows preserve rich local columns", () => {
         const database = db();
         const localStoreUuid = ensureContextStoreUuid(database);
@@ -132,6 +253,54 @@ describe("memory authority protocol", () => {
             check_version: 7,
             policy_version: 3,
         });
+    });
+
+    test("mirrored note compilation updates its audit timestamp", () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO notes (id, type, status, content, project_path, session_id, created_at, updated_at) VALUES (71, 'smart', 'active', 'note', '/repo', 'session', 1, 1)",
+                )
+                .run();
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('notes', '/repo', 7, 71)",
+                )
+                .run();
+        });
+
+        expect(
+            applyMirroredNoteCompileFields({
+                db: database,
+                moduleProject: "/repo",
+                moduleRowId: 7,
+                fields: {
+                    compiledProvider: "local-fs",
+                    compiledConfig: '{"kind":"path_exists"}',
+                    compiledAt: 99,
+                    compileStatus: "compiled",
+                },
+            }),
+        ).toBe(true);
+        const note = database
+            .prepare(
+                "SELECT compiled_provider, compiled_config, compiled_at, compile_status, updated_at FROM notes WHERE id = 71",
+            )
+            .get() as {
+            compiled_provider: string;
+            compiled_config: string;
+            compiled_at: number;
+            compile_status: string;
+            updated_at: number;
+        };
+        expect(note).toMatchObject({
+            compiled_provider: "local-fs",
+            compiled_config: '{"kind":"path_exists"}',
+            compiled_at: 99,
+            compile_status: "compiled",
+        });
+        expect(note.updated_at).toBeGreaterThan(1);
     });
 
     test("repeated note drains replace a re-minted module row for the same context note", async () => {
@@ -493,6 +662,7 @@ describe("memory authority protocol", () => {
                         status: "active",
                         verified_at: 1234,
                         mapping: ["src/lib.rs", "src/lib.rs"],
+                        mapping_origin: "mapper",
                         context_store_uuid: storeUuid,
                         context_row_id: contextMemory.id,
                     },
@@ -504,6 +674,7 @@ describe("memory authority protocol", () => {
             contextMemory.id,
         );
         expect(verification?.files).toEqual(["src/lib.rs"]);
+        expect(verification?.mappingOrigin).toBe("mapper");
         expect(verification?.verifiedAt).toBe(1234);
 
         applyMirrorPage({
@@ -529,6 +700,35 @@ describe("memory authority protocol", () => {
         expect(getMemoryVerifications(database, [contextMemory.id]).has(contextMemory.id)).toBe(
             false,
         );
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 2,
+                next_cursor: 3,
+                has_more: false,
+                rows: [
+                    {
+                        ...page.rows[0]!,
+                        feed_seq: 3,
+                        full_row_snapshot: {
+                            ...page.rows[0]!.full_row_snapshot,
+                            mapping: [],
+                            mapping_origin: "host_rejected_fallback",
+                            verified_at: 0,
+                        },
+                    },
+                ],
+            },
+        });
+        expect(
+            getMemoryVerifications(database, [contextMemory.id]).get(contextMemory.id),
+        ).toMatchObject({
+            files: [],
+            hasSentinel: true,
+            mappingOrigin: "host_rejected_fallback",
+        });
     });
     test("preserves source metadata across the historical 9397 mapping sequence", () => {
         const database = db();
@@ -685,8 +885,425 @@ describe("memory authority protocol", () => {
             page: { domain: "memories", cursor: 0, next_cursor: 0, has_more: false, rows: [] },
         });
         expect(
-            database.prepare("SELECT source_type, importance FROM memories WHERE id = 9397").get(),
-        ).toEqual({ source_type: "agent", importance: 66 });
+            database
+                .prepare("SELECT source_type, importance, updated_at FROM memories WHERE id = 9397")
+                .get(),
+        ).toMatchObject({ source_type: "agent", importance: 66 });
+        expect(
+            (
+                database.prepare("SELECT updated_at FROM memories WHERE id = 9397").get() as {
+                    updated_at: number;
+                }
+            ).updated_at,
+        ).toBeGreaterThan(1);
+    });
+
+    test("drain preserves host classification and status newer than the retained snapshot", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        installAuthorityManagedMarker(database, "/repo", storeUuid);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash, importance, scope,
+                        shareable, source_session_id, source_type, seen_count, retrieval_count,
+                        first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
+                        status, expires_at, verification_status, verified_at, classified_at,
+                        merged_from, metadata_json, mural_cue, mural_cue_hash, mural_cue_at,
+                        mural_cue_rejection_count
+                     ) VALUES (
+                        391, '/repo', 'CONSTRAINTS', 'module memory', 'module-hash', 60, 'project',
+                        0, 'module-session', 'historian', 1, 0, 10, 10, 100, 100, NULL,
+                        'active', NULL, 'unverified', NULL, 100, NULL, NULL, NULL, NULL, NULL, 0
+                     )`,
+                )
+                .run();
+        });
+        const staleSnapshot = completeMemorySnapshot(storeUuid, 391);
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 9397,
+                        full_row_snapshot: staleSnapshot,
+                        content_hash: "module-hash",
+                    },
+                ],
+            },
+        });
+
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `UPDATE memories
+                        SET importance = 91, scope = 'universe', shareable = 1,
+                            source_type = 'classifier', status = 'archived',
+                            updated_at = 300, classified_at = 300
+                      WHERE id = 391`,
+                )
+                .run();
+        });
+
+        // Failed Rust passes do not advance the module mirror. The sparse mapping row and the
+        // stale full row model the later drain of the pre-classification module snapshot.
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 1,
+                next_cursor: 2,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 2,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 9397,
+                        full_row_snapshot: {
+                            id: 9397,
+                            project_path: "/repo",
+                            category: "CONSTRAINTS",
+                            content: "module memory",
+                            normalized_hash: "module-hash",
+                            importance: null,
+                            source_type: null,
+                            status: "active",
+                            mapping: ["src/stale.rs"],
+                        },
+                        content_hash: "module-hash",
+                    },
+                ],
+            },
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 2,
+                next_cursor: 3,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 3,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 9397,
+                        full_row_snapshot: staleSnapshot,
+                        content_hash: "module-hash",
+                    },
+                ],
+            },
+        });
+
+        expect(
+            database
+                .prepare(
+                    `SELECT importance, scope, shareable, source_type, status, classified_at,
+                            updated_at
+                       FROM memories WHERE id = 391`,
+                )
+                .get(),
+        ).toEqual({
+            importance: 91,
+            scope: "universe",
+            shareable: 1,
+            source_type: "classifier",
+            status: "archived",
+            classified_at: 300,
+            updated_at: 300,
+        });
+    });
+
+    test("stale mirror status cannot reactivate a newer host archive", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash, importance,
+                        first_seen_at, created_at, updated_at, last_seen_at, status, classified_at
+                     ) VALUES (392, '/repo', 'CONSTRAINTS', 'archived host memory', 'status-hash', 70,
+                               10, 10, 500, 500, 'archived', 400)`,
+                )
+                .run();
+        });
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 9398,
+                        full_row_snapshot: completeMemorySnapshot(storeUuid, 392, {
+                            id: 9398,
+                            content: "archived host memory",
+                            normalized_hash: "status-hash",
+                            importance: 70,
+                            updated_at: 100,
+                            classified_at: 100,
+                            status: "active",
+                        }),
+                        content_hash: "status-hash",
+                    },
+                ],
+            },
+        });
+
+        expect(
+            database.prepare("SELECT status, updated_at FROM memories WHERE id = 392").get(),
+        ).toEqual({ status: "archived", updated_at: 500 });
+    });
+
+    test("stale full snapshots preserve every recency-guarded memory projection field", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash, importance, scope,
+                        shareable, source_session_id, source_type, seen_count, retrieval_count,
+                        first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
+                        status, expires_at, verification_status, verified_at, classified_at,
+                        superseded_by_memory_id, merged_from, metadata_json, mural_cue,
+                        mural_cue_hash, mural_cue_at, mural_cue_rejection_count
+                     ) VALUES (
+                        393, '/repo', 'HOST_CATEGORY', 'host content', 'host-hash', 93, 'universe',
+                        1, 'host-session', 'classifier', 9, 8, 11, 12, 900, 800, 700,
+                        'archived', 1000, 'verified', 850, 875, 777, '[1,2]', '{"host":true}',
+                        'host cue', 'host-cue-hash', 860, 4
+                     )`,
+                )
+                .run();
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications(
+                        memory_id, file_path, verified_at, mapped_at, mapping_origin
+                     ) VALUES (393, 'src/host.ts', 850, 900, 'mapper')`,
+                )
+                .run();
+        });
+        const before = database.prepare("SELECT * FROM memories WHERE id = 393").get();
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 9399,
+                        full_row_snapshot: completeMemorySnapshot(storeUuid, 393, {
+                            id: 9399,
+                            category: "MODULE_CATEGORY",
+                            content: "stale module content",
+                            normalized_hash: "stale-module-hash",
+                            source_session_id: "stale-session",
+                            seen_count: 1,
+                            retrieval_count: 1,
+                            first_seen_at: 1,
+                            created_at: 1,
+                            updated_at: 100,
+                            last_seen_at: 100,
+                            last_retrieved_at: 100,
+                            status: "active",
+                            expires_at: null,
+                            importance: 50,
+                            scope: "project",
+                            shareable: 0,
+                            source_type: "historian",
+                            classified_at: 100,
+                            verification_status: "unverified",
+                            verified_at: 100,
+                            superseded_by_memory_id: null,
+                            merged_from: null,
+                            metadata_json: null,
+                            mural_cue: "stale cue",
+                            mural_cue_hash: "stale-cue-hash",
+                            mural_cue_at: 100,
+                            mural_cue_rejection_count: 0,
+                            mapping: ["src/stale.rs"],
+                            mapping_origin: "host_rejected_fallback",
+                        }),
+                        content_hash: "stale-module-hash",
+                    },
+                ],
+            },
+        });
+
+        expect(database.prepare("SELECT * FROM memories WHERE id = 393").get()).toEqual(before);
+        expect(getMemoryVerifications(database, [393]).get(393)).toMatchObject({
+            files: ["src/host.ts"],
+            verifiedAt: 850,
+        });
+    });
+
+    test("newer mirror rows apply mutable fields but retain immutable source times", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash, importance,
+                        first_seen_at, created_at, updated_at, last_seen_at, status, classified_at
+                     ) VALUES (394, '/repo', 'CONSTRAINTS', 'host content', 'direction-hash', 70,
+                               10, 20, 100, 100, 'archived', 100)`,
+                )
+                .run();
+        });
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 9400,
+                        full_row_snapshot: completeMemorySnapshot(storeUuid, 394, {
+                            id: 9400,
+                            content: "new module content",
+                            normalized_hash: "new-direction-hash",
+                            importance: 80,
+                            first_seen_at: 1,
+                            created_at: 1,
+                            updated_at: 600,
+                            last_seen_at: 600,
+                            status: "active",
+                            classified_at: 600,
+                        }),
+                        content_hash: "new-direction-hash",
+                    },
+                ],
+            },
+        });
+
+        expect(
+            database
+                .prepare(
+                    `SELECT content, normalized_hash, importance, first_seen_at, created_at,
+                            updated_at, status, classified_at
+                       FROM memories WHERE id = 394`,
+                )
+                .get(),
+        ).toEqual({
+            content: "new module content",
+            normalized_hash: "new-direction-hash",
+            importance: 80,
+            first_seen_at: 10,
+            created_at: 20,
+            updated_at: 600,
+            status: "active",
+            classified_at: 600,
+        });
+    });
+
+    test("null projection and repair roll back together when repair fails", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        installAuthorityManagedMarker(database, "/repo", storeUuid);
+        const snapshot = completeMemorySnapshot(storeUuid, 395, {
+            id: 9401,
+            normalized_hash: "transaction-hash",
+            importance: 66,
+            source_type: "agent",
+            updated_at: 10,
+            classified_at: 10,
+        });
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash, importance,
+                        source_type, first_seen_at, created_at, updated_at, last_seen_at,
+                        classified_at
+                     ) VALUES (395, '/repo', 'CONSTRAINTS', 'module memory', 'transaction-hash', 66,
+                               'agent', 10, 10, 10, 10, 10)`,
+                )
+                .run();
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/repo', 9401, 395)",
+                )
+                .run();
+            database
+                .prepare(
+                    "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash, full_row_snapshot) VALUES ('/repo', 9401, 'CONSTRAINTS', 'transaction-hash', ?)",
+                )
+                .run(JSON.stringify(snapshot));
+            database.exec(`
+                CREATE TRIGGER fail_metadata_repair
+                BEFORE UPDATE OF importance ON memories
+                WHEN OLD.importance IS NULL AND NEW.importance IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'repair failed');
+                END;
+            `);
+        });
+
+        expect(() =>
+            applyMirrorPage({
+                db: database,
+                page: {
+                    domain: "memories",
+                    cursor: 0,
+                    next_cursor: 1,
+                    has_more: false,
+                    rows: [
+                        {
+                            feed_seq: 1,
+                            domain: "memories",
+                            op: "update",
+                            module_row_id: 9401,
+                            full_row_snapshot: {
+                                id: 9401,
+                                project_path: "/repo",
+                                category: "CONSTRAINTS",
+                                content: "module memory",
+                                normalized_hash: "transaction-hash",
+                                importance: null,
+                                source_type: null,
+                            },
+                            content_hash: "transaction-hash",
+                        },
+                    ],
+                },
+            }),
+        ).toThrow("repair failed");
+        expect(
+            database
+                .prepare("SELECT importance, source_type, updated_at FROM memories WHERE id = 395")
+                .get(),
+        ).toEqual({ importance: 66, source_type: "agent", updated_at: 10 });
+        expect(getMirrorCursor(database, "memories")).toBe(0);
     });
 
     test("bounds authority seed frames below the management frame cap", async () => {
@@ -736,6 +1353,204 @@ describe("memory authority protocol", () => {
                 )
                 .get(),
         ).toEqual({ context_row_id: 200 });
+    });
+
+    test("activate, steady mirror, and drain preserve the complete host memory id set", async () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            const insert = database.prepare(
+                `INSERT INTO memories(
+                    id, project_path, category, content, normalized_hash, first_seen_at,
+                    created_at, updated_at, last_seen_at, superseded_by_memory_id
+                 ) VALUES (?, '/repo', 'CONSTRAINTS', ?, ?, 0, 0, 0, 0, ?)`,
+            );
+            insert.run(10, "re-minted source", "hash-10", 80);
+            insert.run(40, "missing backlink", "hash-40", null);
+            insert.run(60, "module-side legacy", "hash-60", null);
+            insert.run(80, "supersede target", "hash-80", null);
+            database
+                .prepare(
+                    "INSERT INTO memory_embeddings(memory_id, embedding, model_id) VALUES (10, ?, 'fixture')",
+                )
+                .run(Buffer.from([1, 2, 3]));
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications(
+                        memory_id, file_path, verified_at, mapped_at, mapping_origin
+                     ) VALUES (10, 'src/config.ts', 1, 1, 'mapper')`,
+                )
+                .run();
+            database
+                .prepare(
+                    `INSERT INTO mirror_identity(
+                        domain, module_project, module_row_id, context_row_id
+                     ) VALUES ('memories', '/repo', 100, 10)`,
+                )
+                .run();
+        });
+        const before = memoryIdentityFingerprint(database, "/repo");
+        const hostRows = database
+            .prepare("SELECT * FROM memories WHERE project_path = '/repo' ORDER BY id")
+            .all() as Array<Record<string, unknown>>;
+        const seededModuleIds = new Map([
+            [10, 110],
+            [40, 240],
+            [60, 260],
+            [80, 280],
+        ]);
+        let mirrorPhase: "steady" | "drain" = "steady";
+        let authorityState: AuthorityStatus["state"] = "TS";
+        const feedRow = (
+            feedSeq: number,
+            op: ChangefeedPage["rows"][number]["op"],
+            moduleRowId: number,
+            contextRowId: number,
+            overrides: Record<string, unknown> = {},
+        ): ChangefeedPage["rows"][number] => ({
+            feed_seq: feedSeq,
+            domain: "memories",
+            op,
+            module_row_id: moduleRowId,
+            full_row_snapshot: completeMemorySnapshot(storeUuid, contextRowId, {
+                id: moduleRowId,
+                content:
+                    contextRowId === 10
+                        ? "re-minted source"
+                        : contextRowId === 40
+                          ? "missing backlink"
+                          : contextRowId === 60
+                            ? "module-side legacy"
+                            : "supersede target",
+                normalized_hash: `hash-${contextRowId}`,
+                superseded_by_memory_id: contextRowId === 10 ? 280 : null,
+                ...overrides,
+            }),
+            content_hash: `hash-${contextRowId}`,
+        });
+        const module: AuthorityModuleClient = {
+            authorityStatus: async (args) => ({
+                authority: {
+                    ...authority(args.domain === "memories" ? authorityState : "TS", 1),
+                    domain: args.domain,
+                },
+            }),
+            authorityPrepare: async (args) => {
+                if (args.phase === "begin") authorityState = "PREPARING";
+                if (args.phase === "ack") authorityState = "MODULE";
+                if (args.phase === "abort") authorityState = "TS";
+                return {
+                    authority: {
+                        ...authority(authorityState, 1),
+                        domain: args.domain,
+                        checksum_expected: String(args.checksum_expected ?? ""),
+                        checksum_actual: String(args.checksum_expected ?? ""),
+                        checksum_ok: 1,
+                    },
+                };
+            },
+            authoritySeed: async (args) => ({
+                seeded: args.rows.length,
+                module_row_ids: args.rows.map((row) => {
+                    const sourceId = Number(row.source_row_id);
+                    const moduleId = seededModuleIds.get(sourceId);
+                    if (moduleId === undefined) throw new Error(`unexpected source id ${sourceId}`);
+                    return moduleId;
+                }),
+            }),
+            mirrorPull: async (args) => {
+                if (args.live_only) {
+                    return {
+                        page: {
+                            domain: "memories",
+                            cursor: args.cursor,
+                            next_cursor: args.cursor,
+                            has_more: false,
+                            rows: [],
+                        },
+                    };
+                }
+                const rows =
+                    mirrorPhase === "steady"
+                        ? [feedRow(1, "tombstone", 100, 10), feedRow(2, "insert", 110, 10)]
+                        : [
+                              feedRow(3, "tombstone", 110, 10),
+                              feedRow(4, "insert", 120, 10),
+                              feedRow(5, "update", 241, 40),
+                              feedRow(6, "update", 261, 60, {
+                                  context_store_uuid: null,
+                                  context_row_id: null,
+                              }),
+                          ];
+                const pending = rows.filter((row) => row.feed_seq > args.cursor);
+                return {
+                    page: {
+                        domain: "memories",
+                        cursor: args.cursor,
+                        next_cursor: pending.at(-1)?.feed_seq ?? args.cursor,
+                        has_more: false,
+                        rows: pending,
+                    },
+                };
+            },
+            authorityDrain: async (args) => {
+                if (args.action === "begin") authorityState = "DRAINING";
+                if (args.action === "finish") authorityState = "TS";
+                return {
+                    authority: {
+                        ...authority(authorityState, 2),
+                        captured_upper_bound: 6,
+                        coordinator_token: "id-stability-drain",
+                    },
+                };
+            },
+        };
+
+        await prepareAuthority({
+            db: database,
+            projectPath: "/repo",
+            domains: ["memories"],
+            module,
+            seedPages: async () =>
+                hostRows.map((snapshot) => ({ source_row_id: snapshot.id, snapshot })),
+        });
+        await pullAndApplyMirrorPage({ db: database, module, domain: "memories" });
+        expect(memoryIdentityFingerprint(database, "/repo")).toEqual(before);
+        expect(
+            database
+                .prepare(
+                    "SELECT module_row_id FROM mirror_identity WHERE domain = 'memories' AND context_row_id = 10",
+                )
+                .get(),
+        ).toEqual({ module_row_id: 110 });
+
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "DELETE FROM mirror_identity WHERE domain = 'memories' AND context_row_id IN (40, 60)",
+                )
+                .run();
+        });
+        mirrorPhase = "drain";
+        await expect(
+            drainAuthority({
+                db: database,
+                projectPath: "/repo",
+                domain: "memories",
+                module,
+                checksum: "stable-ids",
+            }),
+        ).resolves.toMatchObject({ state: "TS" });
+
+        expect(memoryIdentityFingerprint(database, "/repo")).toEqual(before);
+        expect(database.prepare("SELECT memory_id, model_id FROM memory_embeddings").all()).toEqual(
+            [{ memory_id: 10, model_id: "fixture" }],
+        );
+        expect(
+            database
+                .prepare("SELECT memory_id, file_path FROM memory_verifications ORDER BY memory_id")
+                .all(),
+        ).toEqual([{ memory_id: 10, file_path: "src/config.ts" }]);
     });
 
     test("module checksum mismatch aborts, removes the marker, and restores TS writes", async () => {
@@ -2211,9 +3026,135 @@ describe("memory authority protocol", () => {
             },
         });
         const rows = database
-            .prepare("SELECT id, superseded_by_memory_id FROM memories ORDER BY id")
-            .all() as Array<{ id: number; superseded_by_memory_id: number | null }>;
+            .prepare("SELECT id, superseded_by_memory_id, updated_at FROM memories ORDER BY id")
+            .all() as Array<{
+            id: number;
+            superseded_by_memory_id: number | null;
+            updated_at: number;
+        }>;
         expect(rows[0]?.superseded_by_memory_id).toBe(rows[1]?.id);
+        expect(rows[0]?.updated_at).toBeGreaterThan(0);
+    });
+
+    test("drain translates pending superseded references and preserves unresolved records", async () => {
+        const database = db();
+        const memory = (id: number, supersededBy: number) => ({
+            id,
+            project_path: "/repo",
+            category: "CONSTRAINTS",
+            content: `memory ${id}`,
+            normalized_hash: `h${id}`,
+            scope: "project",
+            shareable: 0,
+            seen_count: 1,
+            retrieval_count: 0,
+            first_seen_at: 0,
+            created_at: 0,
+            updated_at: 0,
+            last_seen_at: 0,
+            status: "active",
+            verification_status: "unverified",
+            superseded_by_memory_id: supersededBy,
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 2,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 10,
+                        full_row_snapshot: memory(10, 20),
+                        content_hash: "h10",
+                    },
+                    {
+                        feed_seq: 2,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 30,
+                        full_row_snapshot: memory(30, 40),
+                        content_hash: "h30",
+                    },
+                ],
+            },
+        });
+        const targetId = withPrivilegedWriter(database, () => {
+            const result = database
+                .prepare(
+                    "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES ('/repo', 'CONSTRAINTS', 'target', 'h20', 0, 0, 0, 0)",
+                )
+                .run() as { lastInsertRowid: number };
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/repo', 20, ?)",
+                )
+                .run(result.lastInsertRowid);
+            return Number(result.lastInsertRowid);
+        });
+        installAuthorityManagedMarker(database, "/repo");
+        let state: AuthorityStatus["state"] = "MODULE";
+        const module: AuthorityModuleClient = {
+            authorityStatus: async (args) => ({
+                authority: {
+                    ...authority(args.domain === "memories" ? state : "TS", 1),
+                    domain: args.domain,
+                },
+            }),
+            authorityPrepare: async () => ({ authority: authority("MODULE", 1) }),
+            authorityDrain: async (args) => {
+                state = args.action === "finish" ? "TS" : "DRAINING";
+                return {
+                    authority: {
+                        ...authority(state, 1),
+                        captured_upper_bound: 2,
+                        coordinator_token: "drain-pending-refs",
+                    },
+                };
+            },
+            mirrorPull: async (args) => ({
+                page: {
+                    domain: args.domain,
+                    cursor: args.cursor,
+                    next_cursor: args.cursor,
+                    has_more: false,
+                    rows: [],
+                },
+            }),
+        };
+
+        await expect(
+            drainAuthority({
+                db: database,
+                projectPath: "/repo",
+                domain: "memories",
+                module,
+                checksum: "same",
+            }),
+        ).resolves.toMatchObject({ state: "TS" });
+        const source = database
+            .prepare(
+                `SELECT memory.superseded_by_memory_id
+                   FROM memories memory
+                   JOIN mirror_identity identity
+                     ON identity.context_row_id = memory.id
+                  WHERE identity.domain = 'memories'
+                    AND identity.module_project = '/repo'
+                    AND identity.module_row_id = 10`,
+            )
+            .get();
+        expect(source).toEqual({ superseded_by_memory_id: targetId });
+        expect(
+            database
+                .prepare(
+                    "SELECT module_row_id, target_module_row_id FROM mirror_pending_references ORDER BY module_row_id",
+                )
+                .all(),
+        ).toEqual([{ module_row_id: 30, target_module_row_id: 40 }]);
     });
 
     test("privileged same-connection UPDATE between capture and verify aborts prepare", async () => {

@@ -141,12 +141,17 @@ export interface SidebarSnapshot {
 }
 
 export interface StatusDetail extends SidebarSnapshot {
+    /** True when Rust authority has rerouted host tool and historian paths to the module. */
+    hostBackendsModuleSide?: boolean;
     /** User-owned model profile selected for this project, or null for the base config. */
     activeProfile: string | null;
     tagCounter: number;
     activeTags: number;
     droppedTags: number;
     totalTags: number;
+    /** False when Rust authority supplies only the exact total; active/dropped host-mirror
+     *  counts are not presented as module truth. Omitted by older RPC servers means true. */
+    tagCountsAuthoritative?: boolean;
     activeBytes: number;
     lastResponseTime: number;
     lastNudgeTokens: number;

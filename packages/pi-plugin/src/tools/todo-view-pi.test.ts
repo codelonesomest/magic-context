@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type {
 	ExtensionCommandContext,
 	ExtensionUIContext,
@@ -312,7 +312,7 @@ describe("/todos command", () => {
 	});
 });
 describe("TodoOverlay lifecycle", () => {
-	it("registers once and refreshes with requestRender", () => {
+	it("registers once and refreshes after a todo state change", () => {
 		setTodoSnapshot("ses-overlay", [
 			{ id: "1", content: "Plan", status: "pending" },
 		]);
@@ -327,9 +327,44 @@ describe("TodoOverlay lifecycle", () => {
 		const tui = { requestRender: () => requestRenderCount++ };
 		let requestRenderCount = 0;
 		widgetFactory(setWidgetCalls[0])(tui, identityTheme);
+		setTodoSnapshot("ses-overlay", [
+			{ id: "1", content: "Plan", status: "in_progress" },
+		]);
 		overlay.update("ses-overlay");
 		expect(setWidgetCalls).toHaveLength(1);
 		expect(requestRenderCount).toBe(1);
+	});
+	it("keeps in-progress rendering static without timers between state changes", () => {
+		const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(
+			() => undefined as never,
+		);
+		const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(
+			() => undefined as never,
+		);
+		const requestRenderCalls: unknown[] = [];
+		const overlay = new TodoOverlay();
+		const { ui, setWidgetCalls } = makeUi();
+		try {
+			setTodoSnapshot("ses-overlay-static", [
+				{ id: "1", content: "Work", status: "in_progress" },
+			]);
+			overlay.setUICtx("ses-overlay-static", ui);
+			overlay.update("ses-overlay-static");
+			expect(setTimeoutSpy).not.toHaveBeenCalled();
+			expect(setIntervalSpy).not.toHaveBeenCalled();
+
+			const widget = widgetFactory(setWidgetCalls[0])(
+				{ requestRender: () => requestRenderCalls.push(undefined) },
+				identityTheme,
+			);
+			expect(widget.render(120).join("\n")).toContain("◐ #1 Work");
+			expect(widget.render(120).join("\n")).toContain("◐ #1 Work");
+			expect(requestRenderCalls).toHaveLength(0);
+		} finally {
+			setIntervalSpy.mockRestore();
+			setTimeoutSpy.mockRestore();
+			overlay.dispose();
+		}
 	});
 	it("auto-hides on empty snapshots", () => {
 		setTodoSnapshot("ses-overlay", [

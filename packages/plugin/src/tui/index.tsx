@@ -12,6 +12,7 @@ import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount,
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
 import { formatTailHygiene } from "../shared/tail-hygiene-status"
+import { RUST_MODE_HOST_PATHS_LINE } from "../shared/rust-mode-status"
 import { formatWindowDerivationLine } from "../shared/window-geometry"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off"
 import { isCompactionEnabled } from "../config/agent-disable"
@@ -321,6 +322,13 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 )
             })()}
 
+            {s().hostBackendsModuleSide && (
+                <box marginTop={1} width="100%" flexDirection="column">
+                    <text fg={t().text}><b>Rust Mode</b></text>
+                    <text fg={t().textMuted}>{RUST_MODE_HOST_PATHS_LINE}</text>
+                </box>
+            )}
+
             <box flexDirection="row" width="100%" marginTop={1} gap={4}>
                 {compactionOff() ? (
                     <box flexDirection="column" flexGrow={1} flexBasis={0}>
@@ -344,8 +352,24 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                     <>
                         <box flexDirection="column" flexGrow={1} flexBasis={0}>
                             <text fg={t().text}><b>Tags</b></text>
-                            <R t={t()} l="Active" v={`${s().activeTags} (~${fmtBytes(s().activeBytes)})`} />
-                            <R t={t()} l="Dropped" v={String(s().droppedTags)} />
+                            <R
+                                t={t()}
+                                l="Active"
+                                v={
+                                    s().tagCountsAuthoritative === false
+                                        ? "n/a (module total only)"
+                                        : `${s().activeTags} (~${fmtBytes(s().activeBytes)})`
+                                }
+                            />
+                            <R
+                                t={t()}
+                                l="Dropped"
+                                v={
+                                    s().tagCountsAuthoritative === false
+                                        ? "n/a (module total only)"
+                                        : String(s().droppedTags)
+                                }
+                            />
                             <R t={t()} l="Total" v={String(s().totalTags)} fg={t().textMuted} />
                             <box marginTop={1}>
                                 <text fg={t().text}><b>Pending Queue</b></text>
@@ -459,7 +483,7 @@ async function showRecompDialog(api: TuiPluginApi, targetSessionId = getSessionI
         return false
     }
 
-    const countResult = await getCompartmentCount(sessionId)
+    const countResult = await getCompartmentCount(sessionId, api.state.path.directory ?? "")
     // Ack only after the dialog is actually shown for the same active session;
     // route switches while the RPC detail load is in flight must leave it pending.
     if (getSessionId(api) !== sessionId) return false
@@ -588,10 +612,17 @@ async function showStatusDialog(api: TuiPluginApi, targetSessionId = getSessionI
 
     const directory = api.state.path.directory ?? ""
     const modelKey = getModelKeyFromMessages(api, sessionId)
-    const detail = await loadStatusDetail(sessionId, directory, modelKey)
+    const result = await loadStatusDetail(sessionId, directory, modelKey)
     if (getSessionId(api) !== sessionId) return false
+    if (!result.ok) {
+        showToast(api, {
+            message: `Status unavailable: ${result.error}`,
+            variant: "warning",
+        })
+        return false
+    }
 
-    api.ui.dialog.replace(() => <StatusDialog api={api} s={detail} />)
+    api.ui.dialog.replace(() => <StatusDialog api={api} s={result.detail} />)
     return true
 }
 

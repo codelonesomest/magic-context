@@ -33,6 +33,7 @@ import {
     FORK_MIGRATION_VERSION_FLOOR,
     formatInconclusiveOpenCodeMigrationWarning,
     formatLiveProcessMigrationRefusal,
+    getDatabasePath,
     getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
     getPersistedSchemaVersion,
@@ -48,6 +49,8 @@ import { SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
+const originalStorageDir = process.env.MAGIC_CONTEXT_STORAGE_DIR;
+const originalNodeEnv = process.env.NODE_ENV;
 
 function makeTempDir(prefix: string): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -58,6 +61,7 @@ function makeTempDir(prefix: string): string {
 function useTempDataHome(prefix: string): string {
     const dataHome = makeTempDir(prefix);
     process.env.XDG_DATA_HOME = dataHome;
+    process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataHome;
     return dataHome;
 }
 
@@ -106,7 +110,12 @@ afterEach(() => {
     __resetStoragePermissionFsForTests();
     __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalStorageDir === undefined) delete process.env.MAGIC_CONTEXT_STORAGE_DIR;
+    else process.env.MAGIC_CONTEXT_STORAGE_DIR = originalStorageDir;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
 
     for (const dir of tempDirs) {
         try {
@@ -206,6 +215,43 @@ describe("upstream migration version lane", () => {
             closeQuietly(future);
             closeQuietly(forkOnly);
         }
+    });
+});
+
+describe("explicit shared storage resolution", () => {
+    it("keeps path resolution and database opening in the per-test XDG fixture", () => {
+        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = makeTempDir("storage-db-test-guard-");
+        const perTestDataHome = makeTempDir("storage-db-preload-xdg-");
+        process.env.XDG_DATA_HOME = perTestDataHome;
+        process.env.MAGIC_CONTEXT_STORAGE_DIR = makeTempDir("storage-db-production-");
+
+        const resolved = resolveDatabasePath();
+        expect(resolved.dbPath).toBe(resolveDbPath(perTestDataHome));
+        const db = openDatabase();
+        expect(db).not.toBeNull();
+        expect(getDatabasePath(db!)).toBe(resolved.dbPath);
+        closeDatabase();
+    });
+
+    it("opens a fresh absolute override and applies private storage permissions", () => {
+        if (process.platform === "win32") return;
+        const override = makeTempDir("storage-db-explicit-");
+        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = "";
+        process.env.NODE_ENV = "development";
+        process.env.MAGIC_CONTEXT_STORAGE_DIR = join(override, "shared");
+        __setRpcDiscoveryFsForTests({
+            readdirSync: (_path, options) => (options?.withFileTypes ? [] : []),
+        });
+        __setRpcIdentityTestHooks({
+            processListExecFileSync: (() => "") as typeof execFileSync,
+        });
+        const db = openDatabase();
+        expect(db).not.toBeNull();
+        const dbPath = join(override, "shared", "context.db");
+        expect(existsSync(dbPath)).toBe(true);
+        expect(statSync(join(override, "shared")).mode & 0o777).toBe(0o700);
+        expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+        closeDatabase();
     });
 });
 
@@ -355,6 +401,21 @@ describe("storage-db", () => {
             expect(SESSION_SCOPED_TABLES.map((definition) => definition.table).sort()).toEqual(
                 schemaTables,
             );
+
+            // The orphan sweep derives candidates from this harness-provenanced
+            // subset. Tables without harness remain cleanup-only because their
+            // rows cannot safely be attributed to OpenCode instead of Pi.
+            const harnessScopedSchemaTables = schemaTables.filter((table) => {
+                const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                    name: string;
+                }>;
+                return columns.some((column) => column.name === "harness");
+            });
+            expect(
+                SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped === true)
+                    .map((definition) => definition.table)
+                    .sort(),
+            ).toEqual(harnessScopedSchemaTables.sort());
         });
 
         it("#when clearSession runs #then every session-scoped table is emptied", () => {
@@ -1173,7 +1234,8 @@ describe("storage-db", () => {
                 expect(dbPath.startsWith(realStorageRoot)).toBe(false);
                 expect(dbPath.includes("mc-test-db-backstop-")).toBe(true);
             } finally {
-                if (savedXdg !== undefined) process.env.XDG_DATA_HOME = savedXdg;
+                if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = savedXdg;
                 if (savedTestDir !== undefined)
                     process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
             }

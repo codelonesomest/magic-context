@@ -60,17 +60,20 @@ import {
 	adoptPiFallbackMessageTag,
 	adoptPiFallbackToolOwnerTag,
 	type ContextDatabase,
+	captureChannel1PostReduceGraceBaseline,
 	casChannel2NudgeState,
 	clearPendingPiCompactionMarkerStateIf,
 	deriveTagLoadFloor,
 	findAdoptableFallbackTags,
 	findPiFallbackToolOwnerTags,
 	getActiveTagsBySession,
+	getChannel1NudgeState,
 	getDroppedTagsByNumbers,
 	getHistorianFailureState,
 	getMaxDroppedTagNumber,
 	getOldestActiveUnprotectedToolTags,
 	getPendingOps,
+	getPendingOpsCount,
 	getPendingPiCompactionMarkerState,
 	getPersistedToolTagAccounting,
 	getTagsByNumbers,
@@ -91,13 +94,13 @@ import {
 	clearHistorianFailureState,
 	clearPersistedReasoningWatermark,
 	getAutoSearchHintDecisions,
+	getEmergencyInputSample,
 	getNoteNudgeAnchors,
 	getOverflowState,
 	type PendingPiCompactionMarker,
 	peekDeferredExecutePending,
 	pruneAutoSearchHintDecisions,
 	pruneNoteNudgeAnchors,
-	resetLastNudgeCycleIfTailShrank,
 	setDeferredExecutePendingIfAbsent,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
@@ -120,6 +123,7 @@ import {
 import {
 	applyMidTurnDeferral,
 	detectMidTurnBypassReason,
+	type SchedulerDeferReason,
 } from "@magic-context/core/hooks/magic-context/boundary-execution";
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
 import {
@@ -172,6 +176,7 @@ import {
 	TEXT_TAG_IDENTITY_MARKER,
 	tagTranscript,
 } from "@magic-context/core/shared/tag-transcript";
+
 import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
@@ -215,6 +220,10 @@ import {
 	resolvePiWindowGeometry,
 } from "./pi-context-limit";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
+import {
+	formatPiPressureForLog,
+	resolvePiPressureSnapshot,
+} from "./pi-pressure";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
 	convertEntriesToRawMessages,
@@ -254,22 +263,6 @@ import { createPiTranscript } from "./transcript-pi";
 /** Emergency-block threshold — mirrors OpenCode's >=95% emergency path. */
 const EMERGENCY_BLOCK_PERCENTAGE = 95;
 
-// estimateTokens (char-based) under-counts the real provider
-// tokenizer + untagged structural/reasoning parts: the observed overflow was
-// >400K real vs a ~340K forward estimate (~15% gap). Scaling the limit DOWN for
-// the forward percentage reaches the derived force and absolute 95% emergency
-// bands at a real size that corresponds to the window, not the under-counted estimate.
-// 0.85 (not 0.90): 0.90 would make the 95% emergency band fire only at ~360K
-// estimated, still short of the >400K real seen here.
-const FORWARD_PRESSURE_LIMIT_FACTOR = 0.85;
-
-// Returns { percentage, inputTokens } floored by Pi's FORWARD usage estimate.
-// piUsage.tokens = last assistant usage + estimateTokens of every message after
-// it (pi-mono estimateContextTokens), recomputed from the LIVE array each call —
-// so it catches a mid-turn balloon the message_end-persisted trailing number
-// misses. Keep ONLY .tokens (forward, input-side); .percent is discarded (counts
-// output on Pi's own denominator). Immune to NULL token_count (live array, not
-// our tag store). NEVER lowers (max), so it's never less reactive than today.
 function isPiHardCacheExpired(
 	lastResponseTime: number,
 	ttlMs: number,
@@ -282,37 +275,13 @@ function isPiHardCacheExpired(
 	return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
 }
 
-function applyForwardPressureFloor(
-	trailingPercentage: number,
-	trailingInputTokens: number,
-	piUsageTokens: number | null | undefined,
-	correctedLimit: number | undefined,
-): { percentage: number; inputTokens: number } {
-	const forwardTokens =
-		typeof piUsageTokens === "number" && piUsageTokens > 0 ? piUsageTokens : 0;
-	if (forwardTokens === 0 || !isSaneLimit(correctedLimit)) {
-		return { percentage: trailingPercentage, inputTokens: trailingInputTokens };
-	}
-	// Scale the LIMIT only for this forward percentage — do NOT mutate the real
-	// usageContextLimit (history-budget + emergency-drop ceiling rely on the true
-	// limit) and do NOT inflate forwardTokens (emergency-drop needs the raw
-	// current assembled size).
-	const forwardPressureLimit = correctedLimit * FORWARD_PRESSURE_LIMIT_FACTOR;
-	const forwardPercentage = (forwardTokens / forwardPressureLimit) * 100;
-	return forwardPercentage > trailingPercentage
-		? {
-				percentage: forwardPercentage,
-				inputTokens: Math.max(trailingInputTokens, forwardTokens),
-			}
-		: { percentage: trailingPercentage, inputTokens: trailingInputTokens };
-}
-
 let injectM0M1PiForRun = injectM0M1Pi;
 let persistReasoningWatermarkForRun = updateSessionMeta;
 let persistStableIdSchemeForRun = updateSessionMeta;
 let afterFallbackAdoptionForTests:
 	| ((stableIdSchemeCutover: boolean) => void)
 	| undefined;
+let pendingDecisionLogObserverForTests: ((message: string) => void) | undefined;
 let mutationGateObserverForTests:
 	| ((snapshot: {
 			foldDue: boolean;
@@ -324,10 +293,8 @@ let mutationGateObserverForTests:
 	| undefined;
 
 export const __test = {
-	FORWARD_PRESSURE_LIMIT_FACTOR,
 	isPiHardCacheExpired,
 	adoptPiFallbackTags,
-	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
 	readPiBranchEntriesForContext,
@@ -375,6 +342,14 @@ export const __test = {
 		afterFallbackAdoptionForTests = fn;
 		return () => {
 			afterFallbackAdoptionForTests = undefined;
+		};
+	},
+	setPendingDecisionLogObserverForTests(
+		fn: typeof pendingDecisionLogObserverForTests,
+	): () => void {
+		pendingDecisionLogObserverForTests = fn;
+		return () => {
+			pendingDecisionLogObserverForTests = undefined;
 		};
 	},
 	setMutationGateObserverForTests(
@@ -937,8 +912,12 @@ export interface PiHistorianOptions {
 	fallbackModels?: readonly ModelInput[];
 	/** Historian context window — used to derive chunk token budget. */
 	historianChunkTokens: number;
-	/** Optional per-call timeout (default 120s). */
+	/** Optional per-call timeout (default 600s). */
 	timeoutMs?: number;
+	/** Provider sampling temperature; when omitted, uses the temperature configured for historian runs. */
+	temperature?: number;
+	/** Provider output budget; when omitted, uses the output-token budget configured for historian runs. */
+	maxOutputTokens?: number;
 	/** When true, run a second editor pass after a successful first pass to
 	 *  clean low-signal U: lines and cross-compartment duplicates. Mirrors
 	 *  OpenCode's `historian.two_pass` config. */
@@ -2557,12 +2536,12 @@ export function registerPiContextHandler(
 				usagePercentage = (usageInputTokens / usageContextLimit) * 100;
 			}
 			({ percentage: usagePercentage, inputTokens: usageInputTokens } =
-				applyForwardPressureFloor(
-					usagePercentage,
-					usageInputTokens,
-					piUsage?.tokens,
-					usageContextLimit,
-				));
+				resolvePiPressureSnapshot({
+					persistedPercentage: usagePercentage,
+					persistedInputTokens: usageInputTokens,
+					liveInputTokens: piUsage?.tokens,
+					usableContextLimit: usageContextLimit,
+				}));
 			const realUsagePercentageBeforeEmergencyBump = usagePercentage;
 			// Emergency bump LAST so it floors recovery pressure without capping
 			// a higher live forward-pressure reading.
@@ -2685,17 +2664,21 @@ export function registerPiContextHandler(
 				effectiveExecuteThresholdPercentage,
 			});
 
-			const { midTurnAdjustedSchedulerDecision, sideEffect } =
-				options.compactionOff
-					? {
-							midTurnAdjustedSchedulerDecision: "defer" as const,
-							sideEffect: "none" as const,
-						}
-					: applyMidTurnDeferral({
-							base: schedulerDecisionEarly,
-							bypassReason,
-							midTurn,
-						});
+			const {
+				midTurnAdjustedSchedulerDecision,
+				sideEffect,
+				deferReason: schedulerDeferReason,
+			} = options.compactionOff
+				? {
+						midTurnAdjustedSchedulerDecision: "defer" as const,
+						sideEffect: "none" as const,
+						deferReason: "scheduler_defer" as const,
+					}
+				: applyMidTurnDeferral({
+						base: schedulerDecisionEarly,
+						bypassReason,
+						midTurn,
+					});
 
 			if (sideEffect === "set-flag" && !options.compactionOff) {
 				const flagPayload = {
@@ -2729,6 +2712,15 @@ export function registerPiContextHandler(
 			const forceMaterialization =
 				!options.compactionOff &&
 				usagePercentage >= forceMaterializationPercentage;
+			// Leaving the force band ends the pressure episode. Fresh usage samples
+			// inside the band do not release this latch; only a later re-entry may
+			// originate another emergency batch.
+			if (
+				!forceMaterialization &&
+				getEmergencyInputSample(options.db, sessionId) > 0
+			) {
+				clearEmergencyDropSample(options.db, sessionId);
+			}
 
 			// 95% emergency block: usage is dangerous enough that we
 			// MUST wait for any in-flight historian to finish so its
@@ -2851,7 +2843,7 @@ export function registerPiContextHandler(
 
 			sessionLog(
 				sessionId,
-				`transform: usage=${usagePercentage.toFixed(1)}% (${usageInputTokens} tokens, limit=${usageContextLimit ?? "?"}) decision=${schedulerDecision}${forceMaterialization ? " force=true" : ""}${isEmergency ? " EMERGENCY=true" : ""}${isCacheBusting ? " busting=true" : ""}`,
+				`transform: ${formatPiPressureForLog({ percentage: usagePercentage, inputTokens: usageInputTokens, contextLimit: usageContextLimit })} decision=${schedulerDecision}${forceMaterialization ? " force=true" : ""}${isEmergency ? " EMERGENCY=true" : ""}${isCacheBusting ? " busting=true" : ""}`,
 			);
 			logTransformTiming(
 				sessionId,
@@ -2939,6 +2931,7 @@ export function registerPiContextHandler(
 				reusableMessageIds,
 				stableIdSchemeCutover,
 				schedulerDecision,
+				schedulerDeferReason,
 				// 95% emergency forces drop-all-tools regardless of the
 				// derived force gate, so the LLM call sees the smallest possible
 				// prompt before we hand control back to Pi.
@@ -3202,7 +3195,24 @@ export function registerPiContextHandler(
 						previous: getPiChannel1Baseline(sessionId),
 					});
 					const effective = effectivePiTailHygiene(baseline);
-					resetLastNudgeCycleIfTailShrank(options.db, sessionId, effective.u);
+					const durableGrace =
+						baseline.evaluable && !baseline.generationInvalidated
+							? captureChannel1PostReduceGraceBaseline(
+									options.db,
+									sessionId,
+									effective.u,
+								)
+							: getChannel1NudgeState(options.db, sessionId);
+					baseline.channel1PostReduceGrace =
+						durableGrace.postReduceGracePending ||
+						durableGrace.postReduceGraceBaselineU !== undefined
+							? {
+									pending: durableGrace.postReduceGracePending === true,
+									baselineU: durableGrace.postReduceGraceBaselineU,
+									preReduceLevel:
+										durableGrace.postReduceGracePreLevel ?? durableGrace.level,
+								}
+							: undefined;
 					const oldestReclaimableToolTags = getOldestActiveUnprotectedToolTags(
 						options.db,
 						sessionId,
@@ -3405,14 +3415,22 @@ export function registerPiContextHandler(
 const inFlightHistorian = new Map<string, Promise<unknown>>();
 
 /**
- * Wait for all in-flight historian runs to complete. Called from the
- * Pi `session_shutdown` event handler so historian can finish writing
- * compartments before the process exits. Returns immediately if no
- * runs are in-flight.
+ * Wait for one session's in-flight historian run to complete. Called from the
+ * Pi `session_shutdown` event handler so its historian can finish writing
+ * compartments before that session shuts down. Omitting the session id waits
+ * for all runs and remains available for process-exit callers and tests. Returns
+ * immediately if no matching runs are in-flight.
  */
-export async function awaitInFlightHistorians(): Promise<void> {
-	if (inFlightHistorian.size === 0) return;
-	await Promise.allSettled(Array.from(inFlightHistorian.values()));
+export async function awaitInFlightHistorians(
+	sessionId?: string,
+): Promise<void> {
+	const runs = sessionId
+		? [inFlightHistorian.get(sessionId)].filter(
+				(run): run is Promise<unknown> => run !== undefined,
+			)
+		: [...inFlightHistorian.values()];
+	if (runs.length === 0) return;
+	await Promise.allSettled(runs);
 }
 
 export function resolvePiHistorianTriggerInputs(args: {
@@ -3685,6 +3703,8 @@ function spawnPiHistorianRun(args: {
 				refreshBoundarySnapshot,
 				currentContextLimit,
 				historianTimeoutMs: historian.timeoutMs,
+				temperature: historian.temperature,
+				maxOutputTokens: historian.maxOutputTokens,
 				twoPass: historian.twoPass,
 				thinkingLevel: historian.thinkingLevel,
 				memoryEnabled: isTaskSubagent ? false : historian.memoryEnabled,
@@ -3922,12 +3942,12 @@ function maybeFireHistorian(args: {
 			};
 			usageSource = "piUsage fallback";
 		}
-		usage = applyForwardPressureFloor(
-			usage.percentage,
-			usage.inputTokens,
-			piUsage?.tokens,
-			usageContextLimit,
-		);
+		usage = resolvePiPressureSnapshot({
+			persistedPercentage: usage.percentage,
+			persistedInputTokens: usage.inputTokens,
+			liveInputTokens: piUsage?.tokens,
+			usableContextLimit: usageContextLimit,
+		});
 		sessionLog(
 			sessionId,
 			`historian trigger eval: usage=${usage.percentage.toFixed(1)}% (${usage.inputTokens} tokens) [${usageSource}], checking trigger...`,
@@ -4243,6 +4263,8 @@ interface RunPipelineArgs {
 	 * cached injection). Mirrors OpenCode's `schedulerDecisionEarly`.
 	 */
 	schedulerDecision: "execute" | "defer";
+	/** The defer reason is computed once when the scheduler decision is made; preserve it so refusal logs report the actual reason instead of recomputing it. */
+	schedulerDeferReason: SchedulerDeferReason | null;
 	/**
 	 * Force-materialization signal: when true, drop-all-tools mode
 	 * activates (mirrors OpenCode's derived force-band emergency cleanup). Caller
@@ -4901,10 +4923,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					: foldExecutedThisPass && args.schedulerDecision !== "execute"
 						? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
 						: `scheduler_execute (scheduler=${args.schedulerDecision})`;
-		sessionLog(
-			args.sessionId,
-			`pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,
-		);
+		const pendingOpsDepth = getPendingOpsCount(args.db, args.sessionId);
+		const pendingDecisionLog = `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOpsDepth === null ? "not loaded (deferred pass)" : pendingOpsDepth} context=${args.contextUsage.percentage.toFixed(1)}%`;
+		sessionLog(args.sessionId, pendingDecisionLog);
+		pendingDecisionLogObserverForTests?.(pendingDecisionLog);
 		try {
 			const tApplyPending = performance.now();
 			pendingOpsDidMutate = applyPendingOperations(
@@ -4951,10 +4973,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			throw err;
 		}
 	} else {
-		sessionLog(
-			args.sessionId,
-			`pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=${pendingOps.length} context=${args.contextUsage.percentage.toFixed(1)}%`,
-		);
+		const pendingOpsDepth = getPendingOpsCount(args.db, args.sessionId);
+		const refusalReason =
+			args.schedulerDeferReason ??
+			(historianRunning ? "historian_in_flight" : "scheduler_defer");
+		const pendingDecisionLog = `pending ops WILL NOT APPLY — reason=${refusalReason} pendingOps=${pendingOpsDepth === null ? "not loaded (deferred pass)" : pendingOpsDepth} context=${args.contextUsage.percentage.toFixed(1)}%`;
+		sessionLog(args.sessionId, pendingDecisionLog);
+		pendingDecisionLogObserverForTests?.(pendingDecisionLog);
 	}
 
 	// 3. Apply persistent dropped/truncated tag statuses so cross-pass
@@ -5118,18 +5143,41 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			: foldExecutedThisPass && args.schedulerDecision !== "execute"
 				? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
 				: `scheduler_execute (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`;
-		sessionLog(
-			args.sessionId,
-			`heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=n/a`,
-		);
+		const heuristicsDecisionLog = `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=n/a`;
+		sessionLog(args.sessionId, heuristicsDecisionLog);
+		pendingDecisionLogObserverForTests?.(heuristicsDecisionLog);
 	} else {
 		const reason =
-			args.heuristics === undefined ? "disabled" : "scheduler_defer";
-		sessionLog(args.sessionId, `heuristics WILL NOT RUN — reason=${reason}`);
+			args.heuristics === undefined
+				? "disabled"
+				: (args.schedulerDeferReason ??
+					(historianRunning
+						? "historian_in_flight"
+						: alreadyRanHeuristicsThisTurn
+							? "already_ran_this_turn"
+							: "scheduler_defer"));
+		const heuristicsDecisionLog = `heuristics WILL NOT RUN — reason=${reason}`;
+		sessionLog(args.sessionId, heuristicsDecisionLog);
+		pendingDecisionLogObserverForTests?.(heuristicsDecisionLog);
 	}
 	if (shouldRunHeuristics && args.heuristics) {
 		try {
 			const tHeuristic = performance.now();
+			const independentMutationBeforeHeuristics =
+				pendingOpsDidMutate || foldExecutedThisPass;
+			// A queued drop or completed hard fold already changes provider-visible
+			// bytes on this pass. Rearm so accumulated candidates join that same cache
+			// rebuild instead of waiting for a new pressure period. Do not treat frozen
+			// status replay as a new mutation: Pi rebuilds raw messages every pass, so
+			// replay is expected restoration and must not authorize another emergency
+			// batch on every pass.
+			if (
+				args.forceMaterialization === true &&
+				independentMutationBeforeHeuristics &&
+				getEmergencyInputSample(args.db, args.sessionId) > 0
+			) {
+				clearEmergencyDropSample(args.db, args.sessionId);
+			}
 			heuristicsResult = applyPiHeuristicCleanup(
 				args.sessionId,
 				args.db,

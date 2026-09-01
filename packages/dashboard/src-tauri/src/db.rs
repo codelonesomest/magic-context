@@ -10,7 +10,28 @@ use crate::external_cache_sessions;
 use crate::pi_sessions;
 use crate::project_identity::{basename, normalize_stored_project_path};
 
+#[cfg(test)]
+use std::sync::Mutex;
+
+#[cfg(test)]
+static RESOLVE_DB_PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn resolve_db_path() -> Option<PathBuf> {
+    // Keep the dashboard on the same harness-side database as the plugin. An
+    // explicit override is a complete absolute storage directory; do not fall
+    // back to XDG/legacy paths when it is invalid or the DB is not created yet.
+    if let Ok(raw) = std::env::var("MAGIC_CONTEXT_STORAGE_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let explicit = PathBuf::from(trimmed);
+            if !explicit.is_absolute() {
+                return None;
+            }
+            let path = explicit.join("context.db");
+            return path.exists().then_some(path);
+        }
+    }
+
     // The magic-context plugin uses XDG_DATA_HOME or ~/.local/share on ALL platforms
     // (see packages/plugin/src/shared/data-path.ts). On Windows this means
     // C:\Users\<user>\.local\share — NOT %APPDATA%.
@@ -47,6 +68,47 @@ pub fn resolve_db_path() -> Option<PathBuf> {
         Some(legacy_path)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod storage_path_tests {
+    use super::resolve_db_path;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_absolute_storage_override_beats_xdg_and_rejects_relative() {
+        let _guard = super::RESOLVE_DB_PATH_ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let explicit = root.path().join("shared");
+        fs::create_dir_all(&explicit).unwrap();
+        let explicit_db = explicit.join("context.db");
+        fs::write(&explicit_db, b"sqlite-fixture").unwrap();
+        let xdg = root.path().join("xdg");
+        fs::create_dir_all(xdg.join("cortexkit/magic-context")).unwrap();
+        let xdg_db = xdg.join("cortexkit/magic-context/context.db");
+        fs::write(&xdg_db, b"xdg-fixture").unwrap();
+
+        let old_storage = std::env::var_os("MAGIC_CONTEXT_STORAGE_DIR");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("MAGIC_CONTEXT_STORAGE_DIR", &explicit);
+        std::env::set_var("XDG_DATA_HOME", &xdg);
+        assert_eq!(resolve_db_path(), Some(PathBuf::from(&explicit_db)));
+
+        std::env::set_var("MAGIC_CONTEXT_STORAGE_DIR", "relative/shared");
+        assert_eq!(resolve_db_path(), None);
+
+        if let Some(value) = old_storage {
+            std::env::set_var("MAGIC_CONTEXT_STORAGE_DIR", value);
+        } else {
+            std::env::remove_var("MAGIC_CONTEXT_STORAGE_DIR");
+        }
+        if let Some(value) = old_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 }
 
@@ -652,6 +714,8 @@ pub struct DbCacheEvent {
     pub cause: Option<String>,
     pub agent: Option<String>,
     pub finish: Option<String>,
+    #[serde(skip)]
+    native_turn_id: Option<String>,
     pub turn_id: String,
     pub is_turn_start: bool,
     // The model's context window for this session (tokens), so the timeline can
@@ -702,6 +766,9 @@ pub struct RawDbCacheEvent {
     total_tokens: i64,
     agent: Option<String>,
     finish: Option<String>,
+    /// OpenCode's native turn key. Every assistant step spawned by one user
+    /// message carries that user message's `parentID`.
+    native_turn_id: Option<String>,
     context_limit: Option<i64>,
 }
 
@@ -960,6 +1027,7 @@ pub fn load_raw_db_cache_events(
                        COALESCE(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER), 0) AS total_tokens,
                        CAST(json_extract(m.data, '$.agent') AS TEXT) AS agent,
                        CAST(json_extract(m.data, '$.finish') AS TEXT) AS finish,
+                       CAST(json_extract(m.data, '$.parentID') AS TEXT) AS native_turn_id,
                        ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.time_created DESC) AS rn
                 FROM message m
                 WHERE json_extract(m.data, '$.role') = 'assistant'
@@ -967,7 +1035,7 @@ pub fn load_raw_db_cache_events(
                   AND m.time_created > ?1
             )
             SELECT msg_id, session_id, time_created, input_tokens, cache_read,
-                   cache_write, total_tokens, agent, finish
+                   cache_write, total_tokens, agent, finish, native_turn_id
             FROM ranked
             WHERE rn <= ?2
             ORDER BY time_created DESC
@@ -990,13 +1058,14 @@ pub fn load_raw_db_cache_events(
                        COALESCE(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER), 0) AS total_tokens,
                        CAST(json_extract(m.data, '$.agent') AS TEXT) AS agent,
                        CAST(json_extract(m.data, '$.finish') AS TEXT) AS finish,
+                       CAST(json_extract(m.data, '$.parentID') AS TEXT) AS native_turn_id,
                        ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.time_created DESC) AS rn
                 FROM message m
                 WHERE json_extract(m.data, '$.role') = 'assistant'
                   AND COALESCE(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER), 0) > 0
             )
             SELECT msg_id, session_id, time_created, input_tokens, cache_read,
-                   cache_write, total_tokens, agent, finish
+                   cache_write, total_tokens, agent, finish, native_turn_id
             FROM ranked
             WHERE rn <= ?1
             ORDER BY time_created DESC
@@ -1022,6 +1091,7 @@ pub fn load_raw_db_cache_events(
             total_tokens: row.get(6)?,
             agent: row.get(7)?,
             finish: row.get(8)?,
+            native_turn_id: row.get(9)?,
             context_limit: None,
         })
     })?;
@@ -1072,6 +1142,7 @@ pub fn load_raw_pi_cache_events(
                     total_tokens: usage.total as i64,
                     agent: None,
                     finish: message.stop_reason.clone(),
+                    native_turn_id: None,
                     context_limit: None,
                 })
             })
@@ -1172,6 +1243,7 @@ fn load_raw_external_cache_events(
                     total_tokens: event.total_tokens,
                     agent: event.model.clone(),
                     finish: event.finish.clone(),
+                    native_turn_id: None,
                     context_limit: event.context_limit,
                 })
             })
@@ -1356,6 +1428,10 @@ fn load_transform_failure_sessions_from_conn(
     out
 }
 
+fn finish_continues_turn(finish: &str) -> bool {
+    matches!(finish, "tool-calls" | "toolUse" | "tool_use")
+}
+
 fn build_db_cache_events(rows: Vec<RawDbCacheEvent>, enrich_causes: bool) -> Vec<DbCacheEvent> {
     build_db_cache_events_with_attribution(rows, enrich_causes, None, None)
 }
@@ -1535,6 +1611,7 @@ fn build_db_cache_events_with_attribution(
             cause: None,
             agent: row.agent,
             finish: row.finish,
+            native_turn_id: row.native_turn_id,
             turn_id: String::new(),
             is_turn_start: false,
             context_limit: row.context_limit.unwrap_or(0),
@@ -1601,25 +1678,32 @@ fn build_db_cache_events_with_attribution(
             chronological[i].session_id.clone(),
         );
 
-        // Turn grouping: a new turn starts at the session's first event or when
-        // the previous event's finish != "tool-calls".
+        // OpenCode persists the native user→assistant relationship as `parentID`.
+        // It is authoritative even when an interrupted tool step is followed by a
+        // queued user message. JSONL harnesses lack that key, so they fall back to
+        // their provider-specific tool-continuation finish values.
+        let native_turn_id = chronological[i]
+            .native_turn_id
+            .as_deref()
+            .filter(|turn_id| !turn_id.is_empty());
         let prev_finish = last_finish_by_session.get(&session_key).cloned();
-        let is_new_turn = match prev_finish.as_deref() {
-            None => true,
-            Some("tool-calls") => false,
-            Some(_) => true,
-        };
+        let inferred_is_new_turn = prev_finish
+            .as_deref()
+            .map_or(true, |finish| !finish_continues_turn(finish));
+        let turn_id = native_turn_id.map(ToString::to_string).unwrap_or_else(|| {
+            if inferred_is_new_turn {
+                chronological[i].message_id.clone()
+            } else {
+                current_turn_id_by_session
+                    .get(&session_key)
+                    .cloned()
+                    .unwrap_or_else(|| chronological[i].message_id.clone())
+            }
+        });
+        let is_new_turn = current_turn_id_by_session.get(&session_key) != Some(&turn_id);
         chronological[i].is_turn_start = is_new_turn;
-        if is_new_turn {
-            chronological[i].turn_id = chronological[i].message_id.clone();
-            current_turn_id_by_session
-                .insert(session_key.clone(), chronological[i].message_id.clone());
-        } else {
-            chronological[i].turn_id = current_turn_id_by_session
-                .get(&session_key)
-                .cloned()
-                .unwrap_or_default();
-        }
+        chronological[i].turn_id = turn_id.clone();
+        current_turn_id_by_session.insert(session_key.clone(), turn_id);
 
         // Severity.
         let is_first_in_window = seen_sessions.insert(session_key.clone());
@@ -2439,14 +2523,23 @@ fn get_opencode_session_cache_events(
     let Ok(conn) = open_readonly(&opencode_db_path) else {
         return Vec::new();
     };
+    get_opencode_session_cache_events_from_conn(&conn, session_id, limit, since_timestamp)
+}
 
+fn get_opencode_session_cache_events_from_conn(
+    conn: &Connection,
+    session_id: &str,
+    limit: Option<usize>,
+    since_timestamp: Option<i64>,
+) -> Vec<DbCacheEvent> {
     const COLS: &str = "SELECT CAST(id AS TEXT), session_id, time_created,
                 COALESCE(CAST(json_extract(data, '$.tokens.input') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.cache.read') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.cache.write') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.total') AS INTEGER), 0),
                 CAST(json_extract(data, '$.agent') AS TEXT),
-                CAST(json_extract(data, '$.finish') AS TEXT)
+                 CAST(json_extract(data, '$.finish') AS TEXT),
+                 CAST(json_extract(data, '$.parentID') AS TEXT)
          FROM message
          WHERE session_id = ?1
            AND json_extract(data, '$.role') = 'assistant'
@@ -2495,6 +2588,7 @@ fn get_opencode_session_cache_events(
             total_tokens: row.get(6)?,
             agent: row.get(7)?,
             finish: row.get(8)?,
+            native_turn_id: row.get(9)?,
             context_limit: None,
         })
     }) else {
@@ -2531,6 +2625,7 @@ fn get_pi_session_cache_events(
                 total_tokens: usage.total as i64,
                 agent: None,
                 finish: message.stop_reason,
+                native_turn_id: None,
                 context_limit: None,
             })
         })
@@ -2619,6 +2714,7 @@ fn get_external_session_cache_events(
             total_tokens: event.total_tokens,
             agent: event.model.clone(),
             finish: event.finish.clone(),
+            native_turn_id: None,
             context_limit: event.context_limit,
         })
         .collect();
@@ -7206,8 +7302,14 @@ mod cache_turn_tests {
             total_tokens: total,
             agent: None,
             finish: finish.map(|s| s.to_string()),
+            native_turn_id: None,
             context_limit: None,
         }
+    }
+
+    fn with_native_turn(mut event: RawDbCacheEvent, turn_id: &str) -> RawDbCacheEvent {
+        event.native_turn_id = Some(turn_id.to_string());
+        event
     }
 
     fn turn_summary_event(events: &[DbCacheEvent]) -> Option<&DbCacheEvent> {
@@ -7253,6 +7355,142 @@ mod cache_turn_tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].is_turn_start);
         assert_eq!(events[0].turn_id, "m1");
+    }
+
+    #[test]
+    fn opencode_session_query_uses_parent_id_as_the_native_turn() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (message_id, timestamp) in [("assistant-1", 100), ("assistant-2", 200)] {
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    message_id,
+                    "s1",
+                    timestamp,
+                    serde_json::json!({
+                        "role": "assistant",
+                        "parentID": "user-1",
+                        "finish": "stop",
+                        "tokens": { "input": 10, "cache": { "read": 80, "write": 10 }, "total": 100 }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        let events = get_opencode_session_cache_events_from_conn(&conn, "s1", Some(10), None);
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_turn_start);
+        assert!(!events[1].is_turn_start);
+        assert!(events.iter().all(|event| event.turn_id == "user-1"));
+    }
+
+    #[test]
+    fn native_opencode_parent_id_overrides_finish_heuristics() {
+        let rows = vec![
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-1",
+                    "s1",
+                    100,
+                    10,
+                    80,
+                    10,
+                    100,
+                    Some("tool-calls"),
+                ),
+                "user-1",
+            ),
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-2",
+                    "s1",
+                    100,
+                    10,
+                    85,
+                    5,
+                    100,
+                    Some("tool-calls"),
+                ),
+                "user-2",
+            ),
+        ];
+
+        let events = build_db_cache_events(rows, false);
+        assert_eq!(events.iter().filter(|event| event.is_turn_start).count(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.turn_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["user-1", "user-2"]),
+            "queued users with colliding timestamps remain distinct native turns"
+        );
+    }
+
+    #[test]
+    fn native_opencode_parent_groups_every_request_in_a_multi_step_turn() {
+        let rows = vec![
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-1",
+                    "s1",
+                    100,
+                    10,
+                    80,
+                    10,
+                    100,
+                    Some("stop"),
+                ),
+                "user-1",
+            ),
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-2",
+                    "s1",
+                    200,
+                    10,
+                    85,
+                    5,
+                    100,
+                    Some("stop"),
+                ),
+                "user-1",
+            ),
+        ];
+
+        let events = build_db_cache_events(rows, false);
+        assert!(events[0].is_turn_start);
+        assert!(!events[1].is_turn_start);
+        assert!(events.iter().all(|event| event.turn_id == "user-1"));
+    }
+
+    #[test]
+    fn jsonl_tool_continuation_finish_values_group_requests() {
+        for (harness, finish) in [(Harness::Pi, "toolUse"), (Harness::ClaudeCode, "tool_use")] {
+            let rows = vec![
+                raw(harness, "m1", "s1", 100, 10, 80, 10, 100, Some(finish)),
+                raw(harness, "m2", "s1", 200, 10, 85, 5, 100, Some("stop")),
+            ];
+            let events = build_db_cache_events(rows, false);
+            assert!(events[0].is_turn_start, "{harness:?}");
+            assert!(!events[1].is_turn_start, "{harness:?}");
+            assert_eq!(events[0].turn_id, events[1].turn_id, "{harness:?}");
+        }
     }
 
     #[test]
@@ -8277,6 +8515,7 @@ mod get_session_cache_events_by_turn_count_tests {
             cause: None,
             agent: None,
             finish: Some("stop".to_string()),
+            native_turn_id: None,
             turn_id: String::new(),
             is_turn_start,
             context_limit: 0,

@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -9,6 +9,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage-meta";
 import {
+    captureChannel1PostReduceGraceBaseline,
     getOverflowState,
     recordOverflowDetected,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -18,6 +19,7 @@ import type { Channel1State } from "./ctx-reduce-nudge";
 import { EMPTY_TASK_OUTPUT_SENTINEL } from "./empty-task-output";
 import {
     createChatMessageHook,
+    createCommandExecuteBeforeHook,
     createEventHook,
     createToolExecuteAfterHook,
 } from "./hook-handlers";
@@ -394,6 +396,110 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
     });
 });
 
+describe("Desktop stripped-command interception", () => {
+    function createCommandHook(commandHandler: {
+        "command.execute.before": (
+            input: { command: string; sessionID: string; arguments: string },
+            output: { parts: Array<{ type: string; text?: string }> },
+            params: Record<string, unknown>,
+        ) => Promise<unknown>;
+    }) {
+        const db = createTestDb();
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession: new Map(),
+            variantBySession: new Map(),
+            agentBySession: new Map(),
+            historyRefreshSessions: new Set(),
+            systemPromptRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            commandHandler,
+        });
+        return { db, hook };
+    }
+
+    test("routes accepted wrapup arguments through the native command handler", async () => {
+        const execute = mock(async () => undefined);
+        const { db, hook } = createCommandHook({ "command.execute.before": execute });
+        try {
+            await hook(
+                {
+                    sessionID: "ses-wrapup",
+                    agent: "build",
+                    variant: "high",
+                    model: { providerID: "anthropic", modelID: "claude" },
+                },
+                { parts: [{ type: "text", text: "ctx-wrapup 2" }] },
+            );
+
+            expect(execute).toHaveBeenCalledTimes(1);
+            expect(execute.mock.calls[0]?.[0]).toEqual({
+                command: "ctx-wrapup",
+                sessionID: "ses-wrapup",
+                arguments: "2",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("does not route trailing or surrounding prose", async () => {
+        const execute = mock(async () => undefined);
+        const { db, hook } = createCommandHook({ "command.execute.before": execute });
+        try {
+            for (const text of [
+                "ctx-status extra prose sentence",
+                "Please run ctx-status before continuing.",
+            ]) {
+                await hook({ sessionID: "ses-prose" }, { parts: [{ type: "text", text }] });
+            }
+
+            expect(execute).not.toHaveBeenCalled();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("leaves native slash dispatch on the same handler adapter", async () => {
+        const execute = mock(async () => undefined);
+        const nativeHook = createCommandExecuteBeforeHook({ "command.execute.before": execute });
+        const output = { parts: [{ type: "text", text: "" }] };
+
+        await nativeHook(
+            {
+                command: "ctx-status",
+                sessionID: "ses-native-command",
+                arguments: "",
+                agent: "build",
+                variant: "high",
+                providerID: "anthropic",
+                modelID: "claude",
+            },
+            output,
+        );
+
+        expect(execute).toHaveBeenCalledWith(
+            {
+                command: "ctx-status",
+                sessionID: "ses-native-command",
+                arguments: "",
+                agent: "build",
+                variant: "high",
+                providerID: "anthropic",
+                modelID: "claude",
+            },
+            output,
+            {
+                agent: "build",
+                variant: "high",
+                providerId: "anthropic",
+                modelId: "claude",
+            },
+        );
+    });
+});
+
 // Variant-change flush must be provider-aware (#257). On providers whose wire
 // renders the thinking config into the prompt (Anthropic family), the
 // provider itself invalidates message blocks on a variant flip, so our flush
@@ -624,24 +730,24 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
 });
 
 describe("createToolExecuteAfterHook Channel-1 dampening", () => {
-    test("gives an applying drop pass one fire-free baseline before resuming", async () => {
+    test("keeps the post-reduce specimen quiet until U regrows by a full delta", async () => {
         const db = createTestDb();
         const sessionId = "ses-channel1-drop-grace";
         const state: Channel1State = {
-            baselineU: 90_000,
-            baselineT: 120_000,
+            baselineU: 30_000,
+            baselineT: 72_000,
             turnDeltaU: 0,
             turnDeltaT: 0,
             usableWindow: 128_000,
-            realUserTurnCount: 1,
+            realUserTurnCount: 0,
             baselineGeneration: 2,
             computedAt: 1,
             evaluable: true,
             generationInvalidated: false,
             baselineParts: [],
-            contentSignature: "post-drop",
+            contentSignature: "pre-drop",
             reducedSinceRefresh: false,
-            agentDropsAppliedThisPass: true,
+            agentDropsAppliedThisPass: false,
             oldestReclaimableToolTags: [],
         };
         const hook = createToolExecuteAfterHook({
@@ -650,14 +756,39 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
         });
 
         try {
-            const applyingPass = { output: "output on applying pass" };
-            await hook({ tool: "bash", sessionID: sessionId }, applyingPass);
-            expect(applyingPass.output).toBe("output on applying pass");
+            const first = { output: "first output" };
+            await hook({ tool: "bash", sessionID: sessionId }, first);
+            expect(first.output).toContain("Housekeeping:");
+            expect(first.output).not.toContain("Reminder:");
 
-            state.agentDropsAppliedThisPass = false;
-            const nextPass = { output: "output on next pass" };
-            await hook({ tool: "bash", sessionID: sessionId }, nextPass);
-            expect(nextPass.output).toContain("Housekeeping backlog: ~90k");
+            await hook({ tool: "ctx_reduce", sessionID: sessionId }, { output: "queued drops" });
+            captureChannel1PostReduceGraceBaseline(db, sessionId, 60_000);
+            Object.assign(state, {
+                baselineU: 60_000,
+                baselineT: 145_000,
+                turnDeltaU: 0,
+                turnDeltaT: 0,
+                realUserTurnCount: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                reducedSinceRefresh: false,
+                agentDropsAppliedThisPass: false,
+                contentSignature: "post-drop",
+            });
+            const immediate = { output: "immediate next output" };
+            await hook({ tool: "bash", sessionID: sessionId }, immediate);
+            expect(immediate.output).toBe("immediate next output");
+
+            Object.assign(state, { baselineU: 84_999, realUserTurnCount: 5, turnDeltaT: 0 });
+            const almost = { output: "almost regrown" };
+            await hook({ tool: "bash", sessionID: sessionId }, almost);
+            expect(almost.output).toBe("almost regrown");
+
+            Object.assign(state, { baselineU: 85_000, turnDeltaT: 0 });
+            const regrown = { output: "regrown" };
+            await hook({ tool: "bash", sessionID: sessionId }, regrown);
+            expect(regrown.output).toContain("Reminder:");
+            expect(regrown.output).not.toContain("a ctx_reduce pass is due");
         } finally {
             closeQuietly(db);
         }
@@ -710,7 +841,7 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
         try {
             const first = { output: "first output" };
             await hook({ tool: "bash", sessionID: sessionId }, first);
-            expect(first.output).toContain("Housekeeping: ~50k of this session's ~128k window");
+            expect(first.output).toContain("Housekeeping: spent tool outputs (~50k tokens)");
             const frozenFirst = first.output;
             await hook({ tool: "bash", sessionID: sessionId }, first);
             expect(first.output).toBe(frozenFirst);
@@ -719,13 +850,9 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             const sameTurnCount = countRealUserMessages(sameTurnWithSyntheticRows);
             expect(sameTurnCount).toBe(firstTurnCount);
             channel1StateBySession.set(sessionId, state(80_000, 180_000, sameTurnCount));
-            const sticky = { output: "second output" };
-            await hook({ tool: "bash", sessionID: sessionId }, sticky);
-            expect(sticky.output).toContain("Reminder: ctx_reduce housekeeping still pending —");
-            expect(sticky.output).not.toContain("Not a limit");
-            const frozenSticky = sticky.output;
-            await hook({ tool: "bash", sessionID: sessionId }, sticky);
-            expect(sticky.output).toBe(frozenSticky);
+            const sameTurn = { output: "second output" };
+            await hook({ tool: "bash", sessionID: sessionId }, sameTurn);
+            expect(sameTurn.output).toBe("second output");
 
             const threeLater = Array.from({ length: 4 }, (_, index) => ({
                 info: { id: `real-user-${index}`, role: "user" },
@@ -735,18 +862,25 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
                 sessionId,
                 state(110_000, 240_000, countRealUserMessages(threeLater)),
             );
-            const expired = { output: "third output" };
-            await hook({ tool: "bash", sessionID: sessionId }, expired);
-            expect(expired.output).toContain("Housekeeping: ~110k of this session's ~128k window");
-            expect(expired.output).not.toContain("Reminder: ctx_reduce housekeeping still pending");
+            const beforeFiveTurns = { output: "third output" };
+            await hook({ tool: "bash", sessionID: sessionId }, beforeFiveTurns);
+            expect(beforeFiveTurns.output).toBe("third output");
 
-            channel1StateBySession.set(sessionId, state(120_000, 180_000, 4));
+            channel1StateBySession.set(sessionId, state(110_000, 240_000, 6));
+            const sticky = { output: "five turns later" };
+            await hook({ tool: "bash", sessionID: sessionId }, sticky);
+            expect(sticky.output).toContain(
+                "Reminder: spent tool outputs (~110k tokens) are still reclaimable",
+            );
+            expect(sticky.output).not.toContain("a ctx_reduce pass is due");
+
+            channel1StateBySession.set(sessionId, state(120_000, 180_000, 6));
             const escalation = { output: "fourth output" };
             await hook({ tool: "bash", sessionID: sessionId }, escalation);
-            expect(escalation.output).toContain("Housekeeping backlog: ~120k");
-            expect(escalation.output).not.toContain(
-                "Reminder: ctx_reduce housekeeping still pending",
+            expect(escalation.output).toContain(
+                "Housekeeping backlog: spent tool outputs (~120k tokens)",
             );
+            expect(escalation.output).not.toContain("Reminder: spent tool outputs");
         } finally {
             closeQuietly(db);
         }
@@ -783,8 +917,9 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
         try {
             const output = { output: "legacy output" };
             await hook({ tool: "bash", sessionID: sessionId }, output);
-            expect(output.output).toContain("Housekeeping: ~80k of this session's ~128k window");
-            expect(output.output).not.toContain("Reminder: ctx_reduce housekeeping still pending");
+            expect(output.output).toContain(
+                "Reminder: spent tool outputs (~80k tokens) are still reclaimable",
+            );
             expect(
                 db
                     .prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?")

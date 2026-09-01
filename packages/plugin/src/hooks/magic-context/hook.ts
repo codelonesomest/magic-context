@@ -41,6 +41,7 @@ import {
 } from "../../features/magic-context/memory/project-identity";
 import {
     embedSessionCompartmentChunks,
+    embedUnembeddedMemoriesForProject,
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
@@ -86,6 +87,7 @@ import {
     resolveExecuteThresholdDetail,
     resolveModelKey,
 } from "./event-resolvers";
+import { formatEmbedFailureSummary } from "./format-embed-failure";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { createDbLkgPersistence } from "./lkg-persist";
@@ -177,6 +179,10 @@ export interface MagicContextDeps {
             min_chars: number;
         };
         transform_mode?: ResolvedTransformMode;
+        /** Path to the subc daemon's connection file. Threaded to the module
+         *  transport so a host that publishes it outside the default data-dir
+         *  location (e.g. a systemd RuntimeDirectory) is actually reachable. */
+        subc?: { connection_file: string };
         /** Compaction-off mode gate (issue #266). Resolved ONCE here at the
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
@@ -662,7 +668,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             case "stalled":
                 return terminal(
                     "skipped",
-                    `Embedded ${outcome.embedded} compartments; ${outcome.remaining} could not be embedded (the provider returned no result). Run /ctx-embed start again to retry them.`,
+                    formatEmbedFailureSummary(outcome.embedded, outcome.remaining, outcome.failure),
                 );
             default:
                 return terminal(
@@ -773,7 +779,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
         (() => {
-            const transport = new SubcModuleTransport();
+            const transport = new SubcModuleTransport(deps.config.subc?.connection_file);
             const client: RustModeModuleClient = {
                 call: (args) => transport.call(args),
                 stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
@@ -906,6 +912,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   content,
                                   memory_project: memoryProject,
                                   surface_condition: surfaceCondition,
+                                  compiled_provider: compiledProvider,
+                                  compiled_config: compiledConfig,
+                                  compiled_at: compiledAt,
+                                  compile_status: compileStatus,
                                   filter,
                                   limit,
                                   offset,
@@ -971,6 +981,27 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       // Auto-search and local RPC/dashboard reads consume the mirror,
                       // so publish the module mutation to that read model before return.
                       await syncModuleMemories();
+                      if (
+                          !moduleNoteResponseIsError(response) &&
+                          (action === "write" || action === "update" || action === "merge")
+                      ) {
+                          // TypeScript memory writes queue embedding work immediately.
+                          // The Rust path must do the same after publishing its memory.
+                          void (async () => {
+                              await ensureProjectRegisteredFromOpenCodeDirectory(projectRoot, db);
+                              const embedded = await embedUnembeddedMemoriesForProject(
+                                  db,
+                                  memoryProject,
+                              );
+                              if (embedded > 0) {
+                                  log(
+                                      `[magic-context] proactively embedded ${embedded} mirrored ${embedded === 1 ? "memory" : "memories"} for project ${memoryProject}`,
+                                  );
+                              }
+                          })().catch((error) => {
+                              log("[magic-context] mirrored memory embedding failed:", error);
+                          });
+                      }
                       return response;
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
@@ -1504,6 +1535,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions,
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
+            commandHandler,
             // E5 — only offer the upgrade reminder when historian can run (so
             // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable

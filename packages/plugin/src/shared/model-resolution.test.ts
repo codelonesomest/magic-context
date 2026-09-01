@@ -4,10 +4,29 @@ import {
     normalizeModelEntry,
     resolveDreamerTaskModel,
     resolveFallbackEntries,
+    resolveHistorianAgentOverrides,
     resolveHistorianModel,
 } from "./model-resolution";
 
 describe("model-resolution", () => {
+    test("keeps historian temperature opt-in while preserving explicit overrides", () => {
+        expect(resolveHistorianAgentOverrides(undefined)).toEqual({
+            maxTokens: 32_000,
+        });
+        expect(
+            resolveHistorianAgentOverrides({
+                temperature: 0.2,
+                maxTokens: 16_000,
+                opencode: { model: "google/flash", variant: "low" },
+            }),
+        ).toEqual({
+            temperature: 0.2,
+            maxTokens: 16_000,
+            model: "google/flash",
+            variant: "low",
+        });
+    });
+
     test("normalizes string and object entries to the same model identity", () => {
         expect(normalizeModelEntry("anthropic/sonnet", "opencode")).toEqual({
             model: "anthropic/sonnet",
@@ -34,6 +53,24 @@ describe("model-resolution", () => {
             { model: "anthropic/sonnet", qualifier: "high" },
             { model: "google/flash" },
         ]);
+    });
+
+    test("keeps the flash calibration available only as an explicit override", () => {
+        expect(
+            resolveHistorianAgentOverrides({
+                opencode: { model: { model: "google/flash", variant: "fast" } },
+                pi: { model: "pi/ignored" },
+                two_pass: true,
+            }),
+        ).toEqual({
+            maxTokens: 32_000,
+            two_pass: true,
+            model: "google/flash",
+            variant: "fast",
+        });
+        expect(
+            resolveHistorianAgentOverrides({ temperature: 0.1, maxTokens: 12_000 }),
+        ).toMatchObject({ temperature: 0.1, maxTokens: 12_000 });
     });
 
     test("does not inherit a block qualifier into unqualified fallbacks", () => {

@@ -239,6 +239,15 @@ export function markProjectLoadUntrusted(projectIdentity: string): void {
 let projectSweepInProgress = false;
 let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
 
+export class TestProviderFactoryRequiredError extends Error {
+    constructor() {
+        super(
+            "test constructed a network-capable embedding provider without a test factory — install _setTestProviderFactoryForProject or set embedding.provider off in the fixture",
+        );
+        this.name = "TestProviderFactoryRequiredError";
+    }
+}
+
 function synapseConfigFields(config: EmbeddingConfig): {
     model?: string;
     fingerprint?: string;
@@ -378,6 +387,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
         return {
             provider: "local",
             model: config?.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+            local_runtime: config?.local_runtime ?? "auto",
             ...(config?.max_input_tokens
                 ? {
                       max_input_tokens: normalizeCompartmentChunkMaxInputTokens(
@@ -468,12 +478,20 @@ function createProvider(
     config: EmbeddingConfig,
     context?: { projectRoot: string; session: string },
 ): EmbeddingProvider | null {
+    // `off` is an intentional no-provider configuration, including in tests.
+    if (config.provider === "off") {
+        return null;
+    }
+
     if (testProviderFactory) {
         return testProviderFactory(config);
     }
 
-    if (config.provider === "off") {
-        return null;
+    // The preload sets this process-only marker for every Bun test that wires
+    // Magic Context's test isolation. A factory makes provider construction
+    // explicit so a fixture can never silently use a live endpoint or model.
+    if (process.env.MAGIC_CONTEXT_TEST_DATA_DIR?.trim()) {
+        throw new TestProviderFactoryRequiredError();
     }
 
     if (config.provider === "openai-compatible") {
@@ -493,6 +511,7 @@ function createProvider(
             config.model,
             config.max_input_tokens,
             config.local_dtype,
+            config.local_runtime,
         );
     }
 
@@ -1192,11 +1211,12 @@ export function enqueueShadowEmbeddingItems(
 }
 
 /**
- * Base missing-set query for one shadow scope: the items the PRIMARY lane has
- * already embedded (row under the primary modelId) that have NO row under the
- * shadow modelId yet. Mirrors the primary backfill's LEFT JOIN ... WHERE NULL
- * shape. Returned without ORDER BY/LIMIT so callers can append a bounded LIMIT
- * (id listing) or wrap it in a COUNT(*).
+ * Base key/hash-incomplete query for one shadow scope. Memory content updates
+ * invalidate all model rows and commit SHAs are content identities, so their
+ * current-content predicate reduces to row existence. Chunk coverage is stricter:
+ * every primary `(compartment_id, window_index, chunk_hash)` must have an exact
+ * row under the current shadow identity. A same-key row with an old hash remains
+ * a candidate and is replaced by the bounded drain.
  */
 function shadowBackfillMissingBase(
     scope: ShadowScope,
@@ -1227,15 +1247,25 @@ function shadowBackfillMissingBase(
         };
     }
     return {
-        sql: `SELECT DISTINCT cp.compartment_id AS id
+        sql: `SELECT cp.compartment_id AS id,
+                     MIN(CASE WHEN NOT EXISTS (
+                         SELECT 1 FROM compartment_chunk_embeddings same_key
+                         WHERE same_key.compartment_id = cp.compartment_id
+                           AND same_key.window_index = cp.window_index
+                           AND same_key.model_id = ?
+                     ) THEN 0 ELSE 1 END) AS defect_order
               FROM compartment_chunk_embeddings cp
               WHERE cp.project_path = ? AND cp.model_id = ?
                 AND NOT EXISTS (
-                    SELECT 1 FROM compartment_chunk_embeddings cs
-                    WHERE cs.compartment_id = cp.compartment_id AND cs.model_id = ?
-                )`,
-        params: [projectIdentity, primaryModelId, shadowModelId],
-        orderBy: " ORDER BY cp.compartment_id",
+                    SELECT 1 FROM compartment_chunk_embeddings current
+                    WHERE current.compartment_id = cp.compartment_id
+                      AND current.window_index = cp.window_index
+                      AND current.chunk_hash = cp.chunk_hash
+                      AND current.model_id = ?
+                )
+              GROUP BY cp.compartment_id`,
+        params: [shadowModelId, projectIdentity, primaryModelId, shadowModelId],
+        orderBy: " ORDER BY defect_order ASC, cp.compartment_id ASC",
     };
 }
 
@@ -2142,6 +2172,7 @@ async function embedCompartmentChunkBatch(
         projectIdentity,
         snapshot.chunkModelId,
         batchSize,
+        getProjectEmbeddingMaxInputTokens(projectIdentity),
     );
     if (candidates.length === 0) return 0;
     // Passive sweep ignores `failed`/`noWork` — it's bounded per tick and re-runs
@@ -2465,11 +2496,13 @@ export async function embedSessionCompartmentChunks(
     // persist it before counting so stale rows under another project cannot make
     // this session look already embedded forever.
     recordSessionProjectIdentity(db, sessionId, projectIdentity);
+    const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
     const total = countUnembeddedSessionCompartments(
         db,
         projectIdentity,
         sessionId,
         snapshot.chunkModelId,
+        maxInputTokens,
     );
     if (total === 0) return { status: "nothing", embedded: 0, total: 0 };
 
@@ -2531,6 +2564,7 @@ export async function embedSessionCompartmentChunks(
                 snapshot.chunkModelId,
                 batchSize,
                 [...skipIds, ...failedIds],
+                maxInputTokens,
             );
             if (candidates.length === 0) break;
             const {
@@ -2604,6 +2638,7 @@ export async function embedSessionCompartmentChunks(
                 projectIdentity,
                 sessionId,
                 snapshot.chunkModelId,
+                maxInputTokens,
             ) - skipIds.length,
         );
         if (remaining > 0) {
@@ -2661,6 +2696,7 @@ export function getEmbeddingCoverageStatus(
         projectIdentity,
         sessionId,
         snapshot.chunkModelId,
+        getProjectEmbeddingMaxInputTokens(projectIdentity),
     );
     const memories = getMemoryEmbedCoverage(db, projectIdentity, snapshot.modelId);
     const gitEnabled = snapshot.gitCommitEnabled;
