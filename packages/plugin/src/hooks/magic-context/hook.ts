@@ -52,6 +52,7 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import {
+    type DatabaseBootTimings,
     getMigrationOnOpenRefusal,
     getSchemaFenceRejection,
     openDatabaseAsync,
@@ -195,6 +196,8 @@ export interface MagicContextDeps {
     rustModeModuleClient?: RustModeModuleClient;
     /** Test and async-boot seam for supplying a database already opened by the caller. */
     openDatabaseForHook?: () => Database | null;
+    /** Plugin-factory diagnostics for the boot-time storage phases. */
+    onStorageBootTimings?: (timings: DatabaseBootTimings) => void;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
@@ -411,6 +414,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const liveModelBySession =
         deps.liveSessionState?.liveModelBySession ??
         new Map<string, { providerID: string; modelID: string }>();
+    const latestAssistantMessageIdBySession =
+        deps.liveSessionState?.latestAssistantMessageIdBySession ?? new Map<string, string>();
     const agentBySession = deps.liveSessionState?.agentBySession ?? new Map<string, string>();
     const sessionDirectoryBySession =
         deps.liveSessionState?.sessionDirectoryBySession ?? new Map<string, string>();
@@ -498,6 +503,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // shared live state — and the next transform pass + RPC sidebar see them.
         liveSessionState: {
             liveModelBySession,
+            latestAssistantMessageIdBySession,
             channel1StateBySession,
             variantBySession,
             agentBySession,
@@ -718,7 +724,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         autoEmbedAttemptedBySession.add(sessionId);
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         void (async () => {
-            let completedDrainWithWork = false;
+            // Latch discipline: early exits (no identity, provider off, nothing to
+            // embed yet) release the latch so a young session gets its drain once
+            // real work exists — those paths are silent and cost one coverage
+            // query. Once a drain reaches ANY terminal outcome (busy, stalled,
+            // success), the latch holds for the process lifetime: busy means the
+            // project-level passive backfill owns the backlog, and re-attempting
+            // per pass is the announce/busy livelock this shape replaced.
+            let drainReachedTerminal = false;
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -738,35 +751,41 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 if (!coverage.enabled) return;
                 const remaining = coverage.session.total - coverage.session.embedded;
                 if (remaining <= 0) return;
-                const notifyParams = getLiveNotificationParams(
-                    sessionId,
-                    liveModelBySession,
-                    variantBySession,
-                    agentBySession,
-                );
-                if (!isTuiConnected(sessionId)) {
-                    const startMsg = `Embedding ${remaining} compartment${remaining === 1 ? "" : "s"} of history in the background…`;
-                    await sendIgnoredMessage(deps.client, sessionId, startMsg, {
-                        ...notifyParams,
-                    });
-                }
-                const summary = await executeEmbedHistory(sessionId);
+                // The auto lane is a silent bootstrap trigger: no pre-announce, no
+                // busy/zero-work chatter, and the once-per-process latch never
+                // resets. Announce-then-drain looped every turn on large backlogs —
+                // the project-level passive backfill holds the drain lock for the
+                // whole (bounded, deferred-span) catch-up, so this drain returned
+                // "busy"/zero-work each pass, reset its own latch, and re-announced
+                // the same count forever. Retries belong to the passive backfill;
+                // progress lives in /ctx-embed status and the sidebar.
+                const embeddedBefore = coverage.session.embedded;
+                await executeEmbedHistory(sessionId, { silent: true });
+                drainReachedTerminal = true;
                 const completedCoverage = getEmbeddingCoverageStatus(
                     db,
                     sessionProjectIdentity,
                     sessionId,
                 );
-                completedDrainWithWork =
-                    completedCoverage.session.total - completedCoverage.session.embedded <= 0;
-                if (!isTuiConnected(sessionId)) {
-                    await sendIgnoredMessage(deps.client, sessionId, summary, {
-                        ...notifyParams,
-                    });
+                const embeddedNow = completedCoverage.session.embedded - embeddedBefore;
+                if (embeddedNow > 0 && !isTuiConnected(sessionId)) {
+                    const notifyParams = getLiveNotificationParams(
+                        sessionId,
+                        liveModelBySession,
+                        variantBySession,
+                        agentBySession,
+                    );
+                    await sendIgnoredMessage(
+                        deps.client,
+                        sessionId,
+                        `Embedded ${embeddedNow} compartment${embeddedNow === 1 ? "" : "s"} of history for semantic search.`,
+                        { ...notifyParams },
+                    );
                 }
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
             } finally {
-                if (!completedDrainWithWork) autoEmbedAttemptedBySession.delete(sessionId);
+                if (!drainReachedTerminal) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };
@@ -1197,6 +1216,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         compactionHandler: deps.compactionHandler,
         config: deps.config,
         compactionOff,
+        thinkingBindingRecoveryEnabled: deps.config.transform_mode !== "rust",
         tagger: deps.tagger,
         db,
         client: deps.client,
@@ -1219,32 +1239,31 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onRustWireInvalidated: (sessionId: string) => {
             transform.invalidateRustWireState(sessionId);
         },
-        // Clean up per-session state the system-prompt handler maintains so
-        // these module/closure-scope maps don't accumulate entries over the
-        // plugin's lifetime (Finding #3).
-        onSessionDeleted: (sessionId: string) => {
+        rustSessionCleanup: rustModeModuleClient !== undefined,
+        // Remove module-owned state before the context database drops the durable
+        // session→project binding needed to retry a failed module deletion.
+        onSessionDeleted: async (sessionId: string) => {
             dropSlot(sessionId, "session-deleted");
-            transform.clearRustSession(sessionId);
-            systemPromptHash.clearSession(sessionId);
-            // Prune every per-session map this hook closure owns. These
-            // accumulate one entry per session for the plugin process lifetime
-            // (which can span days/weeks across many sessions and subagents);
-            // without this, a long-lived process leaks memory steadily. Some
-            // maps are shared via liveSessionState — clearing on the terminal
-            // session.deleted event is correct since the session is gone.
-            lastHeuristicsTurnId.delete(sessionId);
-            clearToolPermissionDenied(sessionId);
-            commitSeenLastPass.delete(sessionId);
-            variantBySession.delete(sessionId);
-            liveModelBySession.delete(sessionId);
-            agentBySession.delete(sessionId);
-            sessionDirectoryBySession.delete(sessionId);
-            recompProgressBySession.delete(sessionId);
-            internalChildSessions.delete(sessionId);
-            rustMemorySyncRequestedSessions.delete(sessionId);
-            channel1StateBySession.delete(sessionId);
-            channel2DirectiveTextBySession.delete(sessionId);
-            clearEmbedSessionState(sessionId);
+            try {
+                await transform.clearRustSession(sessionId);
+            } finally {
+                systemPromptHash.clearSession(sessionId);
+                // Prune every per-session map this hook closure owns. These maps
+                // otherwise accumulate for the lifetime of a long-running plugin process.
+                lastHeuristicsTurnId.delete(sessionId);
+                clearToolPermissionDenied(sessionId);
+                commitSeenLastPass.delete(sessionId);
+                variantBySession.delete(sessionId);
+                liveModelBySession.delete(sessionId);
+                agentBySession.delete(sessionId);
+                sessionDirectoryBySession.delete(sessionId);
+                recompProgressBySession.delete(sessionId);
+                internalChildSessions.delete(sessionId);
+                rustMemorySyncRequestedSessions.delete(sessionId);
+                channel1StateBySession.delete(sessionId);
+                channel2DirectiveTextBySession.delete(sessionId);
+                clearEmbedSessionState(sessionId);
+            }
         },
     });
 
@@ -1508,6 +1527,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         db,
         liveModelBySession,
+        latestAssistantMessageIdBySession,
         variantBySession,
         agentBySession,
         sessionDirectoryBySession,
@@ -1622,7 +1642,7 @@ export async function createMagicContextHookAsync(
     let database: Database | null;
     try {
         clearHookInitFailure();
-        database = await openDatabaseAsync();
+        database = await openDatabaseAsync({ onBootTimings: deps.onStorageBootTimings });
     } catch (error) {
         const reason = getErrorMessage(error);
         log("[magic-context] hook failed to open storage; disabling feature:", error);

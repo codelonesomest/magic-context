@@ -180,6 +180,104 @@ pub enum FireOutcome {
     Busy(HistorianDurableState),
 }
 
+/// Rust's concrete reason for declining a historian firing. The raw variant name stays
+/// available for Rust incident tooling while `canonical_cause` maps the decision onto the
+/// TypeScript operator vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorianNoFireCause {
+    HistorianAlreadyInProgress,
+    LiveHistorianClaimBusy,
+    RestartRecoveryInProgress,
+    CheapGateBelowTriggerBudget,
+    NoLiveMessageAtOrAfterOffset,
+    RawTailInspectionFailed,
+    ProjectedPostDropSatisfied,
+    ProtectedTailWindowEmpty,
+    BelowProactiveFloor,
+    BelowMinimumEligibleContent,
+    DrainBudgetSpent,
+    MissingBoundarySnapshot,
+    StaleBoundarySnapshot,
+    EmptyFilteredChunk,
+    InvalidChunkCoverage,
+    NoModels,
+    FailureBackoff,
+    PendingRewrite,
+    StateLoadFailed,
+    ContinuedOrdinalOffsetMissing,
+    MissingBoundary,
+    EmptyEligibleRange,
+    EmptyChunk,
+    BelowSubstanceFloor,
+    MissingBlockIdentity,
+    AssemblyFailed,
+    SubagentSession,
+}
+
+impl HistorianNoFireCause {
+    pub const fn raw_cause(self) -> &'static str {
+        match self {
+            Self::HistorianAlreadyInProgress => "HistorianAlreadyInProgress",
+            Self::LiveHistorianClaimBusy => "LiveHistorianClaimBusy",
+            Self::RestartRecoveryInProgress => "RestartRecoveryInProgress",
+            Self::CheapGateBelowTriggerBudget => "CheapGateBelowTriggerBudget",
+            Self::NoLiveMessageAtOrAfterOffset => "NoLiveMessageAtOrAfterOffset",
+            Self::RawTailInspectionFailed => "RawTailInspectionFailed",
+            Self::ProjectedPostDropSatisfied => "ProjectedPostDropSatisfied",
+            Self::ProtectedTailWindowEmpty => "ProtectedTailWindowEmpty",
+            Self::BelowProactiveFloor => "BelowProactiveFloor",
+            Self::BelowMinimumEligibleContent => "BelowMinimumEligibleContent",
+            Self::DrainBudgetSpent => "DrainBudgetSpent",
+            Self::MissingBoundarySnapshot => "MissingBoundarySnapshot",
+            Self::StaleBoundarySnapshot => "StaleBoundarySnapshot",
+            Self::EmptyFilteredChunk => "EmptyFilteredChunk",
+            Self::InvalidChunkCoverage => "InvalidChunkCoverage",
+            Self::NoModels => "NoModels",
+            Self::FailureBackoff => "FailureBackoff",
+            Self::PendingRewrite => "PendingRewrite",
+            Self::StateLoadFailed => "StateLoadFailed",
+            Self::ContinuedOrdinalOffsetMissing => "ContinuedOrdinalOffsetMissing",
+            Self::MissingBoundary => "MissingBoundary",
+            Self::EmptyEligibleRange => "EmptyEligibleRange",
+            Self::EmptyChunk => "EmptyChunk",
+            Self::BelowSubstanceFloor => "BelowSubstanceFloor",
+            Self::MissingBlockIdentity => "MissingBlockIdentity",
+            Self::AssemblyFailed => "AssemblyFailed",
+            Self::SubagentSession => "SubagentSession",
+        }
+    }
+
+    pub const fn canonical_cause(self) -> &'static str {
+        match self {
+            Self::HistorianAlreadyInProgress
+            | Self::LiveHistorianClaimBusy
+            | Self::RestartRecoveryInProgress => "in_flight",
+            Self::CheapGateBelowTriggerBudget => "cheap_skip",
+            Self::NoLiveMessageAtOrAfterOffset | Self::EmptyChunk => "no_new_raw_history",
+            Self::RawTailInspectionFailed => "raw_history_unavailable",
+            Self::ProjectedPostDropSatisfied => "redundancy_skip",
+            Self::ProtectedTailWindowEmpty | Self::MissingBoundary | Self::EmptyEligibleRange => {
+                "protected_tail"
+            }
+            Self::BelowMinimumEligibleContent | Self::BelowSubstanceFloor => "below_min_chunk",
+            Self::DrainBudgetSpent => "drain_budget",
+            Self::MissingBoundarySnapshot => "missing_boundary_snapshot",
+            Self::StaleBoundarySnapshot => "stale_boundary_snapshot",
+            Self::EmptyFilteredChunk => "below_min_chunk",
+            Self::InvalidChunkCoverage => "invalid_chunk_coverage",
+            Self::BelowProactiveFloor => "below_proactive_floor",
+            Self::NoModels => "no_models",
+            Self::FailureBackoff => "rate_limit",
+            Self::PendingRewrite => "pending_rewrite",
+            Self::StateLoadFailed => "state_load_failed",
+            Self::ContinuedOrdinalOffsetMissing => "state_incomplete",
+            Self::MissingBlockIdentity => "invalid_boundary_identity",
+            Self::AssemblyFailed => "assembly_failed",
+            Self::SubagentSession => "subagent_session",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum HistorianStateError {
     InvalidRange {
@@ -839,7 +937,15 @@ impl HistorianProducerDriver for HistorianProducer {
         model: &str,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
-        HistorianProducer::start_with_temperature(self, session_id, system, prompt, model, temperature).await
+        HistorianProducer::start_with_temperature(
+            self,
+            session_id,
+            system,
+            prompt,
+            model,
+            temperature,
+        )
+        .await
     }
 
     async fn start_with_generation(
@@ -2096,6 +2202,7 @@ mod tests {
         observed_sessions: Vec<String>,
         observed_systems: Vec<String>,
         observed_prompts: Vec<String>,
+        observed_temperatures: Vec<Option<f64>>,
         await_run_ids: Vec<String>,
         cancels: Vec<String>,
         closes: usize,
@@ -2146,6 +2253,18 @@ mod tests {
             self.starts
                 .pop_front()
                 .expect("scripted start result available")
+        }
+
+        async fn start_with_temperature(
+            &mut self,
+            session_id: &str,
+            system: &str,
+            prompt: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            self.observed_temperatures.push(temperature);
+            self.start(session_id, system, prompt, model).await
         }
 
         async fn await_output(
@@ -2469,18 +2588,15 @@ mod tests {
             .with_start(Ok(run_handle("run-2")))
             .with_output(Ok(producer_output(historian_xml("fallback model summary"))));
 
-        let outcome = run_historian_firing(
-            &mut producer,
-            fire_request(
-                &fallback_store,
-                "placeholder prompt",
-                &models,
-                &chunk,
-                &prior,
-            ),
-        )
-        .await
-        .unwrap();
+        let mut request = fire_request(
+            &fallback_store,
+            "placeholder prompt",
+            &models,
+            &chunk,
+            &prior,
+        );
+        request.temperature = Some(0.0);
+        let outcome = run_historian_firing(&mut producer, request).await.unwrap();
         let HistorianDriveOutcome::Completed(success) = outcome else {
             panic!("expected completed fallback outcome");
         };
@@ -2499,6 +2615,7 @@ mod tests {
             ],
             "fallback retries author a new session/run instead of resuming under another model"
         );
+        assert_eq!(producer.observed_temperatures, vec![Some(0.0), Some(0.0)]);
         assert_eq!(
             fallback_store
                 .load("ses")

@@ -55,8 +55,10 @@ describe("native ONNX install shape", () => {
             );
             expect(manifest.devDependencies?.[TRANSFORMERS]).toBe("^4.1.0");
             expect(manifest.optionalDependencies?.[ONNX_RUNTIME_NODE]).toBe("1.24.3");
-            expect(manifest.optionalDependencies?.[SHARP]).toBe("^0.34.5");
+            expect(manifest.optionalDependencies?.[SHARP]).toBe("^0.35.0");
             expect(manifest.scripts?.build).toContain("transformers-web-entry.ts");
+            expect(manifest.scripts?.build).toContain("build-transformers-node-wasm.ts");
+            expect(manifest.scripts?.build).toContain("--target browser");
             expect(manifest.scripts?.build).not.toContain("--external @huggingface/transformers");
             expect(manifest.scripts?.build).toContain("--external onnxruntime-node");
 
@@ -66,8 +68,20 @@ describe("native ONNX install shape", () => {
             expect(directDependenciesLockBlock(lockBlock)).not.toContain(`"${ONNX_RUNTIME_NODE}":`);
             expect(directDependenciesLockBlock(lockBlock)).not.toContain(`"${SHARP}":`);
             expect(lockBlock).toContain(
-                `"optionalDependencies": {\n        "${ONNX_RUNTIME_NODE}": "1.24.3",\n        "${SHARP}": "^0.34.5",`,
+                `"optionalDependencies": {\n        "${ONNX_RUNTIME_NODE}": "1.24.3",\n        "${SHARP}": "^0.35.0",`,
             );
         }
+    });
+
+    test("Node WASM twin preserves filesystem builtins while replacing optional native loaders", () => {
+        const buildScript = readFileSync(
+            join(REPO_ROOT, "packages/plugin/scripts/build-transformers-node-wasm.ts"),
+            "utf8",
+        );
+        expect(buildScript).toContain('target: "node"');
+        expect(buildScript).toContain("filter: /^onnxruntime-node$/");
+        expect(buildScript).toContain("filter: /^sharp$/");
+        expect(buildScript).toContain("src/transformers.js");
+        expect(buildScript).not.toContain("filter: /^node:fs$/");
     });
 });

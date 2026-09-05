@@ -2,7 +2,7 @@
 
 Cross-session memory and context management for [Pi coding agent](https://github.com/earendil-works/pi-mono) and [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi). The same extension package runs on both hosts and shares its SQLite database with the [OpenCode plugin](https://www.npmjs.com/package/@cortexkit/opencode-magic-context).
 
-Requires Pi `>= 0.74.0` or OMP `>= 17.1.7`.
+Requires Pi `>= 0.80.2` or OMP `>= 17.1.7`.
 
 ---
 
@@ -74,7 +74,7 @@ Verify with:
 npx @cortexkit/magic-context@latest doctor --harness omp
 ```
 
-OMP's legacy Pi loader maps `@earendil-works/*` imports to its bundled `@oh-my-pi/*` runtime. Magic Context also re-invokes the current host executable for historian, dreamer, and sidekick children, so OMP children remain OMP processes.
+OMP's legacy Pi loader maps `@earendil-works/*` imports to its bundled `@oh-my-pi/*` runtime. Magic Context identifies OMP from positive host evidence: the standalone OMP executable, the running or explicitly selected OMP package, or `@oh-my-pi/pi-utils`'s in-process `APP_NAME` resolved through the host module graph. A custom agent directory alone is not OMP evidence. It also re-invokes the current host executable for historian, dreamer, and sidekick children, so OMP children remain OMP processes.
 
 ---
 
@@ -96,6 +96,9 @@ Session discovery follows the active host. Relative `pi.subagent_extensions` are
   "historian": {
     "pi": {
       "model": "anthropic/claude-haiku-4-5"
+    },
+    "omp": {
+      "model": { "model": "opencode/claude-haiku-4-5", "thinking_level": "auto" }
     }
   },
   "embedding": {
@@ -103,6 +106,8 @@ Session discovery follows the active host. Relative `pi.subagent_extensions` are
   }
 }
 ```
+
+OMP uses `historian.omp ?? historian.pi` and `dreamer.omp ?? dreamer.pi`; leaving the OMP blocks absent preserves existing Pi-compatible configuration. OMP supports `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `inherit`, and `auto` thinking levels.
 
 For the full configuration reference (including dreamer, sidekick, auto-search, and experimental features), see [CONFIGURATION.md](https://github.com/cortexkit/magic-context/blob/master/CONFIGURATION.md) in the main repository — OpenCode, Pi, and OMP share the same schema.
 

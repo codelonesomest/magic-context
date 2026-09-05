@@ -23,13 +23,26 @@ import { replaceAllCompartmentState } from "../../features/magic-context/compart
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     closeDatabase,
+    getHiddenSeamPlaceholderIds,
+    getOldestActiveUnprotectedToolTags,
     getOrCreateSessionMeta,
+    getPendingOps,
+    getStrippedPlaceholderIds,
+    getTagsBySession,
     openDatabase,
+    queuePendingOp,
 } from "../../features/magic-context/storage";
+import { getTrailingBlankDecisions } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getTailHygieneTags,
+    insertTag,
+    markWhitespaceAssistantTagInert,
+} from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { registerActiveCompartmentRun } from "./compartment-runner";
+import { createChatMessageHook } from "./hook-handlers";
 import { createTransform } from "./transform";
 
 /**
@@ -108,6 +121,32 @@ function buildSimpleMessages(sessionId: string): TestMessage[] {
             parts: [{ type: "text", text: "world" }],
         },
     ];
+}
+
+function serializeProviderWire(messages: TestMessage[], providerID: string): string {
+    const grouped: Array<{ role: string; content: TestPart[] }> = [];
+    for (const message of messages) {
+        const content = message.parts
+            .filter(
+                (part) => providerID !== "anthropic" || part.type !== "text" || part.text !== "",
+            )
+            .map((part) => {
+                if (part.type !== "text") return structuredClone(part);
+                const historyEnd = part.text.indexOf("</session-history>\n\n");
+                return historyEnd < 0
+                    ? structuredClone(part)
+                    : {
+                          ...part,
+                          text: part.text.slice(historyEnd + "</session-history>\n\n".length),
+                      };
+            });
+        if (content.length === 0) continue;
+        const previous = grouped.at(-1);
+        if (previous?.role === message.info.role)
+            previous.content.push(...structuredClone(content));
+        else grouped.push({ role: message.info.role, content: structuredClone(content) });
+    }
+    return JSON.stringify(grouped);
 }
 
 function buildMessagesWithIgnoredCommandOutput(sessionId: string): TestMessage[] {
@@ -520,6 +559,363 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         expect(JSON.stringify(secondMessages[0])).toBe(firstWire);
         expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
         expect(deferredMaterializationSessions.has(sessionId)).toBe(true);
+    });
+
+    for (const providerID of ["anthropic", "openai"] as const) {
+        it(`keeps ${providerID} seam bytes stable through fold, re-exposure, and marker landing`, async () => {
+            useTempDataHome(`ctx-busting-marker-seam-${providerID}-`);
+            const sessionId = `ses-marker-seam-${providerID}`;
+            const db = openDatabase();
+            const historyRefreshSessions = new Set<string>();
+            const pendingMaterializationSessions = new Set<string>();
+            const deferredHistoryRefreshSessions = new Set<string>();
+            const deferredMaterializationSessions = new Set<string>();
+            let decision: "execute" | "defer" = "execute";
+            const sourceMessages = (): TestMessage[] => [
+                {
+                    info: { id: "hidden-tool-owner", role: "assistant", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "tool",
+                            callID: "hidden-tool-call",
+                            state: { output: "never served ".repeat(2_000), tool: "read" },
+                        },
+                    ],
+                },
+                {
+                    info: { id: "marker-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "marker boundary" }],
+                },
+                {
+                    info: { id: "hidden-assistant-a", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "old assistant a" }],
+                },
+                {
+                    info: { id: "hidden-assistant-b", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "old assistant b" }],
+                },
+                {
+                    info: {
+                        id: "assistant-compartment-end",
+                        role: "assistant",
+                        sessionID: sessionId,
+                    },
+                    parts: [{ type: "text", text: "fold through here" }],
+                },
+                {
+                    info: { id: "retained-head-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained head" }],
+                },
+                {
+                    info: { id: "retained-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retain me" }],
+                },
+            ];
+            const transform = createTransform({
+                tagger: createTagger(),
+                scheduler: { shouldExecute: mock(() => decision) },
+                contextUsageMap: new Map([
+                    [
+                        sessionId,
+                        { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                    ],
+                ]),
+                db,
+                liveModelBySession: new Map([
+                    [sessionId, { providerID, modelID: `${providerID}-test-model` }],
+                ]),
+                historyRefreshSessions,
+                pendingMaterializationSessions,
+                deferredHistoryRefreshSessions,
+                deferredMaterializationSessions,
+                lastHeuristicsTurnId: new Map<string, string>(),
+                clearReasoningAge: 50,
+                protectedTags: 0,
+            });
+
+            await transform({}, { messages: sourceMessages() });
+            const hiddenTags = getTagsBySession(db, sessionId).filter(
+                (tag) =>
+                    tag.messageId === "hidden-assistant-a:p0" ||
+                    tag.messageId === "hidden-assistant-b:p0",
+            );
+            expect(hiddenTags).toHaveLength(2);
+            for (const tag of hiddenTags) queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+            replaceAllCompartmentState(
+                db,
+                sessionId,
+                [
+                    {
+                        sequence: 1,
+                        startMessage: 1,
+                        endMessage: 5,
+                        startMessageId: "hidden-tool-owner",
+                        endMessageId: "assistant-compartment-end",
+                        title: "folded prefix",
+                        content: "folded content",
+                    },
+                ],
+                [],
+            );
+            deferredHistoryRefreshSessions.add(sessionId);
+            deferredMaterializationSessions.add(sessionId);
+
+            const foldMessages = sourceMessages();
+            await transform({}, { messages: foldMessages });
+            const foldWire = serializeProviderWire(foldMessages, providerID);
+            expect(foldMessages.some((message) => message.info.id === "hidden-assistant-a")).toBe(
+                false,
+            );
+            expect(getStrippedPlaceholderIds(db, sessionId)).toEqual(
+                new Set(["hidden-assistant-a", "hidden-assistant-b"]),
+            );
+            expect(getHiddenSeamPlaceholderIds(db, sessionId)).toEqual(
+                new Set(["hidden-assistant-a", "hidden-assistant-b"]),
+            );
+
+            const tagsAfterFold = getTagsBySession(db, sessionId);
+            const trimmedIds = new Set([
+                "hidden-tool-owner",
+                "marker-user:p0",
+                "hidden-assistant-a:p0",
+                "hidden-assistant-b:p0",
+                "assistant-compartment-end:p0",
+            ]);
+            expect(
+                tagsAfterFold
+                    .filter((tag) => trimmedIds.has(tag.messageId))
+                    .every((tag) => tag.status === "compacted"),
+            ).toBe(true);
+            expect(
+                getTailHygieneTags(db, sessionId).some((tag) => trimmedIds.has(tag.messageId)),
+            ).toBe(false);
+            const hiddenToolTag = tagsAfterFold.find((tag) => tag.type === "tool");
+            expect(hiddenToolTag?.status).toBe("compacted");
+            expect(
+                getOldestActiveUnprotectedToolTags(db, sessionId, 0, 10).some(
+                    (tag) => tag.tagNumber === hiddenToolTag?.tagNumber,
+                ),
+            ).toBe(false);
+
+            db.exec("CREATE TEMP TABLE stripped_placeholder_writes (count INTEGER NOT NULL)");
+            db.exec("INSERT INTO stripped_placeholder_writes VALUES (0)");
+            db.exec(`CREATE TEMP TRIGGER count_stripped_placeholder_writes
+                AFTER UPDATE OF stripped_placeholder_ids ON session_meta
+                WHEN OLD.stripped_placeholder_ids IS NOT NEW.stripped_placeholder_ids
+                BEGIN UPDATE stripped_placeholder_writes SET count = count + 1; END`);
+
+            decision = "defer";
+            const replayMessages = sourceMessages().filter(
+                (message) =>
+                    message.info.id === "retained-head-user" ||
+                    message.info.id === "hidden-assistant-a" ||
+                    message.info.id === "hidden-assistant-b" ||
+                    message.info.id === "retained-user",
+            );
+            await transform({}, { messages: replayMessages });
+            const replayWire = serializeProviderWire(replayMessages, providerID);
+            expect(replayWire).toBe(foldWire);
+
+            const markerLandedMessages = sourceMessages().filter(
+                (message) =>
+                    message.info.id === "retained-head-user" || message.info.id === "retained-user",
+            );
+            await transform({}, { messages: markerLandedMessages });
+            expect(serializeProviderWire(markerLandedMessages, providerID)).toBe(replayWire);
+            expect(getStrippedPlaceholderIds(db, sessionId)).toEqual(
+                new Set(["hidden-assistant-a", "hidden-assistant-b"]),
+            );
+            expect(db.prepare("SELECT count FROM stripped_placeholder_writes").get()).toEqual({
+                count: 0,
+            });
+
+            decision = "execute";
+            deferredHistoryRefreshSessions.add(sessionId);
+            deferredMaterializationSessions.add(sessionId);
+            const repeatedFoldMessages = sourceMessages();
+            await transform({}, { messages: repeatedFoldMessages });
+            expect(getTagsBySession(db, sessionId)).toHaveLength(tagsAfterFold.length);
+        });
+    }
+
+    it("keeps a tagged whitespace shell byte-identical after a marker-advance drain", async () => {
+        useTempDataHome("ctx-busting-marker-whitespace-shell-");
+        const sessionId = "ses-marker-whitespace-shell";
+        const db = openDatabase();
+        const historyRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const deferredHistoryRefreshSessions = new Set<string>();
+        const deferredMaterializationSessions = new Set<string>();
+        let decision: "execute" | "defer" = "execute";
+        const sourceMessages = (includeBlank: boolean, includeTool: boolean): TestMessage[] => [
+            {
+                info: { id: "marker-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "marker boundary" }],
+            },
+            {
+                info: { id: "retained-head-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "retained head" }],
+            },
+            {
+                info: { id: "blank-owner", role: "assistant", sessionID: sessionId },
+                parts: [
+                    ...(includeBlank ? ([{ type: "text", text: " " }] as TestPart[]) : []),
+                    ...(includeTool
+                        ? ([
+                              {
+                                  type: "tool",
+                                  callID: "drained-tool",
+                                  state: { output: "old tool output", tool: "read" },
+                              },
+                          ] as TestPart[])
+                        : []),
+                ],
+            },
+            {
+                info: { id: "target-assistant", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "The static flag didn't take" }],
+            },
+            {
+                info: { id: "tail-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "continue" }],
+            },
+        ];
+        insertTag(db, sessionId, "blank-owner:p0", "message", 1, 16778, 0, null, 0, null, null, {
+            tokenCount: 0,
+            inputTokenCount: null,
+            reasoningTokenCount: null,
+        });
+        markWhitespaceAssistantTagInert(db, sessionId, 16778, "blank-owner:p0");
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => decision) },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "anthropic", modelID: "anthropic-test-model" }],
+            ]),
+            historyRefreshSessions,
+            pendingMaterializationSessions,
+            deferredHistoryRefreshSessions,
+            deferredMaterializationSessions,
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTags: 0,
+        });
+
+        await transform({}, { messages: sourceMessages(true, true) });
+        expect(getTrailingBlankDecisions(db, sessionId).get("blank-owner")).toBe("strip");
+        const toolTag = getTagsBySession(db, sessionId).find(
+            (tag) => tag.type === "tool" && tag.messageId === "drained-tool",
+        );
+        expect(toolTag).toBeDefined();
+        queuePendingOp(db, sessionId, toolTag!.tagNumber, "drop");
+        replaceAllCompartmentState(
+            db,
+            sessionId,
+            [
+                {
+                    sequence: 1,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "marker-user",
+                    endMessageId: "marker-user",
+                    title: "advanced marker",
+                    content: "folded marker prefix",
+                },
+            ],
+            [],
+        );
+        deferredHistoryRefreshSessions.add(sessionId);
+        deferredMaterializationSessions.add(sessionId);
+
+        const foldMessages = sourceMessages(true, false);
+        await transform({}, { messages: foldMessages });
+        expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        const foldAssistant = (
+            JSON.parse(serializeProviderWire(foldMessages, "anthropic")) as Array<{
+                role: string;
+                content: TestPart[];
+            }>
+        ).find((message) => JSON.stringify(message).includes("The static flag didn't take"));
+
+        decision = "defer";
+        const replayMessages = sourceMessages(false, false).slice(1);
+        await transform({}, { messages: replayMessages });
+        const replayAssistant = (
+            JSON.parse(serializeProviderWire(replayMessages, "anthropic")) as Array<{
+                role: string;
+                content: TestPart[];
+            }>
+        ).find((message) => JSON.stringify(message).includes("The static flag didn't take"));
+
+        expect(replayAssistant).toEqual(foldAssistant);
+    });
+
+    it("Fable 5.1 variant change keeps the next pass deferred and pending ops untouched", async () => {
+        useTempDataHome("ctx-fable-variant-defer-");
+        const sessionId = "ses-fable-variant-defer";
+        const db = openDatabase();
+        const historyRefreshSessions = new Set<string>();
+        const systemPromptRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const lastHeuristicsTurnId = new Map<string, string>();
+        const liveModelBySession = new Map<string, { providerID: string; modelID: string }>();
+        const shouldExecute = mock(() => "defer" as const);
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            liveModelBySession,
+            historyRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+            clearReasoningAge: 50,
+            protectedTags: 0,
+        });
+        await transform({}, { messages: buildSimpleMessages(sessionId) });
+        shouldExecute.mockClear();
+        queuePendingOp(db, sessionId, 1, "drop");
+
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession,
+            variantBySession: new Map<string, string | undefined>(),
+            agentBySession: new Map<string, string>(),
+            historyRefreshSessions,
+            systemPromptRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+        });
+        await hook({
+            sessionID: sessionId,
+            variant: "high",
+            model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+        });
+        await hook({
+            sessionID: sessionId,
+            variant: "medium",
+            model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+        });
+
+        expect(historyRefreshSessions.size).toBe(0);
+        expect(systemPromptRefreshSessions.size).toBe(0);
+        expect(pendingMaterializationSessions.size).toBe(0);
+        const nextPass = buildSimpleMessages(sessionId);
+        await transform({}, { messages: nextPass });
+        expect(shouldExecute).toHaveBeenCalled();
+        expect(getPendingOps(db, sessionId)).toHaveLength(1);
     });
 
     it("keeps ignored Desktop command output byte-stable across three quiet passes", async () => {

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import {
     addProcessedImageStrippedIds,
@@ -29,15 +30,19 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
+    armThinkingBindingRecovery,
+    clearThinkingBindingRecoveryIf,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
+    getThinkingBindingRecoveryTarget,
     getTrailingBlankDecisions,
     setPersistedCompactionMarkerState,
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
+import { markWhitespaceAssistantTagInert } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
@@ -554,6 +559,65 @@ describe("stripped placeholder replay across temporary marker windows", () => {
         expect(resumedMessages[0]?.parts).toEqual([{ type: "text", text: "" }]);
         expect(getStrippedPlaceholderIds(db, sessionId).has(assistantId)).toBe(true);
     });
+
+    it("pre-freezes hidden assistant separators before a marker advance", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-placeholder-marker-hidden-separators";
+        const user = (id: string, tag: number): MessageLike =>
+            ({
+                info: { id, role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: `[dropped §${tag}§]` }],
+            }) as unknown as MessageLike;
+        const assistant = (id: string, tag: number): MessageLike =>
+            ({
+                info: { id, role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: `[dropped §${tag}§]` }],
+            }) as unknown as MessageLike;
+
+        const foldMessages = [user("user-a", 74389), user("user-b", 74398), user("user-c", 74407)];
+        const hiddenAssistants = [assistant("assistant-a", 74393), assistant("assistant-b", 74400)];
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, foldMessages, {
+                schedulerDecision: "execute",
+                schedulerDeferReason: null,
+                resolvedProviderID: "anthropic",
+                hiddenMessagesAtCompactionSeam: hiddenAssistants,
+            }),
+        );
+        const foldWire = serializeAnthropicVisibleRoleGroups(foldMessages);
+        expect(JSON.parse(foldWire)).toEqual([
+            {
+                role: "user",
+                parts: [
+                    { type: "text", text: "[dropped §74389§]" },
+                    { type: "text", text: "[dropped §74398§]" },
+                    { type: "text", text: "[dropped §74407§]" },
+                ],
+            },
+        ]);
+        expect(getStrippedPlaceholderIds(db, sessionId)).toEqual(
+            new Set(["assistant-a", "assistant-b"]),
+        );
+
+        const replayMessages = [
+            user("user-a", 74389),
+            assistant("assistant-a", 74393),
+            user("user-b", 74398),
+            assistant("assistant-b", 74400),
+            user("user-c", 74407),
+        ];
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, replayMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        expect(replayMessages[1]?.parts).toEqual([{ type: "text", text: "" }]);
+        expect(replayMessages[3]?.parts).toEqual([{ type: "text", text: "" }]);
+        expect(serializeAnthropicVisibleRoleGroups(replayMessages)).toBe(foldWire);
+    });
 });
 
 describe("deferred compaction marker representation", () => {
@@ -709,6 +773,80 @@ describe("deferred compaction marker representation", () => {
         expect(rustIndex).toBe(tsIndex);
         expect(JSON.stringify(rustMessages[rustIndex])).toBe(JSON.stringify(tsMessages[tsIndex]));
         expect(rustMessages).toEqual(tsMessages);
+    });
+
+    it("applies a Rust materialized boundary on its serving pass and replays identical bytes", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-rust-marker-reverse-edge";
+        createOpenCodeDbWithoutMessages("postprocess-rust-marker-");
+        const opencodeDb = new Database(
+            join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"),
+        );
+        opencodeDb
+            .prepare(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+            )
+            .run(
+                "msg-boundary",
+                sessionId,
+                1_000,
+                1_000,
+                JSON.stringify({ role: "user", time: { created: 1_000 } }),
+            );
+        opencodeDb.close();
+        const source = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>stable</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            {
+                info: { id: "tail", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "new turn" }],
+            },
+        ] as unknown as MessageLike[];
+        const first = structuredClone(source);
+        const applied = runRustModePostprocess({
+            db,
+            sessionId,
+            messages: first,
+            sessionDirectory: process.env.XDG_DATA_HOME,
+            materializedBoundary: {
+                rowVersion: 7,
+                ordinal: 10,
+                endMessageId: "msg-boundary",
+            },
+            fullFeatureMode: true,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: false, frozen: true },
+        });
+
+        expect(applied.markerAt).toBe("msg-boundary");
+        expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
+        const marker = getPersistedCompactionMarkerState(db, sessionId);
+        expect(marker?.targetEndMessageId).toBe("msg-boundary");
+        expect(first.find((message) => message.info.summary === true)?.info).toMatchObject({
+            summary: true,
+            finish: "stop",
+        });
+        const firstBytes = JSON.stringify(first);
+
+        const replay = structuredClone(source);
+        runRustModePostprocess({
+            db,
+            sessionId,
+            messages: replay,
+            fullFeatureMode: true,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: false, frozen: true },
+        });
+        expect(JSON.stringify(replay)).toBe(firstBytes);
     });
 
     it("keeps a provisional marker untagged and freezes the callable tag choice", () => {
@@ -2359,6 +2497,143 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
     });
 
+    it("preserves a pre-deploy whitespace prefix through a HARD fold and rebuilt defer tail", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-hardfold-inert-whitespace";
+        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-hardfold-whitespace-"));
+        tempDirs.push(dataHome);
+        process.env.XDG_DATA_HOME = dataHome;
+        mkdirSync(join(dataHome, "opencode"), { recursive: true });
+        const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        opencodeDb.exec(
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        opencodeDb
+            .prepare(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+            )
+            .run("msg-fold-boundary", sessionId, 1_000, 1_000, JSON.stringify({ role: "user" }));
+        opencodeDb.close();
+
+        materializeBaseline(sessionId);
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "msg-fold-boundary",
+                endMessageId: "msg-fold-boundary",
+                title: "hard fold whitespace",
+                content: "folded content",
+            },
+        ]);
+        setPendingCompactionMarkerState(db, sessionId, {
+            ordinal: 10,
+            endMessageId: "msg-fold-boundary",
+            publishedAt: 1,
+        });
+        insertTag(db, sessionId, "assistant-framing:p0", "message", 1, 1);
+        markWhitespaceAssistantTagInert(db, sessionId, 1, "assistant-framing:p0");
+        const previousServe = "§1§  ";
+        const makeTail = () =>
+            [
+                {
+                    info: { id: "msg-tail-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained user turn" }],
+                },
+                {
+                    info: { id: "assistant-framing", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: " " }],
+                },
+            ] as unknown as MessageLike[];
+
+        const tagger = createTagger();
+        tagger.initFromDb(sessionId, db);
+        const hardMessages = makeTail();
+        const hardTagged = tagMessages(sessionId, hardMessages, tagger, db);
+        const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
+        const hardResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, hardMessages, {
+                tagger,
+                targets: hardTagged.targets,
+                reasoningByMessage: hardTagged.reasoningByMessage,
+                messageTagNumbers: hardTagged.messageTagNumbers,
+                batch: hardTagged.batch,
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions,
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 10,
+                    compartmentEndMessageId: "msg-fold-boundary",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                },
+            }),
+        );
+
+        const marker = getPersistedCompactionMarkerState(db, sessionId);
+        const hardWhitespace = hardMessages.find(
+            (message) => message.info.id === "assistant-framing",
+        );
+        expect(hardResult.materialized).toBe(true);
+        expect(marker?.boundaryOrdinal).toBe(10);
+        expect(hardWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        const hardWire = JSON.stringify(hardMessages);
+
+        const deferMessages = [
+            {
+                info: {
+                    id: marker?.summaryMessageId,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            ...makeTail(),
+        ] as unknown as MessageLike[];
+        const deferTagger = createTagger();
+        deferTagger.initFromDb(sessionId, db);
+        const deferTagged = tagMessages(sessionId, deferMessages, deferTagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                tagger: deferTagger,
+                targets: deferTagged.targets,
+                reasoningByMessage: deferTagged.reasoningByMessage,
+                messageTagNumbers: deferTagged.messageTagNumbers,
+                batch: deferTagged.batch,
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                },
+            }),
+        );
+
+        const deferWhitespace = deferMessages.find(
+            (message) => message.info.id === "assistant-framing",
+        );
+        expect(deferWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        expect(JSON.stringify(deferMessages)).toBe(hardWire);
+    });
+
     it("observes a tool-set comparison without turning it into an m[0] fold", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -3265,6 +3540,226 @@ describe("final message representation", () => {
         expect(JSON.stringify(nonAnthropicMessages)).toBe(nonAnthropicBefore);
     });
 
+    it("recovers a bound newest thinking block once and replays the sentinel byte-stably", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-fable-binding-recovery";
+        const buildMessages = () =>
+            [
+                {
+                    info: { id: "user-prefix", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "mutated prefix" }],
+                },
+                {
+                    info: { id: "assistant-bound", role: "assistant", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "thinking",
+                            thinking: "signed thinking bound to the old prefix",
+                            signature: "bound-signature",
+                        },
+                        { type: "text", text: "completed answer" },
+                    ],
+                },
+                {
+                    info: { id: "retry-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+            ] as unknown as MessageLike[];
+
+        armThinkingBindingRecovery(db, sessionId);
+        const recoveryMessages = buildMessages();
+        const recovery = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, recoveryMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+            }),
+        );
+
+        expect(recovery.thinkingBindingRecovery).toEqual({
+            flagTarget: "newest_reasoning_bearing_assistant",
+            messageId: "assistant-bound",
+        });
+        expect(findMessage(recoveryMessages, "assistant-bound").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+        // Postprocessing does not consume the recovery flag. Only a successful live
+        // transform clears it, so a last-known-good fallback cannot clear recovery
+        // for an output that was not successfully transformed.
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+        expect(
+            clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                recovery.thinkingBindingRecovery.flagTarget,
+            ),
+        ).toBe(true);
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBeNull();
+
+        const replayMessages = buildMessages();
+        const replay = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, replayMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+            }),
+        );
+        expect(replay.thinkingBindingRecovery).toBeNull();
+        expect(serializeAnthropicWirePrefix(replayMessages)).toBe(
+            serializeAnthropicWirePrefix(recoveryMessages),
+        );
+    });
+
+    it("recovers a bound thinking block through Rust-mode host postprocess", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-fable-binding-recovery-rust";
+        const buildMessages = () =>
+            [
+                {
+                    info: { id: "assistant-bound", role: "assistant", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "thinking",
+                            thinking: "signed thinking bound to the rejected prefix",
+                            signature: "bound-signature",
+                        },
+                        { type: "text", text: "completed answer" },
+                    ],
+                },
+                {
+                    info: { id: "retry-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+            ] as unknown as MessageLike[];
+        const postprocess = (messages: MessageLike[]) =>
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                fullFeatureMode: true,
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: true, frozen: true },
+            });
+
+        armThinkingBindingRecovery(db, sessionId);
+        const recoveryMessages = buildMessages();
+        const recovery = postprocess(recoveryMessages);
+
+        expect(recovery.thinkingBindingRecovery).toEqual({
+            flagTarget: "newest_reasoning_bearing_assistant",
+            messageId: "assistant-bound",
+        });
+        expect(findMessage(recoveryMessages, "assistant-bound").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+        expect(
+            clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                recovery.thinkingBindingRecovery.flagTarget,
+            ),
+        ).toBe(true);
+
+        const replayMessages = buildMessages();
+        const replay = postprocess(replayMessages);
+        expect(replay.thinkingBindingRecovery).toBeNull();
+        expect(serializeAnthropicWirePrefix(replayMessages)).toBe(
+            serializeAnthropicWirePrefix(recoveryMessages),
+        );
+    });
+
+    it("lets Rust module trailing-blank output outrank host keep decisions", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-rust-trailing-blank-authority";
+        addTrailingBlankDecisions(db, sessionId, [
+            ["assistant-stripped", "keep"],
+            ["assistant-kept", "keep:2"],
+            ["assistant-absorbing", "strip"],
+        ]);
+        const messages = [
+            {
+                info: { id: "assistant-stripped", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "module stripped suffix" }],
+            },
+            {
+                info: { id: "assistant-kept", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "text", text: "module kept suffix" },
+                    { type: "text", text: " " },
+                ],
+            },
+            {
+                info: { id: "assistant-absorbing", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "text", text: "strip stays absorbing" },
+                    { type: "text", text: "" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const beforeStripped = JSON.stringify(messages[0]?.parts);
+        const beforeKept = JSON.stringify(messages[1]?.parts);
+
+        runRustModePostprocess({
+            db,
+            sessionId,
+            messages,
+            fullFeatureMode: true,
+            resolvedProviderID: "anthropic",
+            trailingBlankSourceDecisions: new Map([
+                ["assistant-stripped", "strip"],
+                ["assistant-kept", "keep:2"],
+                ["assistant-absorbing", "keep"],
+            ]),
+            trailingBlankNewestAssistantId: "assistant-absorbing",
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: true },
+        });
+
+        expect(JSON.stringify(messages[0]?.parts)).toBe(beforeStripped);
+        expect(JSON.stringify(messages[1]?.parts)).toBe(beforeKept);
+        expect(messages[2]?.parts).toEqual([{ type: "text", text: "strip stays absorbing" }]);
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-absorbing")).toBe("strip");
+    });
+
+    it("leaves newest thinking byte-identical when no binding recovery was classified", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-fable-binding-inert";
+        const messages = [
+            {
+                info: { id: "assistant-newest", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "thinking", thinking: "keep me", signature: "keep-signature" },
+                    { type: "text", text: "answer" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const before = JSON.stringify(messages);
+
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        expect(result.thinkingBindingRecovery).toBeNull();
+        expect(JSON.stringify(messages)).toBe(before);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+    });
+
     it("freezes first merged-strip application onto a bust and replays it across fresh rebuilds", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -3976,7 +4471,7 @@ describe("final message representation", () => {
         }
     });
 
-    it("uses the last blank shape served while an assistant is still newest", async () => {
+    it("keeps an established strip absorbing while its assistant remains newest", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-trailing-live-newest";
@@ -4001,40 +4496,260 @@ describe("final message representation", () => {
                 resolvedProviderID: "anthropic",
             }),
         );
+        const firstBytes = JSON.stringify(firstMessages[0].parts);
         expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
             new Map([["assistant-target", "strip"]]),
         );
 
-        const stillNewestMessages = [buildTarget(true)];
-        const stillNewest = await runPostTransformPhase(
-            basePostTransformArgs(db, sessionId, stillNewestMessages, {
+        for (const includeTrailing of [true, false, true]) {
+            const replayMessages = [buildTarget(includeTrailing)];
+            const replay = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, replayMessages, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+            expect(replay.bustedThisPass).toBe(false);
+            expect(JSON.stringify(replayMessages[0].parts)).toBe(firstBytes);
+            expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+                new Map([["assistant-target", "strip"]]),
+            );
+        }
+    });
+
+    it("demotes a live keep to an absorbing strip when its source suffix disappears", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-live-demotion";
+        const buildTarget = (trailingCount: number) =>
+            [
+                {
+                    info: { id: "assistant-target", role: "assistant" },
+                    parts: [
+                        { type: "text", text: "answer" },
+                        ...Array.from({ length: trailingCount }, () => ({
+                            type: "text",
+                            text: "",
+                        })),
+                    ],
+                },
+            ] as unknown as MessageLike[];
+
+        const first = buildTarget(1);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, first, {
                 schedulerDecision: "defer",
                 resolvedProviderID: "anthropic",
             }),
         );
-        const lastNewestBytes = JSON.stringify(stillNewestMessages[0].parts);
-        expect(stillNewest.bustedThisPass).toBe(false);
-        expect(stillNewestMessages[0].parts.at(-1)).toEqual({ type: "text", text: "" });
-        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
-            new Map([["assistant-target", "keep"]]),
-        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-target")).toBe("keep");
 
-        const historicalMessages = [
-            buildTarget(true),
+        const recounted = buildTarget(3);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, recounted, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-target")).toBe("keep:3");
+        expect(recounted[0].parts).toHaveLength(4);
+
+        const demoted = buildTarget(0);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, demoted, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-target")).toBe("strip");
+
+        const replay = buildTarget(1);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, replay, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(replay[0].parts).toEqual([{ type: "text", text: "answer" }]);
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-target")).toBe("strip");
+    });
+
+    it("serves the frozen keep count when a live refresh loses its persistence race", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-refresh-cas-failure";
+        addTrailingBlankDecisions(db, sessionId, [["assistant-target", "keep:3"]]);
+        db.exec(`
+            CREATE TRIGGER reject_trailing_blank_refresh
+            BEFORE UPDATE OF trailing_blank_decisions ON session_meta
+            WHEN NEW.session_id = '${sessionId}'
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END
+        `);
+        const messages = [
             {
-                info: { id: "assistant-newest", role: "assistant" },
-                parts: [{ type: "text", text: "next turn" }],
+                info: { id: "assistant-target", role: "assistant" },
+                parts: [
+                    { type: "text", text: "answer" },
+                    { type: "text", text: "" },
+                ],
             },
         ] as unknown as MessageLike[];
-        const historical = await runPostTransformPhase(
-            basePostTransformArgs(db, sessionId, historicalMessages, {
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
                 schedulerDecision: "defer",
                 resolvedProviderID: "anthropic",
             }),
         );
 
-        expect(historical.bustedThisPass).toBe(false);
-        expect(JSON.stringify(historicalMessages[0].parts)).toBe(lastNewestBytes);
+        expect(messages[0].parts).toEqual([
+            { type: "text", text: "answer" },
+            { type: "text", text: "" },
+            { type: "text", text: "" },
+            { type: "text", text: "" },
+        ]);
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-target")).toBe("keep:3");
+    });
+
+    it("keeps incident-geometry history stable across a metadata shell and late blank", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-incident-geometry";
+        const targetParts = (includeFinish: boolean, includeLateBlank: boolean) => [
+            {
+                type: "reasoning",
+                text: "signed thinking",
+                metadata: { anthropic: { signature: "sig-incident" } },
+            },
+            { type: "tool", callID: "call-incident", state: { status: "completed" } },
+            ...(includeFinish ? [{ type: "step-finish", reason: "tool-calls" }] : []),
+            ...(includeLateBlank ? [{ type: "text", text: "" }] : []),
+        ];
+        const rawPass = (
+            includeFinish: boolean,
+            nextParts?: MessageLike["parts"],
+            includeLateBlank = false,
+        ) =>
+            [
+                {
+                    info: { id: "assistant-target", role: "assistant" },
+                    parts: targetParts(includeFinish, includeLateBlank),
+                },
+                ...(nextParts
+                    ? [
+                          {
+                              info: { id: "assistant-next", role: "assistant" },
+                              parts: nextParts,
+                          },
+                      ]
+                    : []),
+            ] as unknown as MessageLike[];
+        const serve = async (rawMessages: MessageLike[]) => {
+            const sourceDecisions = snapshotTrailingBlankSourceDecisions(rawMessages);
+            const messages = cloneMessages(rawMessages);
+            stripStructuralNoise(messages);
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: "anthropic",
+                    trailingBlankSourceDecisions: sourceDecisions,
+                }),
+            );
+            return messages;
+        };
+
+        await serve(rawPass(false));
+        const streaming = await serve(rawPass(false));
+        const passOne = await serve(rawPass(true, [{ type: "meta", trace: "shell" }]));
+        // The metadata-only shell is transient: the next ingress snapshot can expose the
+        // previous assistant as newest while the harness appends its late blank.
+        const lateBlank = await serve(rawPass(true, undefined, true));
+        const passTwo = await serve(rawPass(true, [{ type: "text", text: "next" }]));
+        const targetBytes = [streaming, passOne, lateBlank, passTwo].map((messages) =>
+            JSON.stringify(findMessage(messages, "assistant-target").parts),
+        );
+
+        expect(new Set(targetBytes).size).toBe(1);
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-target")).toBe("strip");
+    });
+
+    it("migrates only a newest frozen-strip suffix on the first deployment pass", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-deployment-regression";
+        const messages = [
+            {
+                info: { id: "historical-strip", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "terminal reasoning", signature: "sig" },
+                    { type: "text", text: "" },
+                ],
+            },
+            {
+                info: { id: "historical-keep", role: "assistant" },
+                parts: [
+                    { type: "text", text: "kept" },
+                    { type: "text", text: "" },
+                ],
+            },
+            {
+                info: { id: "historical-keep-three", role: "assistant" },
+                parts: [
+                    { type: "text", text: "kept three" },
+                    { type: "text", text: "" },
+                    { type: "text", text: "" },
+                    { type: "text", text: "" },
+                ],
+            },
+            {
+                info: { id: "newest-strip", role: "assistant" },
+                parts: [
+                    { type: "text", text: "newest answer" },
+                    { type: "text", text: "" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        addTrailingBlankDecisions(db, sessionId, [
+            ["historical-strip", "strip"],
+            ["historical-keep", "keep"],
+            ["historical-keep-three", "keep:3"],
+            ["newest-strip", "strip"],
+        ]);
+        const before = new Map(
+            messages.map((message) => [message.info.id, JSON.stringify(message.parts)]),
+        );
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        for (const id of ["historical-strip", "historical-keep", "historical-keep-three"]) {
+            expect(JSON.stringify(findMessage(messages, id).parts)).toBe(before.get(id));
+        }
+        expect(JSON.stringify(findMessage(messages, "newest-strip").parts)).not.toBe(
+            before.get("newest-strip"),
+        );
+        expect(findMessage(messages, "historical-strip").parts.at(-1)).toEqual({
+            type: "text",
+            text: "",
+        });
+        expect(findMessage(messages, "newest-strip").parts.at(-1)).toEqual({
+            type: "text",
+            text: "newest answer",
+        });
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+            new Map([
+                ["historical-strip", "strip"],
+                ["historical-keep", "keep"],
+                ["historical-keep-three", "keep:3"],
+                ["newest-strip", "strip"],
+            ]),
+        );
     });
 
     it("prevents a three-turn late-blank storm without opening the defer gate", async () => {

@@ -38,6 +38,8 @@ import type {
 	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
+import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
+import { resolvePiHarnessKind } from "./pi-harness-kind";
 
 const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
 const PI_CODING_AGENT_PACKAGE_NAMES = new Set([
@@ -146,7 +148,9 @@ function pathIsInside(root: string, candidate: string): boolean {
 }
 
 /**
- * Resolve the package's declared `pi` bin rather than assuming a dist layout.
+ * Resolve the package's declared CLI bin rather than assuming a dist layout.
+ * Pi declares `bin.pi`; OMP declares `bin.omp` (same package family —
+ * `@oh-my-pi/pi-coding-agent` is in the allowlist above but ships no `pi` bin).
  * Keep the containment guard: a package manifest may select only a
  * file below its own root, including after symlinks are canonicalized.
  */
@@ -156,14 +160,22 @@ function resolvePiBin(
 	checkedPaths: string[],
 ): string | null {
 	const bin = found.manifest.bin;
-	const binEntry =
-		typeof bin === "string"
-			? bin
-			: bin &&
-					typeof bin === "object" &&
-					typeof (bin as Record<string, unknown>).pi === "string"
-				? (bin as Record<string, string>).pi
-				: undefined;
+	const binKeys = ["pi", "omp"];
+	let binEntry: string | undefined;
+	for (const key of binKeys) {
+		if (typeof bin === "string" && key === "pi") {
+			binEntry = bin;
+			break;
+		}
+		if (
+			bin &&
+			typeof bin === "object" &&
+			typeof (bin as Record<string, unknown>)[key] === "string"
+		) {
+			binEntry = (bin as Record<string, string>)[key];
+			break;
+		}
+	}
 	if (!binEntry) return null;
 
 	const packageRoot = resolvePath(found.dir);
@@ -466,46 +478,8 @@ const TERMINAL_DRAIN_GRACE_MS = 2_000;
 
 export const MAGIC_CONTEXT_PI_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
 
-function packageRootIsOmp(packageRoot: string): boolean {
-	try {
-		const manifest = JSON.parse(
-			readFileSync(join(packageRoot, "package.json"), "utf-8"),
-		) as { name?: unknown };
-		return manifest.name === "@oh-my-pi/pi-coding-agent";
-	} catch {
-		return false;
-	}
-}
-
-function expandHomePath(value: string): string {
-	if (value === "~") return homedir();
-	if (value.startsWith("~/") || value.startsWith("~\\")) {
-		return resolvePath(homedir(), value.slice(2));
-	}
-	return resolvePath(value);
-}
-
-/**
- * Positive OMP host identification. PI_CODING_AGENT_DIR alone is deliberately
- * insufficient because upstream Pi supports the same variable.
- */
 export function isOmpHostProcess(): boolean {
-	const execName = basename(process.execPath).toLowerCase();
-	if (/^omp(?:\.exe)?$/.test(execName)) return true;
-
-	const packageOverride = process.env.PI_PACKAGE_DIR?.trim();
-	if (packageOverride && packageRootIsOmp(expandHomePath(packageOverride))) {
-		return true;
-	}
-
-	let current = process.argv[1] ? dirname(resolvePath(process.argv[1])) : "";
-	while (current) {
-		if (packageRootIsOmp(current)) return true;
-		const parent = dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return false;
+	return resolvePiHarnessKind() === "omp";
 }
 
 function normalizedOmpProfile(): string | undefined {
@@ -852,7 +826,7 @@ type ExtensionRetryResult = {
  *   the core contract.
  */
 export class PiSubagentRunner implements SubagentRunner {
-	readonly harness = "pi";
+	readonly harness = resolvePiHarnessKind();
 
 	/**
 	 * How to invoke a Pi subagent (command + fixed leading args + shell flag).
@@ -1079,7 +1053,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			recordChildInvocation({
 				db: openDatabase(),
 				parentSessionId: options.accountingSessionId,
-				harness: "pi",
+				harness: this.harness,
 				subagent:
 					options.accountingSubagent ?? inferAccountingSubagent(options.agent),
 				task: options.accountingTask ?? null,
@@ -1348,7 +1322,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				stderr += text;
 				// Cap to prevent unbounded growth on chatty failures.
 				if (stderr.length > 16_000) {
-					stderr = `${stderr.slice(0, 16_000)}…[truncated]`;
+					stderr = `…[truncated]${stderr.slice(-16_000)}`;
 				}
 				emitProgress({ type: "stderr", chunk: text });
 			});
@@ -1598,7 +1572,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					settle({
 						ok: false,
 						reason: "timeout",
-						error: `pi subagent timed out after ${options.timeoutMs}ms${progressSuffix}${stderr.length > 0 ? ` | stderr: ${stderr.slice(0, 500)}` : ""}`,
+						error: `pi subagent timed out after ${options.timeoutMs}ms${progressSuffix}${stderr.length > 0 ? ` | stderr: ${summarizeChildStderr(stderr)}` : ""}`,
 						durationMs: Date.now() - startTime,
 						meta: {
 							stderr: stderr.length > 0 ? stderr : undefined,
@@ -1734,7 +1708,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					settle({
 						ok: false,
 						reason: "non_zero_exit",
-						error: `pi exited (code=${code}, signal=${signal}) without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
+						error: `pi exited (code=${code}, signal=${signal}) without emitting agent_end. stderr: ${summarizeChildStderr(stderr) || "(empty)"}`,
 						durationMs: Date.now() - startTime,
 						meta: {
 							stderr: stderr.length > 0 ? stderr : undefined,
@@ -1748,7 +1722,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				settle({
 					ok: false,
 					reason: "no_assistant",
-					error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
+					error: `pi exited successfully without emitting agent_end. stderr: ${summarizeChildStderr(stderr) || "(empty)"}`,
 					durationMs: Date.now() - startTime,
 					meta: {
 						stderr: stderr.length > 0 ? stderr : undefined,

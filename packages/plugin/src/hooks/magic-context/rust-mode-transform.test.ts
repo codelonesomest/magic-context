@@ -15,11 +15,19 @@ import { resolveProjectIdentityForSession } from "../../features/magic-context/m
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
-import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
+import {
+    getDatabasePath,
+    initializeDatabase,
+    openDatabase,
+} from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import {
+    addTrailingBlankDecisions,
+    armThinkingBindingRecovery,
     getEmergencyRecoveryArmedAt,
+    getMergedReasoningStrippedIds,
     getOverflowState,
+    getThinkingBindingRecoveryTarget,
     recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
@@ -68,6 +76,7 @@ const createRustModeTransform = (
     createRustModeTransformImpl(deps, {
         ...options,
         allowAuthorityProtocolBypassForTests: true,
+        modulePageMaxBytes: 512 * 1024,
         scheduleLkgCapture: options.scheduleLkgCapture ?? ((capture) => capture()),
     });
 
@@ -452,6 +461,54 @@ describe("Rust mode authority adapter", () => {
         expect("geometry" in body).toBe(false);
     });
 
+    it("captures input key order only for edit-marker tools", () => {
+        const input = [
+            {
+                mid: "tool-message",
+                ck: {
+                    content: [
+                        {
+                            kind: {
+                                type: "tool_call",
+                                name: "read",
+                                input: { filePath: "read.ts", offset: 1 },
+                            },
+                        },
+                        {
+                            kind: {
+                                type: "tool_call",
+                                name: "edit",
+                                input: { filePath: "edit.ts", oldString: "old", newString: "new" },
+                            },
+                        },
+                        {
+                            kind: {
+                                type: "tool_call",
+                                name: "write",
+                                input: { filePath: "write.ts", content: "contents" },
+                            },
+                        },
+                    ],
+                },
+            },
+        ];
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "key-order-filter",
+            input,
+            nativeMessages: [],
+            passInputs: {},
+            usage: {},
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+
+        expect(body.tool_input_key_orders).toEqual({
+            "tool-message#1": ["filePath", "oldString", "newString"],
+            "tool-message#2": ["filePath", "content"],
+        });
+    });
+
     it("copies the resolved history budget onto the authority wire", () => {
         const body = __rustModeTransformTest.buildTransformBody({
             sessionId: "budget-wire",
@@ -587,11 +644,20 @@ describe("Rust mode authority adapter", () => {
             {
                 decision: "HARD",
                 materialize_reason: "first_render",
+                scheduler_decision: "execute",
+                historian: {
+                    fired: false,
+                    no_fire: "trigger_false",
+                    canonical_cause: "no_new_raw_history",
+                    state: "idle",
+                },
                 served_from: "transform",
                 timings: { handler_total: 5, total: 4, native_cache_encoded_messages: 1 },
             },
             {
                 decision: "SOFT+",
+                scheduler_decision: "defer",
+                scheduler_defer_reason: "scheduler_defer",
                 served_from: "lkg",
                 timings: { handler_total: 3, total: 2, native_cache_reused_messages: 1 },
             },
@@ -618,11 +684,23 @@ describe("Rust mode authority adapter", () => {
             const logged = logSpy.mock.calls
                 .filter(([loggedSession]) => loggedSession === sessionId)
                 .map(([, message]) => message);
+            const coverageLines = logged.filter((message) =>
+                message.startsWith("rust input coverage:"),
+            );
+            expect(coverageLines).toEqual([
+                "rust input coverage: oc_input=1 marker_at=none covered=0",
+                "rust input coverage: oc_input=1 marker_at=none covered=0",
+            ]);
             const passLines = logged.filter((message) => message.startsWith("rust pass:"));
             expect(passLines).toHaveLength(2);
             expect(passLines[0]).toContain("decision=HARD");
+            expect(passLines[0]).toContain("scheduler=execute");
+            expect(passLines[0]).toContain(
+                "historian_no_fire=trigger_false canonical_cause=no_new_raw_history",
+            );
             expect(passLines[0]).toContain("served_from=transform");
             expect(passLines[1]).toContain("decision=SOFT+");
+            expect(passLines[1]).toContain("scheduler=defer defer_reason=scheduler_defer");
             expect(passLines[1]).toContain("served_from=lkg");
             expect(passLines[0]).not.toBe(passLines[1]);
             expect(logged.some((message) => message.startsWith("rust module stages:"))).toBe(true);
@@ -631,7 +709,80 @@ describe("Rust mode authority adapter", () => {
         }
     });
 
+    it("keeps host-only trailing blank stripping at a three-pass raw-ingress fixed point", async () => {
+        const sessionId = `rust-host-strip-fixed-point-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        addTrailingBlankDecisions(db, sessionId, [["m1", "strip"]]);
+        const transformBodies: Record<string, unknown>[] = [];
+        const sourceMessages = () =>
+            [
+                {
+                    info: {
+                        id: "m1",
+                        role: "assistant",
+                        sessionID: sessionId,
+                        providerID: "anthropic",
+                        modelID: "claude-sonnet",
+                    },
+                    parts: [
+                        { type: "text", text: "stable answer" },
+                        { type: "text", text: "" },
+                    ],
+                },
+            ] as unknown as MessageLike[];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformBodies.push(structuredClone(body));
+                return {
+                    decision: "PASSTHROUGH",
+                    native_messages: sourceMessages(),
+                };
+            },
+        };
+        const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const served: string[] = [];
+
+        for (let pass = 0; pass < 3; pass += 1) {
+            const messages = sourceMessages();
+            const output = { messages };
+            await runner.run(sessionId, messages, output, makeMeta(db, sessionId));
+            served.push(JSON.stringify(output.messages));
+            expect((output.messages[0] as MessageLike).parts).toEqual([
+                { type: "text", text: "stable answer" },
+            ]);
+        }
+
+        expect(served[1]).toBe(served[0]);
+        expect(served[2]).toBe(served[0]);
+        expect(
+            (
+                ((transformBodies[0]?.native_messages as MessageLike[])[0]?.parts ?? []) as Array<{
+                    text?: string;
+                }>
+            ).at(-1)?.text,
+        ).toBe("");
+        expect(transformBodies.slice(1).map((body) => body.native_messages)).toEqual([[], []]);
+        expect(transformBodies.slice(1).every((body) => body.tail_delta !== undefined)).toBe(true);
+    });
+
     it("keeps the rust pass line grep-compatible", () => {
+        expect(
+            __rustModeTransformTest.formatRustInputCoverageLog({
+                ocInput: 10_004,
+                markerAt: "msg_boundary",
+                covered: 9_590,
+            }),
+        ).toBe("rust input coverage: oc_input=10004 marker_at=msg_boundary covered=9590");
+        expect(
+            __rustModeTransformTest.formatRustInputCoverageLog({
+                ocInput: 21_748,
+                markerAt: null,
+                covered: 7_400,
+            }),
+        ).toBe("rust input coverage: oc_input=21748 marker_at=none covered=7400");
         expect(
             __rustModeTransformTest.formatRustPassLog({
                 decision: "HARD",
@@ -646,6 +797,62 @@ describe("Rust mode authority adapter", () => {
         ).toBe(
             "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 mirror_pull:0.0 compartment_mirror:0.0 other:12.3",
         );
+    });
+
+    it("accepts materialized boundaries only from a committed non-defer response", () => {
+        expect(
+            __rustModeTransformTest.materializedCompactionBoundary({
+                decision: "HARD",
+                scheduler_decision: "execute",
+                committed: true,
+                row_version: 12,
+                coverage_ordinal: 9_590,
+                boundary_id: "msg_boundary#3",
+            }),
+        ).toEqual({ rowVersion: 12, ordinal: 9_590, endMessageId: "msg_boundary" });
+        expect(
+            __rustModeTransformTest.materializedCompactionBoundary({
+                decision: "SOFT+",
+                scheduler_decision: "defer",
+                committed: true,
+                row_version: 12,
+                coverage_ordinal: 9_590,
+                boundary_id: "msg_boundary#3",
+            }),
+        ).toBeUndefined();
+    });
+
+    it("consumes the persisted provider-overflow limit on the next Rust-mode pass", async () => {
+        const sessionId = `rust-overflow-limit-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordOverflowDetected(db, sessionId, 64_000, "anthropic/claude-fable-5-1");
+        let transformBody: Record<string, unknown> | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformBody = body;
+                return { decision: "HARD", native_messages: makeMessages(sessionId) };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.liveModelBySession?.set(sessionId, {
+            providerID: "anthropic",
+            modelID: "claude-fable-5-1",
+        });
+        deps.getModelKey = () => "anthropic/claude-fable-5-1";
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        input[0]!.info.model = {
+            providerID: "anthropic",
+            modelID: "claude-fable-5-1",
+        };
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+
+        expect(transformBody?.usage).toMatchObject({ context_limit_tokens: 64_000 });
+        expect(transformBody?.emergency_recovery_armed).toBe(true);
     });
 
     it("keeps stale low usage armed until a post-overflow usage row proves recovery", async () => {
@@ -1662,7 +1869,7 @@ describe("Rust mode authority adapter", () => {
         await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
 
         const pageIds = new Set(transformBodies.map((body) => body.transform_page_id));
-        expect(pageIds.size).toBe(2);
+        expect(pageIds.size).toBe(1);
         expect(transformBodies.length).toBeGreaterThan(2);
         expect(
             transformBodies.every((body) =>
@@ -1721,9 +1928,9 @@ describe("Rust mode authority adapter", () => {
             const seriesStarts = transformBodies.filter((page) => page.transform_page_index === 0);
             const pageIds = new Set(seriesStarts.map((page) => page.transform_page_id));
             expect(seriesStarts).toHaveLength(2);
-            expect(pageIds.size).toBe(2);
+            expect(pageIds.size).toBe(1);
             expect(failedPageId).toBe(seriesStarts[0]?.transform_page_id);
-            expect(seriesStarts[1]?.transform_page_id).not.toBe(seriesStarts[0]?.transform_page_id);
+            expect(seriesStarts[1]?.transform_page_id).toBe(seriesStarts[0]?.transform_page_id);
             expect(output.messages).toEqual(native);
             const logged = logSpy.mock.calls
                 .filter(([loggedSession]) => loggedSession === sessionId)
@@ -1779,7 +1986,7 @@ describe("Rust mode authority adapter", () => {
                 ({ body }) => body.transform_page_index === 0,
             );
             expect(seriesStarts).toHaveLength(2);
-            expect(new Set(seriesStarts.map(({ body }) => body.transform_page_id)).size).toBe(2);
+            expect(new Set(seriesStarts.map(({ body }) => body.transform_page_id)).size).toBe(1);
             expect(
                 transformCalls.find(({ body }) => body.transform_page_index === 1)
                     ?.generationSensitive,
@@ -1807,12 +2014,13 @@ describe("Rust mode authority adapter", () => {
         const transformCalls: Array<{
             body: Record<string, unknown>;
             attemptClass: string | undefined;
+            timeoutMs: number | undefined;
         }> = [];
         const moduleClient: RustModeModuleClient = {
-            call: async ({ method, body, attemptClass }) => {
+            call: async ({ method, body, attemptClass, timeoutMs }) => {
                 if (method !== "transform") return { ok: true };
                 const page = body as Record<string, unknown>;
-                transformCalls.push({ body: page, attemptClass });
+                transformCalls.push({ body: page, attemptClass, timeoutMs });
                 if (page.transform_page_complete === true) {
                     throw Object.assign(new Error("cold execute deadline"), { code: "ETIMEDOUT" });
                 }
@@ -1830,6 +2038,8 @@ describe("Rust mode authority adapter", () => {
             );
             expect(seriesStarts).toHaveLength(1);
             expect(transformCalls.at(-1)?.attemptClass).toBe("transform_series_execute");
+            // One seed message: the cold-start floor plus one per-message increment.
+            expect(transformCalls.at(-1)?.timeoutMs).toBe(15_002);
             expect(
                 transformCalls
                     .slice(0, -1)
@@ -1880,7 +2090,7 @@ describe("Rust mode authority adapter", () => {
 
             const seriesStarts = transformBodies.filter((page) => page.transform_page_index === 0);
             expect(seriesStarts).toHaveLength(2);
-            expect(new Set(seriesStarts.map((page) => page.transform_page_id)).size).toBe(2);
+            expect(new Set(seriesStarts.map((page) => page.transform_page_id)).size).toBe(1);
             expect(output.messages).toEqual(messages);
             const logged = logSpy.mock.calls
                 .filter(([loggedSession]) => loggedSession === sessionId)
@@ -1990,8 +2200,7 @@ describe("Rust mode authority adapter", () => {
         }
         expect(transformBodies[1]?.tail_delta).toBeDefined();
 
-        transform.clearSession(sessionId);
-        await Bun.sleep(0);
+        await transform.clearSession(sessionId);
         expect(deleteSession).toHaveBeenCalledWith(sessionId, "/tmp/rust-clear-session-project");
         expect(closeSession).toHaveBeenCalledWith(sessionId);
         const afterClear = makeMessages(sessionId);
@@ -2005,6 +2214,109 @@ describe("Rust mode authority adapter", () => {
         expect(transformBodies[2]?.tail_delta).toBeUndefined();
         expect(transformBodies[2]?.messages).toHaveLength(1);
         expect(transform.getState(sessionId).passCount).toBe(1);
+    });
+
+    it("does not let an in-flight transform repopulate a deleted session route", async () => {
+        const sessionId = `rust-clear-session-in-flight-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const transformBodies: Array<Record<string, unknown>> = [];
+        let releaseTransform!: (value: unknown) => void;
+        let transformStarted!: () => void;
+        const transformStartedPromise = new Promise<void>((resolve) => {
+            transformStarted = resolve;
+        });
+        const pendingTransform = new Promise<unknown>((resolve) => {
+            releaseTransform = resolve;
+        });
+        let releaseDelete!: () => void;
+        const pendingDelete = new Promise<void>((resolve) => {
+            releaseDelete = resolve;
+        });
+        let transformCalls = 0;
+        const deleteSession = mock(() => pendingDelete);
+        const closeSession = mock(() => {});
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformBodies.push(body as Record<string, unknown>);
+                transformCalls += 1;
+                if (transformCalls === 2) {
+                    transformStarted();
+                    return pendingTransform;
+                }
+                return { decision: "PASSTHROUGH", native_messages: [] };
+            },
+            deleteSession,
+            closeSession,
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            projectRoot: "/tmp/rust-clear-session-in-flight-project",
+            scheduleLkgCapture: (capture) => capture(),
+        });
+        const initial = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: [...initial] },
+            makeMeta(db, sessionId),
+        );
+        const racingInput = makeMessages(sessionId);
+        const racingRun = transform.run(
+            sessionId,
+            racingInput,
+            { messages: [...racingInput] },
+            makeMeta(db, sessionId),
+        );
+        await transformStartedPromise;
+
+        const clearing = transform.clearSession(sessionId);
+        expect(deleteSession).toHaveBeenCalledWith(
+            sessionId,
+            "/tmp/rust-clear-session-in-flight-project",
+        );
+        releaseTransform({ decision: "PASSTHROUGH", native_messages: [] });
+        await racingRun;
+        releaseDelete();
+        await clearing;
+
+        const afterDelete = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            afterDelete,
+            { messages: [...afterDelete] },
+            makeMeta(db, sessionId),
+        );
+        expect(transformBodies[2]?.tail_delta).toBeUndefined();
+        expect(transformBodies[2]?.messages).toHaveLength(1);
+        expect(closeSession).toHaveBeenCalledWith(sessionId);
+    });
+
+    it("propagates module deletion failures while still closing the transport route", async () => {
+        const sessionId = `rust-clear-session-failure-${Date.now()}`;
+        const db = makeDb();
+        const deleteSession = mock(async () => {
+            throw new Error("module unavailable");
+        });
+        const closeSession = mock(() => {});
+        const moduleClient: RustModeModuleClient = {
+            call: async () => ({ ok: true }),
+            deleteSession,
+            closeSession,
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            projectRoot: "/tmp/rust-clear-session-failure-project",
+        });
+
+        await expect(transform.clearSession(sessionId)).rejects.toThrow("module unavailable");
+        expect(deleteSession).toHaveBeenCalledWith(
+            sessionId,
+            "/tmp/rust-clear-session-failure-project",
+        );
+        expect(closeSession).toHaveBeenCalledWith(sessionId);
     });
 
     it("keeps a 1,000-message steady-state pass under the adapter budget", async () => {
@@ -2298,6 +2610,107 @@ describe("Rust mode authority adapter", () => {
         expect(secondSlot?.inputContentDigests).not.toEqual(firstSlot?.inputContentDigests);
     });
 
+    it("replays byte-identical LKG on a typed mc-store transform failure", async () => {
+        const sessionId = `rust-module-store-busy-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let storeBusy = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (storeBusy) {
+                    throw Object.assign(new Error("store: database is locked"), {
+                        code: "transform_failed",
+                    });
+                }
+                return {
+                    decision: "HARD",
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: "last good module bytes" }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeMessages(sessionId);
+        const firstOutput = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, firstOutput, makeMeta(db, sessionId));
+        const firstBytes = JSON.stringify(firstOutput.messages);
+
+        storeBusy = true;
+        const failedOutput = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, failedOutput, makeMeta(db, sessionId));
+
+        expect(JSON.stringify(failedOutput.messages)).toBe(firstBytes);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+    });
+
+    it("serves module output while context.db is busy and skips only the durable LKG refresh", async () => {
+        const sessionId = `rust-context-busy-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeFileDb();
+        installRawProvider(sessionId);
+        let pass = 0;
+        let unavailable = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (unavailable) throw new Error("daemon unavailable");
+                pass += 1;
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `module output ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeMessages(sessionId);
+        const firstOutput = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, firstOutput, makeMeta(db, sessionId));
+        expect(JSON.stringify(firstOutput.messages)).toContain("module output 1");
+
+        const dbPath = getDatabasePath(db);
+        expect(dbPath).toBeDefined();
+        const blocker = new Database(dbPath!);
+        try {
+            db.exec("PRAGMA busy_timeout=0");
+            blocker.exec("PRAGMA busy_timeout=0");
+            blocker.exec("BEGIN IMMEDIATE");
+            const secondOutput = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, secondOutput, makeMeta(db, sessionId));
+            expect(JSON.stringify(secondOutput.messages)).toContain("module output 2");
+            expect(getSlot(sessionId)?.jsonPrefix).toContain("module output 2");
+            const persisted = db
+                .prepare("SELECT json_prefix FROM lkg_slots WHERE session_id = ?")
+                .get(sessionId) as { json_prefix: string };
+            expect(persisted.json_prefix).toContain("module output 1");
+        } finally {
+            if (blocker.inTransaction) blocker.exec("ROLLBACK");
+            closeQuietly(blocker);
+        }
+
+        unavailable = true;
+        const hotReplay = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, hotReplay, makeMeta(db, sessionId));
+        expect(JSON.stringify(hotReplay.messages)).toContain("module output 2");
+
+        resetLkgSlotsForTest();
+        registerLkgPersistence(createDbLkgPersistence(db));
+        const restarted = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const coldReplay = { messages: [...input] as unknown[] };
+        await restarted.run(sessionId, input, coldReplay, makeMeta(db, sessionId));
+        expect(JSON.stringify(coldReplay.messages)).toContain("module output 1");
+    });
+
     it("refuses a pre-bust LKG before the async replacement capture commits", async () => {
         const sessionId = `rust-lkg-async-${Date.now()}`;
         sessions.push(sessionId);
@@ -2348,6 +2761,90 @@ describe("Rust mode authority adapter", () => {
 
         scheduled.shift()?.();
         expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 2");
+    });
+
+    it("keeps binding recovery armed and replay-stable when native output installation fails", async () => {
+        const sessionId = `rust-binding-install-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let moduleUnavailable = false;
+        let rejectInstall = false;
+        let rowVersion = 0;
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    model: { providerID: "anthropic", modelID: "fable-5-1" },
+                },
+                parts: [
+                    { type: "thinking", thinking: "bound thinking", signature: "sig" },
+                    { type: "text", text: "answer" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const nativeMessages = () => structuredClone(input) as unknown[];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (moduleUnavailable) throw new Error("module unavailable after install failure");
+                rowVersion += 1;
+                return {
+                    decision: "HARD",
+                    row_version: rowVersion,
+                    native_messages: nativeMessages(),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+            installNativeMessagesForTests: (output, messages) => {
+                if (rejectInstall) {
+                    rejectInstall = false;
+                    expect(JSON.stringify(messages)).not.toContain("bound thinking");
+                    throw new Error("simulated native output installation failure");
+                }
+                output.messages.splice(0, output.messages.length, ...messages);
+            },
+        });
+        const run = async () => {
+            const output = { messages: structuredClone(input) as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            return output.messages;
+        };
+
+        const baseline = await run();
+        expect(JSON.stringify(baseline)).toContain("bound thinking");
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("bound thinking");
+
+        armThinkingBindingRecovery(db, sessionId);
+        rejectInstall = true;
+        const failedInstallReplay = await run();
+        const frozenId = "binding_mismatch:m1";
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toContain(frozenId);
+        expect(JSON.stringify(failedInstallReplay)).not.toContain("bound thinking");
+        expect(scheduled).toHaveLength(0);
+
+        moduleUnavailable = true;
+        const outageReplay = await run();
+        expect(JSON.stringify(outageReplay)).toBe(JSON.stringify(failedInstallReplay));
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).not.toBeNull();
+
+        moduleUnavailable = false;
+        const recovered = await run();
+        expect(JSON.stringify(recovered)).toBe(JSON.stringify(failedInstallReplay));
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBeNull();
+        expect(scheduled).toHaveLength(1);
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).not.toContain("bound thinking");
     });
 
     it("does not let an older async capture overwrite a newer model-switch capture", async () => {
@@ -2477,6 +2974,29 @@ describe("Rust mode authority adapter", () => {
 
         expect(output.messages).toEqual(input);
         expect(moduleCall).not.toHaveBeenCalled();
+    });
+
+    it("fails closed when overflow recovery is armed but context.db becomes unreadable", async () => {
+        const sessionId = `rust-overflow-state-armed-fault-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordOverflowDetected(db, sessionId, 100_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async () => {
+                throw new Error("module must not run after the preflight storage fault");
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeMessages(sessionId);
+        const meta = makeMeta(db, sessionId);
+        db.exec("DROP TABLE session_meta");
+        const output = { messages: [] as unknown[] };
+
+        await expect(transform.run(sessionId, input, output, meta)).rejects.toBeInstanceOf(
+            EmergencyFailClosedError,
+        );
+        expect(output.messages).toEqual([]);
     });
 
     it("throws locally instead of serving raw above a known context limit", async () => {

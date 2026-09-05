@@ -32,6 +32,7 @@ import {
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
     formatInconclusiveOpenCodeMigrationWarning,
+    formatInconclusivePiMigrationWarning,
     formatLiveProcessMigrationRefusal,
     getDatabasePath,
     getLiveMigrationBlockingProcesses,
@@ -42,6 +43,7 @@ import {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
+    openDatabaseAsync,
     resolveDatabasePath,
 } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
@@ -230,6 +232,65 @@ describe("explicit shared storage resolution", () => {
         const db = openDatabase();
         expect(db).not.toBeNull();
         expect(getDatabasePath(db!)).toBe(resolved.dbPath);
+        closeDatabase();
+    });
+
+    it("reports the same finite boot busy timeout installed before the first schema read", async () => {
+        useTempDataHome("storage-db-boot-busy-timeout-");
+        const diagnostics: string[] = [];
+        const db = await openDatabaseAsync({
+            busyTimeoutMs: 0,
+            onBootBusyTimeout: (message) => diagnostics.push(message),
+        });
+
+        expect(db).not.toBeNull();
+        const timeout = db!.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+        expect(timeout.timeout).toBe(0);
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0]).toContain(`timeout=${timeout.timeout}ms`);
+        expect(diagnostics[0]).toContain(`path=${getDatabasePath(db!)}`);
+        closeDatabase();
+    });
+
+    it("bounds the first schema read behind another connection's exclusive lock", async () => {
+        const dir = makeTempDir("storage-db-exclusive-lock-");
+        const dbPath = join(dir, "context.db");
+        expect(openDatabase(dbPath)).not.toBeNull();
+        closeDatabase();
+
+        const holder = new Database(dbPath);
+        holder.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE");
+        const startedAt = performance.now();
+        try {
+            const opened = await openDatabaseAsync({ dbPath, busyTimeoutMs: 35 });
+            const elapsedMs = performance.now() - startedAt;
+            expect(elapsedMs).toBeLessThan(1_000);
+            if (opened) {
+                const timeout = opened.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+                expect(timeout.timeout).toBe(35);
+            }
+        } finally {
+            holder.exec("ROLLBACK");
+            closeQuietly(holder);
+        }
+    });
+
+    it("reports bounded boot phase timings for an async open", async () => {
+        const dataHome = useTempDataHome("storage-db-boot-timing-");
+        let timings: { openMs: number; guardMs: number; migrateMs: number } | undefined;
+
+        const db = await openDatabaseAsync({
+            onBootTimings: (observed) => {
+                timings = observed;
+            },
+        });
+
+        expect(db).not.toBeNull();
+        expect(getDatabasePath(db!)).toBe(resolveDbPath(dataHome));
+        expect(timings).toBeDefined();
+        expect(timings!.openMs).toBeGreaterThanOrEqual(0);
+        expect(timings!.guardMs).toBeGreaterThanOrEqual(0);
+        expect(timings!.migrateMs).toBeGreaterThanOrEqual(0);
         closeDatabase();
     });
 
@@ -636,6 +697,7 @@ describe("storage-db", () => {
             const dataHome = useTempDataHome("storage-db-live-omp-migration-");
             const dbPath = seedPendingMigration(dataHome);
             __setRpcIdentityTestHooks({
+                platform: "darwin",
                 processListExecFileSync: (() =>
                     " 41002 omp --extension /home/user/.omp/agent/extensions/status.ts -r\n") as typeof execFileSync,
                 execFileSync: ((_, args) =>
@@ -661,6 +723,7 @@ describe("storage-db", () => {
             const dataHome = useTempDataHome("storage-db-omp-worker-migration-");
             const dbPath = seedPendingMigration(dataHome);
             __setRpcIdentityTestHooks({
+                platform: "darwin",
                 processListExecFileSync: (() =>
                     " 41008 bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js __omp_worker_tiny_inference\n") as typeof execFileSync,
             });
@@ -728,6 +791,35 @@ describe("storage-db", () => {
                 serverPids: [process.pid],
             });
             expect(readPersistedVersion(dbPath)).toBe(0);
+        });
+
+        it("#when a Windows omp.exe command line has no Pi arc #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-inconclusive-omp-image-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                platform: "win32",
+                processListExecFileSync: ((file: string | URL) => {
+                    if (String(file) !== "powershell") {
+                        throw new Error(`${String(file)} must not run when CIM succeeds`);
+                    }
+                    return JSON.stringify({
+                        ProcessId: 41001,
+                        ParentProcessId: 8,
+                        CommandLine: "C:\\Users\\qiiks\\.bun\\bin\\omp.exe",
+                        CreationDate: "20260101120000.000000+000",
+                    });
+                }) as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "continuing migration",
+            );
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "Pi/OMP PID 41001",
+            );
         });
 
         it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {

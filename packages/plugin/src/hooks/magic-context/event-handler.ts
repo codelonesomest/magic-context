@@ -1,7 +1,12 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
-import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import {
+    detectOverflow,
+    detectThinkingBindingMismatch,
+    isFable51ThinkingBindingModel,
+} from "../../features/magic-context/overflow-detection";
+import {
+    armThinkingBindingRecovery,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
     clearSession,
@@ -57,6 +62,7 @@ import {
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
 import { readRawSessionMessages } from "./read-session-chunk";
+import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
 import { clearMessageTokensCache } from "./transform";
@@ -87,9 +93,12 @@ export interface EventHandlerDeps {
      * the off-transition clears any persisted intent.
      */
     compactionOff?: boolean;
+    /** The host-side recovery arm is TS-only until the module protocol carries this flag. */
+    thinkingBindingRecoveryEnabled?: boolean;
     onSessionCacheInvalidated?: (sessionId: string) => void;
     onRustWireInvalidated?: (sessionId: string) => void;
-    onSessionDeleted?: (sessionId: string) => void;
+    onSessionDeleted?: (sessionId: string) => Promise<void> | void;
+    rustSessionCleanup?: boolean;
     config: {
         protected_tags: number;
         clear_reasoning_age?: number;
@@ -296,6 +305,25 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
             try {
+                const bindingMismatch = detectThinkingBindingMismatch(errInfo.error);
+                if (bindingMismatch.isBindingMismatch) {
+                    const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
+                    if (
+                        deps.thinkingBindingRecoveryEnabled !== false &&
+                        !deps.compactionOff &&
+                        isFable51ThinkingBindingModel(model?.providerID, model?.modelID)
+                    ) {
+                        armThinkingBindingRecovery(
+                            deps.db,
+                            errInfo.sessionID,
+                            bindingMismatch.messageId,
+                        );
+                        dropSlot(errInfo.sessionID, "thinking-binding-recovery-arm");
+                        deps.onSessionCacheInvalidated?.(errInfo.sessionID);
+                    }
+                    return;
+                }
+
                 const detection = detectOverflow(errInfo.error);
                 if (!detection.isOverflow) {
                     return;
@@ -425,6 +453,32 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             let messageHadOverflowError = false;
+
+            if (info.error !== undefined && info.error !== null) {
+                const bindingMismatch = detectThinkingBindingMismatch(info.error);
+                if (
+                    bindingMismatch.isBindingMismatch &&
+                    deps.thinkingBindingRecoveryEnabled !== false &&
+                    !deps.compactionOff &&
+                    isFable51ThinkingBindingModel(info.providerID, info.modelID)
+                ) {
+                    try {
+                        armThinkingBindingRecovery(
+                            deps.db,
+                            info.sessionID,
+                            bindingMismatch.messageId,
+                        );
+                        dropSlot(info.sessionID, "thinking-binding-recovery-arm");
+                        deps.onSessionCacheInvalidated?.(info.sessionID);
+                    } catch (error) {
+                        sessionLog(
+                            info.sessionID,
+                            "event message.updated thinking binding recovery persistence failed:",
+                            error,
+                        );
+                    }
+                }
+            }
 
             // Secondary overflow-detection path: OpenCode attaches overflow
             // errors to the assistant message itself in addition to emitting
@@ -835,19 +889,30 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 // Commit the retry marker before any deletion work. clearSession removes
                 // it in the same transaction as the session data, so a BUSY/rollback
                 // leaves a durable retry for the next maintenance tick.
-                markSessionCleanupPending(deps.db, sessionId);
-                // Read and remove compaction marker BEFORE clearSession destroys session_meta.
-                // Plan v6: pending_compaction_marker_state lives on the same row, so
-                // clearSession's session_meta DELETE wipes it automatically — no
-                // separate CAS-clear needed here.
-                removeCompactionMarkerForSession(deps.db, sessionId);
-                clearSession(deps.db, sessionId);
+                // Rust cleanup is distinguished in the initial durable write. If the
+                // module call fails, the ordinary sweeper must retain both this marker
+                // and the session→project binding needed for a project-scoped retry.
+                const rustCleanupPending = markSessionCleanupPending(
+                    deps.db,
+                    sessionId,
+                    deps.rustSessionCleanup === true,
+                );
+                await deps.onSessionDeleted?.(sessionId);
+                // A duplicate deletion may arrive after cleanup switches to TypeScript.
+                // Preserve host rows until the pending Rust module deletion succeeds.
+                if (!rustCleanupPending || deps.rustSessionCleanup === true) {
+                    // Read and remove compaction marker BEFORE clearSession destroys session_meta.
+                    // Plan v6: pending_compaction_marker_state lives on the same row, so
+                    // clearSession's session_meta DELETE wipes it automatically — no
+                    // separate CAS-clear needed here.
+                    removeCompactionMarkerForSession(deps.db, sessionId);
+                    clearSession(deps.db, sessionId, deps.rustSessionCleanup === true);
+                }
             } catch (error) {
                 sessionLog(sessionId, "event session.deleted persistence failed:", error);
             }
             resetDegradedCacheCount(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
-            deps.onSessionDeleted?.(sessionId);
             deps.contextUsageMap.delete(sessionId);
             deps.tagger.cleanup(sessionId);
             clearTransformDecisionSession(sessionId);

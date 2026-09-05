@@ -23,6 +23,7 @@ import {
     createEventHook,
     createToolExecuteAfterHook,
 } from "./hook-handlers";
+import { registerLkgPersistence } from "./lkg-slot";
 import type { MessageLike } from "./tag-messages";
 import { countRealUserMessages } from "./tail-hygiene-walk";
 
@@ -298,7 +299,12 @@ describe("createToolExecuteAfterHook todo snapshots", () => {
 });
 
 describe("createEventHook mid-session model switch clears overflow state", () => {
-    function makeAssistantEvent(sessionID: string, providerID: string, modelID: string) {
+    function makeAssistantEvent(
+        sessionID: string,
+        providerID: string,
+        modelID: string,
+        messageID = `msg-${Math.random().toString(36).slice(2)}`,
+    ) {
         return {
             event: {
                 type: "message.updated",
@@ -306,7 +312,7 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
                     info: {
                         role: "assistant",
                         sessionID,
-                        id: `msg-${Math.random().toString(36).slice(2)}`,
+                        id: messageID,
                         providerID,
                         modelID,
                         finish: "stop",
@@ -341,7 +347,7 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
             });
 
             // First assistant response on the small-context model.
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small", "msg-000001"));
             // Session overflowed on the small model → records a detected limit + arms recovery.
             recordOverflowDetected(db, sessionId, 120_000);
             let overflow = getOverflowState(db, sessionId);
@@ -351,11 +357,110 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
             // User switches to a 1M-context model mid-session — next assistant event
             // carries the new model. The handler must clear BOTH the stale detected
             // limit and the recovery flag so the new model's pressure math is clean.
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-large"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-large", "msg-000002"));
             overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(0);
             expect(overflow.needsEmergencyRecovery).toBe(false);
         } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("ignores late updates from an older assistant after a model switch", async () => {
+        const db = createTestDb();
+        let dropCount = 0;
+        registerLkgPersistence({
+            load: () => undefined,
+            clear: () => {
+                dropCount++;
+            },
+        });
+        try {
+            const sessionId = "ses-interleaved-model-switch";
+            const liveModelBySession = new Map<string, { providerID: string; modelID: string }>();
+            const latestAssistantMessageIdBySession = new Map<string, string>();
+            const hook = createEventHook({
+                eventHandler: async () => {},
+                contextUsageMap: new Map(),
+                db,
+                liveModelBySession,
+                latestAssistantMessageIdBySession,
+                variantBySession: new Map(),
+                agentBySession: new Map(),
+                sessionDirectoryBySession: new Map(),
+                historyRefreshSessions: new Set(),
+                deferredHistoryRefreshSessions: new Set(),
+                systemPromptRefreshSessions: new Set(),
+                pendingMaterializationSessions: new Set(),
+                deferredMaterializationSessions: new Set(),
+                lastHeuristicsTurnId: new Map(),
+                client: undefined as never,
+                protectedTags: 5,
+            });
+
+            // The newer assistant shell arrives between two updates for the older row.
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000001"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5-1", "msg-000002"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000001"));
+
+            expect(dropCount).toBe(1);
+            expect(liveModelBySession.get(sessionId)).toEqual({
+                providerID: "fable",
+                modelID: "fable-5-1",
+            });
+            expect(latestAssistantMessageIdBySession.get(sessionId)).toBe("msg-000002");
+        } finally {
+            registerLkgPersistence(undefined);
+            closeQuietly(db);
+        }
+    });
+
+    test("accepts newer assistants for a genuine A-to-B-to-A model sequence", async () => {
+        const db = createTestDb();
+        let dropCount = 0;
+        registerLkgPersistence({
+            load: () => undefined,
+            clear: () => {
+                dropCount++;
+            },
+        });
+        try {
+            const sessionId = "ses-newer-model-switches";
+            const liveModelBySession = new Map([
+                [sessionId, { providerID: "fable", modelID: "fable-4" }],
+            ]);
+            const latestAssistantMessageIdBySession = new Map<string, string>();
+            const hook = createEventHook({
+                eventHandler: async () => {},
+                contextUsageMap: new Map(),
+                db,
+                liveModelBySession,
+                latestAssistantMessageIdBySession,
+                variantBySession: new Map(),
+                agentBySession: new Map(),
+                sessionDirectoryBySession: new Map(),
+                historyRefreshSessions: new Set(),
+                deferredHistoryRefreshSessions: new Set(),
+                systemPromptRefreshSessions: new Set(),
+                pendingMaterializationSessions: new Set(),
+                deferredMaterializationSessions: new Set(),
+                lastHeuristicsTurnId: new Map(),
+                client: undefined as never,
+                protectedTags: 5,
+            });
+
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000001"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5-1", "msg-000002"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000003"));
+
+            expect(dropCount).toBe(3);
+            expect(liveModelBySession.get(sessionId)).toEqual({
+                providerID: "fable",
+                modelID: "fable-5",
+            });
+            expect(latestAssistantMessageIdBySession.get(sessionId)).toBe("msg-000003");
+        } finally {
+            registerLkgPersistence(undefined);
             closeQuietly(db);
         }
     });
@@ -383,10 +488,10 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
                 protectedTags: 5,
             });
 
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small", "msg-000001"));
             recordOverflowDetected(db, sessionId, 120_000);
             // Same model again — detected limit must persist (authoritative on this model).
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small", "msg-000002"));
             const overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(120_000);
             expect(overflow.needsEmergencyRecovery).toBe(true);
@@ -570,6 +675,31 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
+    test("Fable 5.1 variant flip signals nothing and leaves pending materialization untouched", async () => {
+        const sets = freshSets();
+        sets.lastHeuristicsTurnId.set("ses", "turn-1");
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "medium",
+                model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+            });
+
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
+            expect(sets.lastHeuristicsTurnId.get("ses")).toBe("turn-1");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("bedrock provider: variant flip signals all three sets (thinking config rendered into prompt)", async () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
@@ -667,18 +797,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
-    // Unknown provider (no model info on the hook input) takes the
-    // conservative TRUE arm = today's behavior.
-    test("unknown provider (no model info): variant flip takes the TRUE arm (all three sets signaled)", async () => {
+    test("unknown model tuple: variant flip defers rather than manufacturing a bust", async () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
         try {
             await hook({ sessionID: "ses", variant: "low" });
             await hook({ sessionID: "ses", variant: "high" });
 
-            expect(sets.historyRefreshSessions.has("ses")).toBe(true);
-            expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
-            expect(sets.pendingMaterializationSessions.has("ses")).toBe(true);
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
         } finally {
             closeQuietly(db);
         }

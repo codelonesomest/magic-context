@@ -14,6 +14,7 @@ import {
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
@@ -36,6 +37,7 @@ import {
     clearEmergencyRecovery,
     clearHistorianFailureState,
     clearPersistedReasoningWatermark,
+    clearThinkingBindingRecoveryIf,
     getOverflowState,
     loadProtectedTailMeta,
     recordOverflowDetected,
@@ -90,6 +92,7 @@ import type { LiveModelBySession } from "./hook-handlers";
 import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
+    selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
 import { saveLkgSlotToDb } from "./lkg-persist";
 import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-replay";
@@ -1754,6 +1757,10 @@ export function createTransform(deps: TransformDeps) {
 
         let pendingCompartmentInjection: PreparedCompartmentInjection | null = null;
         let rebuiltHistoryFromInitialPrepare = false;
+        let hiddenMessagesAtCompactionSeam: MessageLike[] = [];
+        let trimmedMessagesAtCompactionBoundary: MessageLike[] = [];
+        const messagesBeforeInitialPrepare =
+            isCacheBusting && deferredHistoryWasPendingAtPassStart ? [...messages] : null;
         // Compaction-off bypasses compartment-history preparation entirely,
         // even when historical compartment rows exist: no <session-history>
         // render, no raw-tail trim, no boundary splice, no marker write.
@@ -1770,6 +1777,18 @@ export function createTransform(deps: TransformDeps) {
                 deps.memoryConfig?.injectionBudgetTokens,
                 deps.experimentalTemporalAwareness,
             );
+            if (messagesBeforeInitialPrepare) {
+                const skippedVisibleMessages =
+                    pendingCompartmentInjection?.skippedVisibleMessages ?? 0;
+                trimmedMessagesAtCompactionBoundary = messagesBeforeInitialPrepare.slice(
+                    0,
+                    skippedVisibleMessages,
+                );
+                hiddenMessagesAtCompactionSeam = selectHiddenMessagesAtCompactionSeam(
+                    messagesBeforeInitialPrepare,
+                    skippedVisibleMessages,
+                );
+            }
             logTransformTiming(sessionId, "prepareCompartmentInjection", tInj);
 
             // ── Drain historyRefreshSessions (one-shot semantics) ──
@@ -1868,7 +1887,17 @@ export function createTransform(deps: TransformDeps) {
                 // maintained either way so heuristics and drops continue to work;
                 // only the agent-visible prefix is gated.
                 const skipPrefixInjection = !ctxReduceCallable;
-                const result = tagMessages(sessionId, messages, deps.tagger, db, {
+                // History preparation trims a prefix before the compaction marker is
+                // written later in this pass. OpenCode uses that new marker to build
+                // the next request, where rows hidden only from this transform can
+                // return. Tag the pre-trim objects now so persisted drops mutate them
+                // and postprocess can save their empty-sentinel decisions. Ordinary
+                // passes keep the smaller post-trim walk.
+                const messagesForTagging =
+                    messagesBeforeInitialPrepare && hiddenMessagesAtCompactionSeam.length > 0
+                        ? messagesBeforeInitialPrepare
+                        : messages;
+                const result = tagMessages(sessionId, messagesForTagging, deps.tagger, db, {
                     skipPrefixInjection,
                 });
                 targets = result.targets;
@@ -2233,6 +2262,8 @@ export function createTransform(deps: TransformDeps) {
             protectedTags: deps.protectedTags,
             emergencyCeilingTokens,
             pendingCompartmentInjection,
+            hiddenMessagesAtCompactionSeam,
+            trimmedMessagesAtCompactionBoundary,
             didMutateFromFlushedStatuses,
             watermark,
             forceMaterializationPercentage,
@@ -2252,6 +2283,10 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+                modelForBudget?.providerID,
+                modelForBudget?.modelID,
+            ),
             trailingBlankSourceDecisions,
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
@@ -2579,14 +2614,27 @@ export function createTransform(deps: TransformDeps) {
         );
 
         deps.maybeAutoEmbedSession?.(sessionId);
+
+        const bindingRecovery = postTransformResult.thinkingBindingRecovery;
+        if (bindingRecovery) {
+            const cleared = clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                bindingRecovery.flagTarget,
+            );
+            sessionLog(
+                sessionId,
+                `thinking binding recovery: stripped bound reasoning from assistant ${bindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+            );
+        }
     };
 
     return Object.assign(transform, {
         invalidateRustWireState(sessionId: string): void {
             rustModeTransform?.invalidateWireState(sessionId);
         },
-        clearRustSession(sessionId: string): void {
-            rustModeTransform?.clearSession(sessionId);
+        async clearRustSession(sessionId: string): Promise<void> {
+            await rustModeTransform?.clearSession(sessionId);
         },
     });
 }

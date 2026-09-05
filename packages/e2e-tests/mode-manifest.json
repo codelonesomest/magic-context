@@ -123,6 +123,18 @@
             ]
         },
         {
+            "path": "tests/notice-loop-race.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "OpenCode 1.18.x MessageV2.latest / parentID loop-exit ordering for noReply ignored notices is a host-session contract exercised on the TS OpenCode harness",
+            "contract_refs": [
+                "TS-HARNESS"
+            ]
+        },
+        {
             "path": "tests/overflow-recovery.test.ts",
             "tier": "both-modes",
             "invocation": {
@@ -132,6 +144,18 @@
             "rationale": "provider-overflow detection is shared; Rust historian completion is covered by the hermetic Broca producer suite",
             "contract_refs": [
                 "S2-MIGRATION"
+            ]
+        },
+        {
+            "path": "tests/paired-session-replay.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "CI-fast unit guard for paired replay byte/value-space classification vocabulary",
+            "contract_refs": [
+                "PARITY-REPLAY"
             ]
         },
         {
@@ -478,6 +502,19 @@
             ]
         },
         {
+            "path": "tests/rust-maintenance-contract.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "hermetic wrapup/recomp command drill pins durable coverage, row-version, and disposition contracts",
+            "contract_refs": [
+                "RUST-E2E",
+                "MAINTENANCE-COMMANDS"
+            ]
+        },
+        {
             "path": "tests/rust-memory-off-parity.test.ts",
             "tier": "rust-only",
             "invocation": {
@@ -514,6 +551,43 @@
             "rationale": "park self-heal confirms external-module exit before driving the prolonged outage, then proves the recovered process resumes real transforms",
             "contract_refs": [
                 "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-compaction-marker-byte-identity.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "rust-mode compaction marker advance leaves the served wire bytes identical with and without the marker; the marker only shrinks the input array",
+            "contract_refs": [
+                "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-cold-seed-perf.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "cold-seed handler budget on an ASTRO-shaped 10k-message seed; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
+            "contract_refs": [
+                "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-paired-session-replay.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "same sanitized session shape is replayed through TS and Rust provider-wire lanes and diffed pass by pass",
+            "contract_refs": [
+                "RUST-E2E",
+                "PARITY-REPLAY"
             ]
         },
         {
@@ -754,6 +828,19 @@
                 "FM-OC-6",
                 "RUST-E2E",
                 "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
+            ]
+        },
+        {
+            "path": "tests/window-overlay-reload.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "heavy dual-harness real-process lifecycle drill; run focused after overlay or Pi reload changes instead of placing it in the ordinary host-e2e load lane",
+            "contract_refs": [
+                "OVERLAY-SAME-PATH-AUTO-REFRESH",
+                "PI-EXTENSION-RELOAD"
             ]
         }
     ]

@@ -61,10 +61,7 @@ import {
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
-import {
-	getOverflowState,
-	recordOverflowDetected,
-} from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { getOverflowState } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { runDeferredV22Backfill } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
 import { setCtxReduceRegisteredGlobally } from "@magic-context/core/hooks/magic-context/ctx-reduce-availability";
 import {
@@ -94,7 +91,7 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
-import { log } from "@magic-context/core/shared/logger";
+import { flushLogger, log } from "@magic-context/core/shared/logger";
 import { resolveHistorianModel } from "@magic-context/core/shared/model-resolution";
 import {
 	createPromptSurfaceGuidanceEpochCache,
@@ -102,6 +99,7 @@ import {
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
+import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import {
@@ -164,9 +162,12 @@ import {
 	publishOmpTaskChildRegistrar,
 	tryRegisterOmpTaskChildRuntime,
 } from "./omp-task-child-runtime";
+import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
+import { type PiHarnessKind, resolvePiHarnessKind } from "./pi-harness-kind";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
+import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { readPiSessionMessages } from "./read-session-pi";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
@@ -183,7 +184,7 @@ import {
 	processSystemPromptForCache,
 } from "./system-prompt";
 import { withTimeout } from "./timeout";
-import { registerMagicContextTools } from "./tools";
+import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
 	parseTodos,
 	registerTodoOverlay,
@@ -192,7 +193,9 @@ import {
 	setTodoSnapshot,
 } from "./tools/todo-view-pi";
 
-const PREFIX = "[magic-context][pi]";
+const PI_HARNESS_KIND = resolvePiHarnessKind();
+const PREFIX = `[magic-context][${PI_HARNESS_KIND}]`;
+const PI_BOOT_DEADLINE_MS = 15_000;
 
 // ---------------------------------------------------------------------------
 // In-process child guard (issue #247)
@@ -335,6 +338,7 @@ export function persistPiMessageEndModelMeta(args: {
 		role?: string;
 		provider?: string;
 		model?: string;
+		timestamp?: number;
 	};
 	if (
 		msg.role !== "assistant" ||
@@ -346,7 +350,7 @@ export function persistPiMessageEndModelMeta(args: {
 		return;
 	}
 	const modelKey = canonicalPiModelKey(msg.provider, msg.model);
-	recordPiLiveModel(args.sessionId, modelKey);
+	if (!recordPiLiveModel(args.sessionId, modelKey, msg.timestamp)) return;
 	const cacheTtl = resolveCacheTtl(args.cacheTtlConfig, modelKey);
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
 	if (currentMeta.cacheTtl !== cacheTtl) {
@@ -648,7 +652,7 @@ const PLUGIN_VERSION: string = (() => {
 
 /** Lock the harness at module load. Safe to import this file in tests; the
  * lock is idempotent and will throw only on a conflicting reset. */
-setHarness("pi");
+setHarness(PI_HARNESS_KIND);
 
 // ---------------------------------------------------------------------------
 // Config-driven resolvers
@@ -684,13 +688,14 @@ export function resolveSidekickFromConfig(
 
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
+	harness: PiHarnessKind = PI_HARNESS_KIND,
 ): PiHistorianOptions | undefined {
 	// Defensive: schema declares `historian` required with default {}, but the
 	// runtime config can come from a malformed JSONC merge that drops the
 	// field. Fall back to undefined-safe access so plugin load never crashes.
 	const historian = config.historian as HistorianConfig | undefined;
 	if (historian?.disable === true) return undefined;
-	const resolved = resolveHistorianModel(config, "pi");
+	const resolved = resolveHistorianModel(config, harness);
 	const model = resolved.primary?.model;
 	if (!model) return undefined;
 
@@ -720,7 +725,7 @@ export function resolveHistorianFromConfig(
 		// historian round-trip's latency and token cost. Enable for
 		// long sessions where chunk dedupe matters more than speed.
 		twoPass: historian?.two_pass === true,
-		// Pi only: explicit thinking level for historian subagent invocations.
+		// Pi and OMP: explicit thinking level for historian subagent invocations.
 		// When set, passed as --thinking <level> to Pi subprocess.
 		// Required for providers like GitHub Copilot that apply bad defaults.
 		thinkingLevel: resolved.primary?.qualifier,
@@ -789,6 +794,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	}
 	const unregisterPiSubagentInitContext = registerPiSubagentInitContext(pi);
 	registerPiSubagentInitContextCleanup(pi, unregisterPiSubagentInitContext);
+
+	// Flush before any filesystem or SQLite work. A boot lock that outlives the
+	// regular logger's batching interval must still leave a diagnostic breadcrumb.
+	log(`${PREFIX} boot: entering pid=${process.pid} dir=${process.cwd()}`);
+	flushLogger();
 	beginBootQuietPeriod();
 
 	// Resolve the user-tier storage policy before opening the shared database.
@@ -797,6 +807,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const bootProjectDir = process.cwd();
 	ensureConfigLocationsMigrated(bootProjectDir);
 	const bootConfig = loadPiConfig({ cwd: bootProjectDir });
+	if (!bootConfig.config.enabled) {
+		info("plugin DISABLED via config (enabled: false) — skipping registration");
+		return;
+	}
+	reloadWindowOverlay(bootConfig.config.models?.window_overlay_path);
 	setStoragePrivatePermissionEnforcement(
 		bootConfig.config.storage.enforce_private_permissions,
 	);
@@ -807,90 +822,96 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const storageDir = getMagicContextStorageDir();
 	const dbPath = join(storageDir, "context.db");
-
-	let db: ContextDatabase | null | undefined;
 	let openFailureCause: string | null = null;
-	try {
-		db = await openDatabaseAsync();
-	} catch (err) {
-		openFailureCause = err instanceof Error ? err.message : String(err);
-		db = null;
-	}
-
-	// openDatabase() returns null on the schema fence (DB newer than this binary).
-	// Genuine open/migration exceptions are caught above. Either way Magic Context
-	// cannot operate — when fail_closed_blocking is on (default), register a loud
-	// blocking surface instead of silently skipping hooks (native compaction).
-	if (!db) {
-		const projectDirForConfig = process.cwd();
-		ensureConfigLocationsMigrated(projectDirForConfig);
-		const early = loadPiConfig({ cwd: projectDirForConfig });
-		if (!early.config.enabled) {
-			info(
-				"plugin DISABLED via config (enabled: false) — skipping registration",
-			);
-			return;
+	const openStorage = async (): Promise<ContextDatabase | null> => {
+		try {
+			return await openDatabaseAsync();
+		} catch (error) {
+			openFailureCause = error instanceof Error ? error.message : String(error);
+			return null;
 		}
+	};
+	const unavailableReason = (): FailClosedReason => {
 		const migration = getMigrationOnOpenRefusal();
 		const blockingProcesses =
 			migration?.blockingProcesses ??
 			migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
 			[];
 		const fence = getSchemaFenceRejection();
-		const reason: FailClosedReason =
-			migration && blockingProcesses.length > 0
-				? {
-						kind: "migration_guard",
-						persistedVersion: migration.persistedVersion,
-						supportedVersion: migration.supportedVersion,
-						blockingProcesses,
-					}
-				: fence
-					? {
-							kind: "schema_fence",
-							persistedVersion: fence.persistedVersion,
-							supportedVersion: fence.supportedVersion,
-						}
-					: {
-							kind: "storage_failure",
-							cause: migration?.unreadableFile
-								? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-								: (openFailureCause ??
-									`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`),
-						};
-		if (
-			early.config.fail_closed_blocking === false ||
-			!isCompactionEnabled(early.config)
-		) {
-			warn(
-				`Magic Context (pi) storage unavailable at ${dbPath}: ${formatFailClosedBlockingMessage(reason)}. ` +
-					"fail_closed_blocking=false — degrading silently (hooks not registered).",
-			);
-			return;
+		if (migration && blockingProcesses.length > 0) {
+			return {
+				kind: "migration_guard",
+				persistedVersion: migration.persistedVersion,
+				supportedVersion: migration.supportedVersion,
+				blockingProcesses,
+			};
 		}
-		warn(
-			`Magic Context (pi) storage unavailable at ${dbPath}: ${formatFailClosedBlockingMessage(reason)}`,
-		);
-		let fullRuntimeStarted = false;
-		registerPiFailClosedSurface(pi, {
-			reason,
-			tryReopen: async () => {
-				try {
-					return await openDatabaseAsync();
-				} catch {
-					return null;
-				}
-			},
-			onRecovered: async (recoveredDb) => {
-				if (fullRuntimeStarted) return;
-				fullRuntimeStarted = true;
-				await startPiMagicContextRuntime(pi, recoveredDb, dbPath);
-			},
-		});
-		return;
-	}
+		if (fence) {
+			return {
+				kind: "schema_fence",
+				persistedVersion: fence.persistedVersion,
+				supportedVersion: fence.supportedVersion,
+			};
+		}
+		return {
+			kind: "storage_failure",
+			cause: migration?.unreadableFile
+				? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
+				: (openFailureCause ??
+					`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`),
+		};
+	};
 
-	await startPiMagicContextRuntime(pi, db, dbPath);
+	const bootResult = await bootPiRuntimeWithDeadline<
+		ContextDatabase,
+		FailClosedReason
+	>({
+		deadlineMs: PI_BOOT_DEADLINE_MS,
+		openStorage,
+		startRuntime: (db) => startPiMagicContextRuntime(pi, db, dbPath),
+		unavailableReason,
+		deadlineReason: {
+			kind: "storage_failure",
+			cause: `Pi storage boot phase exceeded its ${PI_BOOT_DEADLINE_MS}ms deadline`,
+		},
+		registerFailClosed: (registration) => {
+			if (
+				bootConfig.config.fail_closed_blocking === false ||
+				!isCompactionEnabled(bootConfig.config)
+			) {
+				warn(
+					`Magic Context (${PI_HARNESS_KIND}) storage unavailable at ${dbPath}: ${formatFailClosedBlockingMessage(registration.reason)}. ` +
+						"fail_closed_blocking=false — degrading silently (hooks not registered).",
+				);
+				return {
+					adoptRecovered: async (recoveredDb) => {
+						try {
+							await registration.onRecovered(recoveredDb);
+							info(
+								"storage boot settled after its deadline; full Magic Context runtime installed",
+							);
+							return true;
+						} catch (error) {
+							warn(
+								`late storage adoption failed: ${error instanceof Error ? error.message : String(error)}`,
+							);
+							return false;
+						}
+					},
+				};
+			}
+			warn(
+				`Magic Context (${PI_HARNESS_KIND}) storage unavailable at ${dbPath}: ${formatFailClosedBlockingMessage(registration.reason)}`,
+			);
+			return registerPiFailClosedSurface(pi, registration);
+		},
+		report: log,
+	});
+
+	// The timed-out phase owns a caught late-adoption promise. Returning here is
+	// what releases the host extension loader; a healthy late open installs the
+	// runtime through the registered recovery surface.
+	if (bootResult.status !== "ready") return;
 }
 
 /**
@@ -966,7 +987,8 @@ async function startPiMagicContextRuntime(
 
 	// Capture boot project for initial config load and logging only. Runtime
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
-	// switches follow the active project without reloading config.
+	// switches follow the active project. Session starts invalidate their cwd's
+	// cached dependencies so changed project config is visible in the next session.
 	const projectDir = process.cwd();
 	const seenDreamerProjectIdentities = new Set<string>();
 	const dreamerRegistrationOwner = {};
@@ -988,7 +1010,7 @@ async function startPiMagicContextRuntime(
 			cwd: projectDir,
 		});
 	const promptSurfaceRuntime = createPromptSurfaceRuntime({
-		harness: "pi",
+		harness: PI_HARNESS_KIND,
 		directory: projectDir,
 		warn: (message) => warn(`config: ${message}`),
 	});
@@ -999,7 +1021,7 @@ async function startPiMagicContextRuntime(
 		"";
 	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
 	info(
-		`loaded v${PLUGIN_VERSION} | harness=pi | db=${dbPath} | ` +
+		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} | db=${dbPath} | ` +
 			`project=${projectIdentity} | dir=${projectDir}`,
 	);
 	// Pi tools are registered once per process, so this mode is intentionally
@@ -1262,6 +1284,7 @@ async function startPiMagicContextRuntime(
 			projectIdentity: current.projectIdentity,
 			registrationOwner: dreamerRegistrationOwner,
 			config: current.dreamerConfig,
+			harness: PI_HARNESS_KIND,
 			// Council finding #7: thread real embedding + memory config so
 			// dreamer can do semantic dedup AND can write memory updates.
 			// Previously hardcoded to off/false, making most dreamer tasks
@@ -1296,16 +1319,11 @@ async function startPiMagicContextRuntime(
 		// loaded via subagent-entry.ts with the
 		// `--magic-context-dreamer-actions` flag.
 		allowDreamerActions: false,
-		// ALWAYS register ctx_memory in the main entry. Pi is a single REPL that
-		// can `/cd` between projects, but tool registration happens once at boot,
-		// so gating registration on the BOOT project's memory.enabled would
-		// mismatch the per-project prompt (which re-resolves memory.enabled each
-		// pass): start in a memory-off project and switch to a memory-on one and
-		// the tool would be absent while the prompt advertises it. The tool's
-		// own per-call guard (ctx-memory.ts, getProjectEmbeddingSnapshot) refuses
-		// when the CURRENT project has memory off, so always-register is correct.
-		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
-		// the retrieval-only sidekick, a separate security concern.)
+		// Keep the definition registered so Pi can activate it in a later session
+		// after a project config flip. session_start below removes it from the
+		// active tool set when the resolved project disables memory. (The subagent
+		// entry still uses memoryToolEnabled to keep ctx_memory off the retrieval-
+		// only sidekick, a separate security concern.)
 		memoryToolEnabled: true,
 		noteToolEnabled: !isOmpHostProcess() || config.omp.tools.ctx_note,
 		protectedTags: config.protected_tags ?? 20,
@@ -1335,6 +1353,13 @@ async function startPiMagicContextRuntime(
 	);
 
 	pi.on("session_start", async (event, ctx) => {
+		// Pi emits session_start for new, resumed, and reloaded sessions. Re-read
+		// this cwd's config before setting the active tools so a memory.enabled
+		// change takes effect at the next session without restarting Pi.
+		projectDepsByDir.delete(ctx.cwd);
+		const current = resolveCurrentProjectDeps(ctx);
+		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
+
 		await handlePiCloneSessionStart(event, ctx, {
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
@@ -1364,7 +1389,7 @@ async function startPiMagicContextRuntime(
 	info(
 		bootProjectDeps.historianConfig
 			? `registered historian trigger (model=${bootProjectDeps.historianConfig.model}, executeThreshold=${formatExecuteThresholdForLog(bootProjectDeps.historianConfig.executeThresholdPercentage)})`
-			: "registered historian trigger: DISABLED (set historian.model in magic-context.jsonc)",
+			: "registered historian trigger: DISABLED (configure the active harness's historian model in magic-context.jsonc)",
 	);
 	info(
 		bootProjectDeps.autoSearchConfig.enabled
@@ -1992,9 +2017,9 @@ async function startPiMagicContextRuntime(
 
 		// Channel 2 (ceiling) nudge delivery — the Pi analog of OpenCode's
 		// event-handler delivery on terminal message.updated. The pipeline
-		// records a `pending` intent near the threshold; deliver it here at the
-		// turn boundary via sendMessage(nextTurn). The synthetic message rides
-		// with the next real user turn instead of starting a competing turn.
+		// records a `pending` intent near the threshold; deliver it here as a
+		// steer. On a busy run the host appends it at the next model boundary;
+		// on a clean idle stop triggerTurn starts the continuation immediately.
 		// Internally CAS-gated to one delivery per tail-reset cycle and no-ops
 		// unless `pending`.
 		// Fire-and-forget; never block agent_end.
@@ -2131,10 +2156,12 @@ async function startPiMagicContextRuntime(
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
-			// Channel 2 mid-turn delivery: queue a pending ceiling intent for the
-			// next real user turn. It must not steer the active turn or spawn a
-			// follow-up that races an external prompt. No-ops unless pending and
-			// revalidated; agent_end stays as the fallback delivery site.
+			// Channel 2 mid-turn delivery: steer a pending ceiling intent into the
+			// active run. The host finishes ordinary tools in this step before
+			// appending the nudge ahead of the next model call. Under oh-my-pi (OMP),
+			// an explicitly interruptible wait that is cancelled gets a paired
+			// synthetic result. No-ops unless pending and revalidated; agent_end stays
+			// as the fallback delivery site.
 			if (compactionOff) return;
 			const block = maybeChannel1ReminderForToolResult({
 				db,
@@ -2299,67 +2326,30 @@ async function startPiMagicContextRuntime(
 			warn("message_end: persist session_meta usage failed:", err);
 		}
 
-		// Overflow recovery: if Pi's assistant message ended with a
-		// provider context-overflow error (`message.errorMessage` matches
-		// a known overflow pattern), record the recovery flag in
-		// session_meta so the next transform pass treats this session as
-		// "needs emergency recovery" — historian fires immediately, drop-
-		// all-tools applies, and pressure math uses the real
-		// detected_context_limit if the error reported one.
-		//
-		// Pi populates `errorMessage` on the assistant message when the
-		// underlying API call fails (we saw exactly this pattern in the
-		// Codex `context_length_exceeded` failure that motivated this
-		// work). The provider-agnostic `detectOverflow` helper from
-		// shared core matches Anthropic, OpenAI, Codex/OpenAI, xAI,
-		// Cerebras, GitHub Copilot, OpenRouter, Ollama, vLLM, Mistral,
-		// MiniMax, Kimi, Gemini, and a generic fallback.
+		// Pi has no `session.error` event. Provider failures arrive on the assistant
+		// `message_end` payload, so classify both overflow and Fable thinking-binding
+		// failures here and persist the decision for the next context pass.
 		try {
-			if (compactionOff) return;
 			const sm = ctx.sessionManager as
 				| { getSessionId?: () => string | undefined }
 				| undefined;
 			const sessionId = sm?.getSessionId?.();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
-			const msgRaw = event.message as unknown;
-			if (!msgRaw || typeof msgRaw !== "object") return;
-			const msg = msgRaw as {
-				role?: string;
-				errorMessage?: string;
-				provider?: string;
-				model?: string;
-			};
-			if (msg.role !== "assistant") return;
-			if (
-				typeof msg.errorMessage !== "string" ||
-				msg.errorMessage.length === 0
-			) {
-				return;
-			}
-			const detection = detectOverflow(msg.errorMessage);
-			if (!detection.isOverflow) return;
-			const modelKey =
-				typeof msg.provider === "string" &&
-				typeof msg.model === "string" &&
-				msg.provider.length > 0 &&
-				msg.model.length > 0
-					? `${msg.provider}/${msg.model}`
-					: undefined;
-			recordOverflowDetected(
+			const recovery = handlePiProviderFailure({
 				db,
 				sessionId,
-				detection.reportedLimit,
-				modelKey,
-				"provider_overflow",
-				detection.reportedLimitProvenance,
-			);
-			log(
-				`[magic-context][${sessionId}] overflow detected: reportedLimit=${
-					detection.reportedLimit ?? "?"
-				} provenance=${detection.reportedLimitProvenance ?? "?"} pattern=${detection.matchedPattern ?? "?"}`,
-			);
+				message: event.message,
+				compactionOff,
+			});
+			if (recovery.kind === "overflow") {
+				log(
+					`[magic-context][${sessionId}] overflow detected: reportedLimit=${
+						recovery.reportedLimit ?? "?"
+					} provenance=${recovery.reportedLimitProvenance ?? "?"} pattern=${recovery.matchedPattern ?? "?"}`,
+				);
+			}
 		} catch (err) {
-			warn("message_end: overflow detection failed:", err);
+			warn("message_end: provider failure classification failed:", err);
 		}
 	});
 

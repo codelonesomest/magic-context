@@ -20,16 +20,60 @@ describe("Pi config resolvers", () => {
 		).toBe("60m");
 	});
 
-	it("keeps historian temperature absent unless configuration explicitly sets it", () => {
-		const omitted = MagicContextConfigSchema.parse({
-			historian: { pi: { model: "test/historian" } },
+	it("keeps historian temperature opt-in and resolves only the Pi harness block", () => {
+		const fixtures = [
+			{ temperature: undefined, expected: undefined },
+			{ temperature: 0.1, expected: 0.1 },
+			{ temperature: 0, expected: 0 },
+		] as const;
+		for (const fixture of fixtures) {
+			const config = MagicContextConfigSchema.parse({
+				historian: {
+					...(fixture.temperature !== undefined
+						? { temperature: fixture.temperature }
+						: {}),
+					opencode: { model: "open/must-not-leak" },
+					pi: { model: "pi/historian" },
+				},
+			});
+			const resolved = resolveHistorianFromConfig(config);
+			expect(resolved?.model).toBe("pi/historian");
+			expect(resolved?.temperature).toBe(fixture.expected);
+		}
+	});
+
+	it("resolves OMP overrides with Pi fallback and existing empty defaults", () => {
+		const configured = MagicContextConfigSchema.parse({
+			historian: {
+				pi: { model: "pi/historian", thinking_level: "high" },
+				omp: { model: "omp/historian", thinking_level: "auto" },
+			},
+			dreamer: {
+				pi: { model: "pi/dreamer", thinking_level: "medium" },
+				omp: { model: "omp/dreamer", thinking_level: "inherit" },
+			},
 		});
-		const explicit = MagicContextConfigSchema.parse({
-			historian: { temperature: 0.1, pi: { model: "test/historian" } },
+		expect(resolveHistorianFromConfig(configured, "omp")).toMatchObject({
+			model: "omp/historian",
+			thinkingLevel: "auto",
+		});
+		expect(resolveDreamerFromConfig(configured)?.omp).toMatchObject({
+			model: "omp/dreamer",
+			thinking_level: "inherit",
 		});
 
-		expect(resolveHistorianFromConfig(omitted)?.temperature).toBeUndefined();
-		expect(resolveHistorianFromConfig(explicit)?.temperature).toBe(0.1);
+		const piOnly = MagicContextConfigSchema.parse({
+			historian: { pi: { model: "pi/historian", thinking_level: "high" } },
+			dreamer: { pi: { model: "pi/dreamer", thinking_level: "medium" } },
+		});
+		expect(resolveHistorianFromConfig(piOnly, "omp")?.model).toBe(
+			"pi/historian",
+		);
+		expect(resolveDreamerFromConfig(piOnly)?.pi?.model).toBe("pi/dreamer");
+
+		const empty = MagicContextConfigSchema.parse({});
+		expect(resolveHistorianFromConfig(empty, "omp")).toBeUndefined();
+		expect(resolveDreamerFromConfig(empty)).toBeUndefined();
 	});
 
 	it("returns undefined for historian, dreamer, and sidekick when disabled", () => {

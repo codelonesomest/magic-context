@@ -1,6 +1,6 @@
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
-import { isMidTurn } from "./read-session-db";
+import { shouldHoldIgnoredNotification } from "./read-session-db";
 
 export interface NotificationParams {
     agent?: string;
@@ -9,6 +9,8 @@ export interface NotificationParams {
     modelId?: string;
     /** TUI toast lifetime in milliseconds (default: 5000). */
     toastDurationMs?: number;
+    /** Runs after this notification is delivered, including after a queued flush. */
+    onDelivered?: () => void;
 }
 
 export type NotificationDeliveryDisposition = "sent" | "queued" | "skipped" | "failed";
@@ -30,7 +32,15 @@ interface QueuedIgnoredNotification {
 
 const queuedIgnoredNotifications = new Map<string, QueuedIgnoredNotification[]>();
 const flushingIgnoredNotifications = new Set<string>();
-let midTurnDetector = (sessionId: string): boolean => isMidTurn(undefined, sessionId);
+let midTurnDetector = (sessionId: string): boolean => shouldHoldIgnoredNotification(sessionId);
+let notificationServerUrl: string | undefined;
+let noticeDeleter: ((sessionId: string, messageId: string) => Promise<boolean>) | undefined;
+let notificationDiagnosticObserverForTests: ((message: string) => void) | undefined;
+
+function notificationDiagnostic(sessionId: string, message: string): void {
+    notificationDiagnosticObserverForTests?.(message);
+    sessionLog(sessionId, message);
+}
 
 function queueIgnoredNotification(notification: QueuedIgnoredNotification): void {
     const queued = queuedIgnoredNotifications.get(notification.sessionId) ?? [];
@@ -43,6 +53,17 @@ function queueIgnoredNotification(notification: QueuedIgnoredNotification): void
         );
     }
     queuedIgnoredNotifications.set(notification.sessionId, queued);
+}
+
+function holdIgnoredNotification(
+    notification: QueuedIgnoredNotification,
+    checkpoint: "before target checks" | "during target checks" | "before append",
+): void {
+    queueIgnoredNotification(notification);
+    notificationDiagnostic(
+        notification.sessionId,
+        `ignored notification held ${checkpoint} (session active); queued`,
+    );
 }
 
 async function trySendTuiToast(
@@ -88,18 +109,41 @@ export const __ignoredNotificationTest = {
     reset(): void {
         queuedIgnoredNotifications.clear();
         flushingIgnoredNotifications.clear();
-        midTurnDetector = (sessionId: string): boolean => isMidTurn(undefined, sessionId);
+        midTurnDetector = (sessionId: string): boolean => shouldHoldIgnoredNotification(sessionId);
+        notificationServerUrl = undefined;
+        noticeDeleter = undefined;
+        notificationDiagnosticObserverForTests = undefined;
     },
     setMidTurnDetector(detector: (sessionId: string) => boolean): void {
         midTurnDetector = detector;
     },
+    setNoticeDeleter(deleter: (sessionId: string, messageId: string) => Promise<boolean>): void {
+        noticeDeleter = deleter;
+    },
+    setDiagnosticObserver(observer: (message: string) => void): void {
+        notificationDiagnosticObserverForTests = observer;
+    },
 };
+
+/** OpenCode HTTP origin used to DELETE a notice row that lost the append race. */
+export function setNotificationServerUrl(url: string | undefined): void {
+    notificationServerUrl =
+        typeof url === "string" && url.length > 0 ? url.replace(/\/$/, "") : undefined;
+}
 
 interface NotificationClient {
     session?: {
         prompt?: (opts: unknown) => unknown | Promise<unknown>;
         promptAsync?: (opts: unknown) => Promise<unknown>;
     };
+}
+
+function notifyDelivered(sessionId: string, params: NotificationParams): void {
+    try {
+        params.onDelivered?.();
+    } catch (error: unknown) {
+        sessionLog(sessionId, "notification delivery callback failed:", getErrorMessage(error));
+    }
 }
 
 function hasNotificationSessionClient(client: unknown): client is NotificationClient {
@@ -155,7 +199,10 @@ async function sendIgnoredMessageNow(
     // A final active-run check closes the window created by the title/context
     // lookups below. The normal caller checks before entering this function too.
     if (midTurnDetector(sessionId)) {
-        queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
+        holdIgnoredNotification(
+            { client, sessionId, text, params, forcePersist },
+            "during target checks",
+        );
         return "queued";
     }
 
@@ -174,7 +221,10 @@ async function sendIgnoredMessageNow(
     // active run that began during title lookup or prompt-context resolution
     // from receiving a new user row.
     if (midTurnDetector(sessionId)) {
-        queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
+        holdIgnoredNotification(
+            { client, sessionId, text, params, forcePersist },
+            "during target checks",
+        );
         return "queued";
     }
 
@@ -221,7 +271,7 @@ async function sendIgnoredMessageNow(
     // The context lookup above can yield to a newly started run. Check directly
     // before the SDK call so the final mutation gate covers that last window too.
     if (midTurnDetector(sessionId)) {
-        queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
+        holdIgnoredNotification({ client, sessionId, text, params, forcePersist }, "before append");
         return "queued";
     }
 
@@ -246,21 +296,126 @@ async function sendIgnoredMessageNow(
     };
 
     try {
+        let result: unknown;
         if (typeof c.session?.prompt === "function") {
-            await Promise.resolve(c.session.prompt(input));
-            return "sent";
+            result = await Promise.resolve(c.session.prompt(input));
+        } else if (typeof c.session?.promptAsync === "function") {
+            result = await c.session.promptAsync(input);
+        } else {
+            sessionLog(sessionId, "session prompt API unavailable for notification");
+            return "failed";
         }
-        if (typeof c.session?.promptAsync === "function") {
-            await c.session.promptAsync(input);
-            return "sent";
+        const messageId = extractPromptedMessageId(result);
+        if (
+            await revertNoticeIfUnsafe({
+                client,
+                sessionId,
+                text,
+                params,
+                forcePersist,
+                messageId,
+            })
+        ) {
+            return "queued";
         }
-        sessionLog(sessionId, "session prompt API unavailable for notification");
-        return "failed";
+        notifyDelivered(sessionId, params);
+        return "sent";
     } catch (error: unknown) {
         const msg = getErrorMessage(error);
         sessionLog(sessionId, "failed to send notification:", msg);
         return "failed";
     }
+}
+
+function extractPromptedMessageId(result: unknown): string | undefined {
+    if (result === null || typeof result !== "object") return undefined;
+    const root = result as Record<string, unknown>;
+    const data =
+        root.data !== null && typeof root.data === "object"
+            ? (root.data as Record<string, unknown>)
+            : root;
+    const info =
+        data.info !== null && typeof data.info === "object"
+            ? (data.info as Record<string, unknown>)
+            : data;
+    return typeof info.id === "string" && info.id.length > 0 ? info.id : undefined;
+}
+
+function getServerAuth(): string | undefined {
+    const password = process.env.OPENCODE_SERVER_PASSWORD;
+    if (!password) return undefined;
+    const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
+    return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
+}
+
+async function deleteNoticeMessage(sessionId: string, messageId: string): Promise<boolean> {
+    if (noticeDeleter) return noticeDeleter(sessionId, messageId);
+    if (!notificationServerUrl) {
+        sessionLog(sessionId, "cannot roll back notice: no server URL for session.message.delete");
+        return false;
+    }
+    const url = `${notificationServerUrl}/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`;
+    try {
+        const auth = getServerAuth();
+        const response = await fetch(url, {
+            method: "DELETE",
+            headers: auth ? { Authorization: auth } : {},
+            signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) {
+            sessionLog(
+                sessionId,
+                `notice rollback DELETE failed status=${response.status} url=${url}`,
+            );
+            return false;
+        }
+        return true;
+    } catch (error: unknown) {
+        sessionLog(sessionId, "notice rollback DELETE error:", getErrorMessage(error));
+        return false;
+    }
+}
+
+async function revertNoticeIfUnsafe(notification: {
+    client: unknown;
+    sessionId: string;
+    text: string;
+    params: NotificationParams;
+    forcePersist: boolean;
+    messageId: string | undefined;
+}): Promise<boolean> {
+    // Re-read the hold predicate after the write. If a run started or an
+    // unanswered real user prompt exists, our row must not remain the newest
+    // user message: OpenCode's loop-exit check uses MessageV2.latest without
+    // filtering ignored/noReply rows. Prefer a lost notice over a phantom turn.
+    if (!midTurnDetector(notification.sessionId)) return false;
+    if (notification.messageId) {
+        const deleted = await deleteNoticeMessage(notification.sessionId, notification.messageId);
+        if (deleted) {
+            notificationDiagnostic(
+                notification.sessionId,
+                `notice rolled back (deleted row ${notification.messageId}); queued for idle delivery`,
+            );
+        } else {
+            sessionLog(
+                notification.sessionId,
+                "failed to roll back a notice that landed while a run was active",
+            );
+        }
+    } else {
+        sessionLog(
+            notification.sessionId,
+            "notice landed while a run was active but the new row id was not returned",
+        );
+    }
+    queueIgnoredNotification({
+        client: notification.client,
+        sessionId: notification.sessionId,
+        text: notification.text,
+        params: notification.params,
+        forcePersist: notification.forcePersist,
+    });
+    return true;
 }
 
 export async function sendIgnoredMessage(
@@ -275,13 +430,19 @@ export async function sendIgnoredMessage(
     forcePersist = false,
 ): Promise<NotificationDeliveryDisposition> {
     // TUI notifications are already out-of-band and do not create a user row.
-    if (await trySendTuiToast(sessionId, text, params, forcePersist)) return "sent";
+    if (await trySendTuiToast(sessionId, text, params, forcePersist)) {
+        notifyDelivered(sessionId, params);
+        return "sent";
+    }
 
     // OpenCode's MessageV2.latest is role-based and treats an ignored-only user
     // row as the latest user turn. Do not create that invisible chronology entry
-    // while the read-only DB signal says the assistant is still mid-turn.
+    // while a run is in flight or an unanswered real prompt exists.
     if (midTurnDetector(sessionId)) {
-        queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
+        holdIgnoredNotification(
+            { client, sessionId, text, params, forcePersist },
+            "before target checks",
+        );
         return "queued";
     }
 

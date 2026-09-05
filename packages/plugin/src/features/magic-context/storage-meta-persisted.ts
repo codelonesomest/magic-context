@@ -13,6 +13,7 @@ import type { ContextUsage } from "./types";
 const emergencyRecoveryArmedSessions = new Set<string>();
 const emergencyRecoveryArmedAtBySession = new Map<string, number>();
 const providerOverflowReconfirmedSessions = new Set<string>();
+const providerOverflowKnownLimitSessions = new Set<string>();
 
 export function isEmergencyRecoveryArmed(sessionId: string): boolean {
     return emergencyRecoveryArmedSessions.has(sessionId);
@@ -20,6 +21,13 @@ export function isEmergencyRecoveryArmed(sessionId: string): boolean {
 
 export function isProviderOverflowReconfirmed(sessionId: string): boolean {
     return providerOverflowReconfirmedSessions.has(sessionId);
+}
+
+export function isProviderOverflowFailClosedProven(sessionId: string): boolean {
+    return (
+        providerOverflowKnownLimitSessions.has(sessionId) ||
+        providerOverflowReconfirmedSessions.has(sessionId)
+    );
 }
 
 export function getEmergencyRecoveryArmedAt(sessionId: string): number | null {
@@ -30,6 +38,7 @@ export function resetEmergencyRecoveryRegistryForTest(): void {
     emergencyRecoveryArmedSessions.clear();
     emergencyRecoveryArmedAtBySession.clear();
     providerOverflowReconfirmedSessions.clear();
+    providerOverflowKnownLimitSessions.clear();
 }
 
 interface PersistedUsageRow {
@@ -2004,6 +2013,9 @@ export function recordOverflowDetected(
     // Arm before the durable write so an unreadable or failed write remains fail-closed.
     emergencyRecoveryArmedSessions.add(sessionId);
     emergencyRecoveryArmedAtBySession.set(sessionId, Date.now());
+    if (origin === "provider_overflow" && typeof reportedLimit === "number" && reportedLimit > 0) {
+        providerOverflowKnownLimitSessions.add(sessionId);
+    }
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         const prior = db
@@ -2079,6 +2091,7 @@ export function clearEmergencyRecovery(db: Database, sessionId: string): void {
     emergencyRecoveryArmedSessions.delete(sessionId);
     emergencyRecoveryArmedAtBySession.delete(sessionId);
     providerOverflowReconfirmedSessions.delete(sessionId);
+    providerOverflowKnownLimitSessions.delete(sessionId);
 }
 
 /**
@@ -2165,25 +2178,82 @@ export function setPersistedCompactionMarkerState(
 
 // ── Stripped placeholder message IDs ──
 
+/**
+ * A session may retain seam decisions while a deferred marker catches up, but
+ * the durable blob must not grow without limit when removal events are missed.
+ */
+export const MAX_STRIPPED_PLACEHOLDER_IDS = 4096;
+
+interface StrippedPlaceholderState {
+    ids: string[];
+    hiddenSeamIds: string[];
+}
+
+function parseStrippedPlaceholderState(raw: string | null | undefined): StrippedPlaceholderState {
+    if (!raw || raw.length === 0) return { ids: [], hiddenSeamIds: [] };
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+            return {
+                ids: parsed.filter((value): value is string => typeof value === "string"),
+                hiddenSeamIds: [],
+            };
+        }
+        if (parsed && typeof parsed === "object") {
+            const state = parsed as { ids?: unknown; hiddenSeamIds?: unknown };
+            return {
+                ids: Array.isArray(state.ids)
+                    ? state.ids.filter((value): value is string => typeof value === "string")
+                    : [],
+                hiddenSeamIds: Array.isArray(state.hiddenSeamIds)
+                    ? state.hiddenSeamIds.filter(
+                          (value): value is string => typeof value === "string",
+                      )
+                    : [],
+            };
+        }
+    } catch {
+        // Intentional: corrupt JSON → treat as empty.
+    }
+    return { ids: [], hiddenSeamIds: [] };
+}
+
+function parseStrippedBlob(raw: string | null | undefined): string[] {
+    if (!raw || raw.length === 0) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed)
+            ? parsed.filter((value): value is string => typeof value === "string")
+            : [];
+    } catch {
+        return [];
+    }
+}
+
+function serializeStrippedPlaceholderState(state: StrippedPlaceholderState): string {
+    if (state.ids.length === 0) return "";
+    if (state.hiddenSeamIds.length === 0) return JSON.stringify(state.ids);
+    return JSON.stringify(state);
+}
+
 export function getStrippedPlaceholderIds(db: Database, sessionId: string): Set<string> {
     const row = db
         .prepare("SELECT stripped_placeholder_ids FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { stripped_placeholder_ids?: string } | null;
-    const raw = row?.stripped_placeholder_ids;
-    if (!raw || raw.length === 0) return new Set();
-    try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed))
-            return new Set(parsed.filter((v: unknown) => typeof v === "string"));
-    } catch {
-        // Intentional: corrupt JSON → treat as empty
-    }
-    return new Set();
+    return new Set(parseStrippedPlaceholderState(row?.stripped_placeholder_ids).ids);
+}
+
+export function getHiddenSeamPlaceholderIds(db: Database, sessionId: string): Set<string> {
+    const row = db
+        .prepare("SELECT stripped_placeholder_ids FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { stripped_placeholder_ids?: string } | null;
+    return new Set(parseStrippedPlaceholderState(row?.stripped_placeholder_ids).hiddenSeamIds);
 }
 
 export function setStrippedPlaceholderIds(db: Database, sessionId: string, ids: Set<string>): void {
     ensureSessionMetaRow(db, sessionId);
-    const json = ids.size > 0 ? JSON.stringify([...ids]) : "";
+    const bounded = [...ids].slice(-MAX_STRIPPED_PLACEHOLDER_IDS);
+    const json = bounded.length > 0 ? JSON.stringify(bounded) : "";
     db.prepare("UPDATE session_meta SET stripped_placeholder_ids = ? WHERE session_id = ?").run(
         json,
         sessionId,
@@ -2191,41 +2261,48 @@ export function setStrippedPlaceholderIds(db: Database, sessionId: string, ids: 
 }
 
 /**
- * Compare-and-swap a delta (add/remove) onto the persisted stripped-placeholder
- * set, retrying on a concurrent write so sibling OpenCode/Pi processes sharing
- * the session DB merge instead of clobbering each other's discovered IDs.
- *
- * The mutation is expressed as a delta (not a whole-set overwrite) precisely so
- * the CAS retry is meaningful: each attempt re-reads the current set, re-applies
- * `(current ∪ add) \ remove`, and CAS-writes against the exact bytes it read.
- * A whole-set overwrite would re-apply a stale-read-derived set and silently
- * undo a sibling's concurrent change.
- *
- * Returns true when the set ended in the intended state (incl. no-op), false
- * only when retries were exhausted.
+ * Compare-and-swap a delta onto persisted placeholder decisions. Hidden seam
+ * membership is stored beside the public id set so non-Anthropic replay can
+ * remove only rows that were absent from the fold wire.
  */
 export function applyStrippedPlaceholderDelta(
     db: Database,
     sessionId: string,
-    delta: { add?: Iterable<string>; remove?: Iterable<string> },
+    delta: {
+        add?: Iterable<string>;
+        remove?: Iterable<string>;
+        hiddenSeamAdd?: Iterable<string>;
+    },
 ): boolean {
     const add = delta.add ? [...delta.add] : [];
     const remove = delta.remove ? [...delta.remove] : [];
-    if (add.length === 0 && remove.length === 0) return true;
+    const hiddenSeamAdd = delta.hiddenSeamAdd ? [...delta.hiddenSeamAdd] : [];
+    if (add.length === 0 && remove.length === 0 && hiddenSeamAdd.length === 0) return true;
     ensureSessionMetaRow(db, sessionId);
 
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
         const row = db
             .prepare("SELECT stripped_placeholder_ids FROM session_meta WHERE session_id = ?")
             .get(sessionId) as { stripped_placeholder_ids?: string | null } | undefined;
-        // Keep the RAW stored value (NULL vs "") for the CAS predicate — SQLite's
-        // `IS` matches NULL and value equality alike, so we can compare against
-        // exactly what we read regardless of whether the column is NULL or "".
         const rawStored = row ? (row.stripped_placeholder_ids ?? null) : null;
-        const current = new Set<string>(parseStrippedBlob(rawStored));
+        const parsed = parseStrippedPlaceholderState(rawStored);
+        const current = new Set(parsed.ids);
+        const hiddenSeamIds = new Set(parsed.hiddenSeamIds);
         for (const id of add) current.add(id);
-        for (const id of remove) current.delete(id);
-        const nextBlob = current.size > 0 ? JSON.stringify([...current]) : "";
+        for (const id of hiddenSeamAdd) {
+            current.add(id);
+            hiddenSeamIds.add(id);
+        }
+        for (const id of remove) {
+            current.delete(id);
+            hiddenSeamIds.delete(id);
+        }
+        const boundedIds = [...current].slice(-MAX_STRIPPED_PLACEHOLDER_IDS);
+        const boundedSet = new Set(boundedIds);
+        const nextBlob = serializeStrippedPlaceholderState({
+            ids: boundedIds,
+            hiddenSeamIds: [...hiddenSeamIds].filter((id) => boundedSet.has(id)),
+        });
         if (nextBlob === (rawStored ?? "")) return true;
         const result = db
             .prepare(
@@ -2238,29 +2315,74 @@ export function applyStrippedPlaceholderDelta(
     return false;
 }
 
-function parseStrippedBlob(raw: string | null | undefined): string[] {
-    if (!raw || raw.length === 0) return [];
-    try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed))
-            return parsed.filter((v: unknown): v is string => typeof v === "string");
-    } catch {
-        // corrupt JSON → empty
-    }
-    return [];
-}
-
 export function removeStrippedPlaceholderId(
     db: Database,
     sessionId: string,
     messageId: string,
 ): boolean {
     const before = getStrippedPlaceholderIds(db, sessionId);
-    if (!before.has(messageId)) {
-        return false;
-    }
+    if (!before.has(messageId)) return false;
     applyStrippedPlaceholderDelta(db, sessionId, { remove: [messageId] });
     return true;
+}
+
+// ── State for retrying Fable 5.1 requests after a thinking-prefix binding rejection ──
+
+export const NEWEST_REASONING_BEARING_ASSISTANT = "newest_reasoning_bearing_assistant";
+export const THINKING_BINDING_RECOVERY_FROZEN_PREFIX = "binding_mismatch:";
+
+export function thinkingBindingRecoveryFrozenId(messageId: string): string {
+    return `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${messageId}`;
+}
+
+export function getThinkingBindingRecoveryTarget(db: Database, sessionId: string): string | null {
+    const row = db
+        .prepare("SELECT thinking_binding_recovery_target FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { thinking_binding_recovery_target?: string | null } | undefined;
+    const target = row?.thinking_binding_recovery_target;
+    return typeof target === "string" && target.length > 0 ? target : null;
+}
+
+/**
+ * Persist the provider-supplied assistant id. When no id is available, store a
+ * marker that makes the next live transform select the newest assistant that
+ * still contains reasoning.
+ */
+export function armThinkingBindingRecovery(
+    db: Database,
+    sessionId: string,
+    messageId?: string,
+): void {
+    ensureSessionMetaRow(db, sessionId);
+    const target =
+        typeof messageId === "string" && messageId.length > 0
+            ? messageId
+            : NEWEST_REASONING_BEARING_ASSISTANT;
+    if (target === NEWEST_REASONING_BEARING_ASSISTANT) {
+        // A later session.error without an id must not replace a more precise id
+        // already captured from message.updated or the provider error body.
+        db.prepare(
+            "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ? AND COALESCE(thinking_binding_recovery_target, '') = ''",
+        ).run(target, sessionId);
+        return;
+    }
+    db.prepare(
+        "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ?",
+    ).run(target, sessionId);
+}
+
+/** Clear only the flag this live pass actually applied; a concurrent re-arm wins. */
+export function clearThinkingBindingRecoveryIf(
+    db: Database,
+    sessionId: string,
+    expectedTarget: string,
+): boolean {
+    const result = db
+        .prepare(
+            "UPDATE session_meta SET thinking_binding_recovery_target = '' WHERE session_id = ? AND thinking_binding_recovery_target = ?",
+        )
+        .run(sessionId, expectedTarget);
+    return result.changes > 0;
 }
 
 // ── Merged-assistant reasoning stripped IDs (frozen replay watermark) ──
@@ -2367,7 +2489,11 @@ export function getTrailingBlankDecisions(
     return parseTrailingBlankDecisions(row?.trailing_blank_decisions);
 }
 
-/** Persist new decisions, optionally refreshing the still-live newest assistant. */
+/**
+ * Persist new decisions, optionally refreshing the still-live newest assistant.
+ * A persisted strip is absorbing; only keep decisions may refresh their count or
+ * demote to strip.
+ */
 export function addTrailingBlankDecisions(
     db: Database,
     sessionId: string,
@@ -2389,7 +2515,9 @@ export function addTrailingBlankDecisions(
             const currentDecision = current.get(id);
             if (
                 currentDecision === undefined ||
-                (id === options?.overwriteMessageId && currentDecision !== decision)
+                (id === options?.overwriteMessageId &&
+                    currentDecision !== decision &&
+                    currentDecision !== "strip")
             ) {
                 current.set(id, decision);
                 changed = true;
@@ -2687,7 +2815,8 @@ export function clearPendingCompactionMarkerStateIf(
  * Stored with `stableStringify` so CAS clear can compare byte-for-byte.
  */
 export interface PendingPiCompactionMarker {
-    firstKeptEntryId: string;
+    /** Null until a later Pi context projection exposes a replayable kept entry. */
+    firstKeptEntryId: string | null;
     endMessageId: string;
     ordinal: number;
     tokensBefore: number;
@@ -2699,7 +2828,8 @@ function isPendingPiCompactionMarker(value: unknown): value is PendingPiCompacti
     return (
         typeof value === "object" &&
         value !== null &&
-        typeof (value as { firstKeptEntryId?: unknown }).firstKeptEntryId === "string" &&
+        ((value as { firstKeptEntryId?: unknown }).firstKeptEntryId === null ||
+            typeof (value as { firstKeptEntryId?: unknown }).firstKeptEntryId === "string") &&
         typeof (value as { endMessageId?: unknown }).endMessageId === "string" &&
         typeof (value as { ordinal?: unknown }).ordinal === "number" &&
         typeof (value as { tokensBefore?: unknown }).tokensBefore === "number" &&

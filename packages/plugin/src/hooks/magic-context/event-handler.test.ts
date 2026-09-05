@@ -5,12 +5,16 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { recordMessageFtsRowid } from "../../features/magic-context/message-fts-rowid-map";
 import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
 } from "../../features/magic-context/message-index-async";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
+    applyStrippedPlaceholderDelta,
     closeDatabase,
+    getHiddenSeamPlaceholderIds,
     getHistorianFailureState,
     getMaxCompressionDepth,
     getOrCreateSessionMeta,
@@ -19,7 +23,9 @@ import {
     incrementCompressionDepth,
     incrementHistorianFailure,
     insertTag,
+    markSessionCleanupPending,
     openDatabase,
+    retryPendingRustSessionCleanupsForProject,
     retryPendingSessionCleanups,
     setStrippedPlaceholderIds,
     updateSessionMeta,
@@ -30,6 +36,7 @@ import {
     getAutoSearchHintDecisions,
     getNoteNudgeAnchors,
     getPersistedNoteNudge,
+    getThinkingBindingRecoveryTarget,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
     normalizeMaterializeReason,
@@ -40,6 +47,7 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
+import { createEventHandler as createPluginEventHandler } from "../../plugin/event";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createEventHandler } from "./event-handler";
 
@@ -117,6 +125,20 @@ function waitForTimers(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function deferred<T = void>(): {
+    promise: Promise<T>;
+    resolve: (value?: T | PromiseLike<T>) => void;
+    reject: (reason?: unknown) => void;
+} {
+    let resolve!: (value?: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = (value) => res(value as T | PromiseLike<T>);
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
 function createDeps(contextUsageMap: Map<string, ContextUsageCacheEntry>) {
     return {
         contextUsageMap,
@@ -161,6 +183,56 @@ function providersClient(limit: number, prompt?: ReturnType<typeof mock>) {
 }
 
 describe("createEventHandler", () => {
+    it("arms documented Fable 5.1 binding mismatch recovery and ignores other models", async () => {
+        useTempDataHome("context-event-thinking-binding-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        const error = {
+            status: 400,
+            error: {
+                type: "invalid_request_error",
+                message:
+                    'messages.4.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".',
+            },
+        };
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "failed-shell",
+                        role: "assistant",
+                        sessionID: "ses-fable-51",
+                        providerID: "anthropic",
+                        modelID: "fable-5-1-20260831",
+                        error,
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-fable-51")).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "other-failed-shell",
+                        role: "assistant",
+                        sessionID: "ses-other-model",
+                        providerID: "anthropic",
+                        modelID: "fable-5-0",
+                        error,
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-other-model")).toBeNull();
+    });
+
     it("normalizes transform decision reasons across harnesses", () => {
         expect(normalizeMaterializeReason("opencode", "system_hash", true)).toBe("system_hash");
         expect(normalizeMaterializeReason("opencode", null, true)).toBe("pressure_refold");
@@ -898,11 +970,12 @@ describe("createEventHandler", () => {
         const deps = createDeps(new Map());
         const handler = createEventHandler(deps);
         insertTag(deps.db, "ses-delete-retry", "m-1", "message", 100, 1);
-        deps.db
+        const privateRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'm-1', 'user', 'private bytes')",
             )
-            .run("ses-delete-retry");
+            .run("ses-delete-retry") as { lastInsertRowid: number | bigint };
+        recordMessageFtsRowid(deps.db, "ses-delete-retry", 1, privateRow.lastInsertRowid);
         deps.db
             .prepare(
                 "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at) VALUES (?, 1, ?)",
@@ -952,6 +1025,259 @@ describe("createEventHandler", () => {
         ).toEqual({ count: 0 });
     });
 
+    it("keeps a failed Rust deletion durable until a project-scoped retry succeeds", async () => {
+        useTempDataHome("context-event-rust-delete-retry-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-retry";
+        const projectPath = "git:rust-delete-retry";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        const onSessionDeleted = mock(async () => {
+            throw new Error("module unavailable");
+        });
+        const handler = createEventHandler({
+            ...deps,
+            onSessionDeleted,
+            rustSessionCleanup: true,
+        });
+
+        await handler({
+            event: {
+                type: "session.deleted",
+                properties: { info: { id: sessionId } },
+            },
+        });
+
+        expect(onSessionDeleted).toHaveBeenCalledWith(sessionId);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(retryPendingSessionCleanups(deps.db)).toEqual({
+            attempted: 0,
+            cleared: 0,
+            failedSessionIds: [],
+        });
+
+        // A replay after cleanup switches to TypeScript must preserve the pending
+        // Rust marker and host rows until module-owned state is deleted.
+        const flippedHandler = createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        });
+        await flippedHandler({
+            event: {
+                type: "session.deleted",
+                properties: { info: { id: sessionId } },
+            },
+        });
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+
+        const deleteSession = mock(async () => {});
+        await expect(
+            retryPendingRustSessionCleanupsForProject(deps.db, projectPath, deleteSession),
+        ).resolves.toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+        expect(deleteSession).toHaveBeenCalledWith(sessionId);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("preserves a failed Rust cleanup across TS → Rust → TS double flips", async () => {
+        useTempDataHome("context-event-rust-delete-double-flip-ts-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-double-flip-ts";
+        const projectPath = "git:rust-double-flip-ts";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        markSessionCleanupPending(deps.db, sessionId, true);
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(async () => {
+                throw new Error("module unavailable");
+            }),
+            rustSessionCleanup: true,
+        })(event);
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        await retryPendingRustSessionCleanupsForProject(deps.db, projectPath, async () => {});
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
+    it("preserves a failed Rust cleanup across Rust → TS → Rust double flips", async () => {
+        useTempDataHome("context-event-rust-delete-double-flip-rust-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-double-flip-rust";
+        const projectPath = "git:rust-double-flip-rust";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+        const failRustDelete = () =>
+            createEventHandler({
+                ...deps,
+                onSessionDeleted: mock(async () => {
+                    throw new Error("module unavailable");
+                }),
+                rustSessionCleanup: true,
+            })(event);
+
+        await failRustDelete();
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+        await failRustDelete();
+
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        await retryPendingRustSessionCleanupsForProject(deps.db, projectPath, async () => {});
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
+    it("serializes the durable outcome of two concurrent session.deleted deliveries", async () => {
+        useTempDataHome("context-event-rust-delete-concurrent-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-concurrent";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        const first = deferred<void>();
+        const second = deferred<void>();
+        let calls = 0;
+        const handler = createEventHandler({
+            ...deps,
+            rustSessionCleanup: true,
+            onSessionDeleted: mock(() => (calls++ === 0 ? first.promise : second.promise)),
+        });
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        const firstDelivery = handler(event);
+        const secondDelivery = handler(event);
+        await Promise.resolve();
+        expect(calls).toBe(2);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        first.reject(new Error("first module delete failed"));
+        second.resolve();
+        await Promise.all([firstDelivery, secondDelivery]);
+
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("serializes two same-tick session.deleted events through the plugin event bus", async () => {
+        useTempDataHome("context-event-bus-rust-delete-concurrent-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-event-bus-concurrent";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        const first = deferred<void>();
+        const second = deferred<void>();
+        let calls = 0;
+        const magicEvent = createEventHandler({
+            ...deps,
+            rustSessionCleanup: true,
+            onSessionDeleted: mock(() => (calls++ === 0 ? first.promise : second.promise)),
+        });
+        const eventBus = createPluginEventHandler({
+            magicContext: { event: magicEvent as never },
+        });
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        const firstDelivery = eventBus(event as never);
+        const secondDelivery = eventBus(event as never);
+        await Promise.resolve();
+        expect(calls).toBe(2);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        first.reject(new Error("first module delete failed"));
+        second.resolve();
+        await Promise.all([firstDelivery, secondDelivery]);
+
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("keeps host rows while a delete races the project-scoped Rust retry", async () => {
+        useTempDataHome("context-event-rust-delete-timer-race-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-timer-race";
+        const projectPath = "git:rust-delete-timer-race";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        markSessionCleanupPending(deps.db, sessionId, true);
+        const retryDelete = deferred<void>();
+        const retry = retryPendingRustSessionCleanupsForProject(
+            deps.db,
+            projectPath,
+            () => retryDelete.promise,
+        );
+        await Promise.resolve();
+
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })({
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+
+        retryDelete.resolve();
+        await expect(retry).resolves.toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
     it("cleans up removed-message tags and indexed content", async () => {
         useTempDataHome("context-event-message-removed-tags-");
         const deps = createDeps(new Map());
@@ -960,16 +1286,22 @@ describe("createEventHandler", () => {
         insertTag(deps.db, "ses-removed", "msg-removed:p0", "message", 32, 1);
         insertTag(deps.db, "ses-removed", "msg-removed:file1", "file", 48, 2);
         insertTag(deps.db, "ses-removed", "msg-keep:p0", "message", 64, 3);
-        deps.db
+        const removedRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             )
-            .run("ses-removed", 1, "msg-removed", "assistant", "removed");
-        deps.db
+            .run("ses-removed", 1, "msg-removed", "assistant", "removed") as {
+            lastInsertRowid: number | bigint;
+        };
+        recordMessageFtsRowid(deps.db, "ses-removed", 1, removedRow.lastInsertRowid);
+        const keptRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             )
-            .run("ses-removed", 2, "msg-keep", "assistant", "keep");
+            .run("ses-removed", 2, "msg-keep", "assistant", "keep") as {
+            lastInsertRowid: number | bigint;
+        };
+        recordMessageFtsRowid(deps.db, "ses-removed", 2, keptRow.lastInsertRowid);
         deps.db
             .prepare(
                 "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at) VALUES (?, ?, ?)",
@@ -1098,7 +1430,10 @@ describe("createEventHandler", () => {
         const deps = createDeps(new Map());
         const handler = createEventHandler(deps);
 
-        setStrippedPlaceholderIds(deps.db, "ses-stripped", new Set(["msg-keep", "msg-removed"]));
+        setStrippedPlaceholderIds(deps.db, "ses-stripped", new Set(["msg-keep"]));
+        applyStrippedPlaceholderDelta(deps.db, "ses-stripped", {
+            hiddenSeamAdd: ["msg-removed"],
+        });
 
         await handler({
             event: {
@@ -1110,6 +1445,7 @@ describe("createEventHandler", () => {
         expect(getStrippedPlaceholderIds(openDatabase(), "ses-stripped")).toEqual(
             new Set(["msg-keep"]),
         );
+        expect(getHiddenSeamPlaceholderIds(openDatabase(), "ses-stripped")).toEqual(new Set());
     });
 
     it("is a no-op for removed messages with no persisted references", async () => {

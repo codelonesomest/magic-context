@@ -71,13 +71,37 @@ describe("sendIgnoredMessage", () => {
 
     it("queues without creating a user row while the session is active", async () => {
         const session = titledClientWithLastTurn();
+        const diagnostics: string[] = [];
         __ignoredNotificationTest.setMidTurnDetector(() => true);
+        __ignoredNotificationTest.setDiagnosticObserver((message) => diagnostics.push(message));
 
         const result = await sendIgnoredMessage({ session }, "ses-active", "background status", {});
 
         expect(result).toBe("queued");
         expect(session.prompt).not.toHaveBeenCalled();
         expect(__ignoredNotificationTest.pendingTexts("ses-active")).toEqual(["background status"]);
+        expect(diagnostics).toEqual([
+            "ignored notification held before target checks (session active); queued",
+        ]);
+    });
+
+    it("runs delivery callbacks only when a queued notice is actually sent", async () => {
+        const session = titledClientWithLastTurn();
+        let active = true;
+        const onDelivered = mock(() => {});
+        __ignoredNotificationTest.setMidTurnDetector(() => active);
+
+        const result = await sendIgnoredMessage({ session }, "ses-callback", "callback status", {
+            onDelivered,
+        });
+
+        expect(result).toBe("queued");
+        expect(onDelivered).not.toHaveBeenCalled();
+
+        active = false;
+        await flushIgnoredMessages("ses-callback");
+
+        expect(onDelivered).toHaveBeenCalledTimes(1);
     });
 
     it("flushes queued notices in order after the session becomes idle", async () => {
@@ -167,6 +191,35 @@ describe("sendIgnoredMessage", () => {
         expect(body.agent).toBe("build");
         expect(body.model).toEqual({ providerID: "anthropic", modelID: "claude-opus-4-8" });
         expect(body.variant).toBe("thinking");
+    });
+
+    it("rolls back a notice that lands after a run starts and re-queues it", async () => {
+        const session = titledClientWithLastTurn();
+        const observedRows = new Set(["msg_notice"]);
+        const diagnostics: string[] = [];
+        let hold = false;
+        __ignoredNotificationTest.setMidTurnDetector(() => hold);
+        __ignoredNotificationTest.setDiagnosticObserver((message) => diagnostics.push(message));
+        const deleter = mock(async (_sessionId: string, messageId: string) =>
+            observedRows.delete(messageId),
+        );
+        __ignoredNotificationTest.setNoticeDeleter(deleter);
+        session.prompt = mock(async () => {
+            hold = true;
+            return { info: { id: "msg_notice" } };
+        });
+
+        const result = await sendIgnoredMessage({ session }, "ses-rollback", "late status", {});
+
+        expect(result).toBe("queued");
+        expect(observedRows.has("msg_notice")).toBe(false);
+        expect(deleter).toHaveBeenCalledTimes(1);
+        expect(deleter.mock.calls[0]?.[0]).toBe("ses-rollback");
+        expect(deleter.mock.calls[0]?.[1]).toBe("msg_notice");
+        expect(__ignoredNotificationTest.pendingTexts("ses-rollback")).toEqual(["late status"]);
+        expect(diagnostics).toEqual([
+            "notice rolled back (deleted row msg_notice); queued for idle delivery",
+        ]);
     });
 
     it("caller-supplied model/agent win over resolution", async () => {

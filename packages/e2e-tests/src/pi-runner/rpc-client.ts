@@ -18,6 +18,7 @@ import {
   childEnv,
   createPiIsolatedEnv,
   PI_CLI,
+  PI_RELOAD_EXTENSION,
   type PiIsolatedEnv,
   type PiRunnerOptions,
   writeConfigs,
@@ -241,6 +242,8 @@ export class PiRpcClient {
         "--no-extensions",
         "--extension",
         this.env.pluginDir,
+        "--extension",
+        PI_RELOAD_EXTENSION,
         "--no-skills",
         "--no-prompt-templates",
         "--no-themes",
@@ -299,6 +302,13 @@ export class PiRpcClient {
 
   getStderr(): string {
     return this.stderr;
+  }
+
+  async restart(): Promise<void> {
+    await this.shutdown();
+    this.extensionErrors.length = 0;
+    this.stderr = "";
+    await this.start();
   }
 
   async shutdown(timeoutMs = 2_000): Promise<void> {

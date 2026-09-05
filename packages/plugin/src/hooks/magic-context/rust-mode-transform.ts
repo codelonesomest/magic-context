@@ -19,17 +19,21 @@ import {
 } from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
     clearPersistedTodoSyntheticAnchor,
+    clearThinkingBindingRecoveryIf,
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
     getOverflowState,
+    getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
     isEmergencyRecoveryArmed,
+    isProviderOverflowFailClosedProven,
     isProviderOverflowReconfirmed,
     loadProtectedTailMeta,
     setPersistedTodoPermissionDenied,
@@ -49,6 +53,7 @@ import {
     type ToolAvailabilityVerdict,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
+import { isEditTool } from "./edit-marker";
 import {
     EmergencyFailClosedError,
     ENGINE_RECONNECTING_USER_MESSAGE,
@@ -90,8 +95,8 @@ import {
 } from "./module-state-sync";
 import {
     isModuleTransportGenerationChangedResult,
-    TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS,
     TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS,
+    transformColdStartExecuteTimeoutMs,
 } from "./module-transport";
 import {
     buildPagedModuleTransformPayloads,
@@ -102,12 +107,16 @@ import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
-import { runRustModePostprocess } from "./transform-postprocess-phase";
+import {
+    replayRustModeBindingMismatchStrips,
+    runRustModePostprocess,
+} from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
 
 export class MemoryAuthorityUnavailableError extends Error {
@@ -302,6 +311,8 @@ export interface RustModeTransformOptions {
     projectRoot?: string;
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
+    /** Test-only page-size override for exercising multi-page control flow with small fixtures. */
+    modulePageMaxBytes?: number;
     memorySyncRequestedSessions?: Set<string>;
     /**
      * Invoked with each project that reaches rust-mode authority preparation, so the
@@ -313,6 +324,8 @@ export interface RustModeTransformOptions {
     allowAuthorityProtocolBypassForTests?: boolean;
     /** Override only for deterministic capture scheduling in tests. */
     scheduleLkgCapture?: (capture: () => void) => void;
+    /** Override only to exercise a failure at the native-output installation boundary. */
+    installNativeMessagesForTests?: (output: { messages: unknown[] }, messages: unknown[]) => void;
     /** Override only to exercise raw-fallback estimator failures in tests. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
 }
@@ -580,9 +593,54 @@ function emptyRustPassTimings(): RustPassTimings {
     };
 }
 
+export function formatRustInputCoverageLog(args: {
+    ocInput: number;
+    markerAt: string | null;
+    covered: number;
+}): string {
+    return `rust input coverage: oc_input=${args.ocInput} marker_at=${args.markerAt ?? "none"} covered=${args.covered}`;
+}
+
+function materializedCompactionBoundary(
+    response: Record<string, unknown>,
+): import("./transform-postprocess-phase").RustMaterializedCompactionBoundary | undefined {
+    if (response.committed !== true) return undefined;
+    if (
+        typeof response.scheduler_decision !== "string" ||
+        response.scheduler_decision.toLowerCase() !== "execute"
+    ) {
+        return undefined;
+    }
+    const ordinal = response.coverage_ordinal;
+    const rowVersion = response.row_version;
+    const boundaryId = response.boundary_id;
+    if (
+        typeof ordinal !== "number" ||
+        !Number.isSafeInteger(ordinal) ||
+        ordinal < 0 ||
+        typeof rowVersion !== "number" ||
+        !Number.isSafeInteger(rowVersion) ||
+        rowVersion <= 0 ||
+        typeof boundaryId !== "string"
+    ) {
+        return undefined;
+    }
+    const separator = boundaryId.lastIndexOf("#");
+    if (separator < 1 || !/^\d+$/.test(boundaryId.slice(separator + 1))) return undefined;
+    return {
+        rowVersion,
+        ordinal,
+        endMessageId: boundaryId.slice(0, separator),
+    };
+}
+
 function formatRustPassLog(args: {
     decision: string;
     reason: string;
+    schedulerDecision?: string;
+    schedulerDeferReason?: string;
+    historianNoFire?: string;
+    historianCanonicalCause?: string;
     servedFrom: string;
     inputCount: number;
     outputCount: number;
@@ -606,7 +664,13 @@ function formatRustPassLog(args: {
     // must not be subtracted into `other` or they would hide leftover serve work.
     const unattributed = Math.max(0, args.elapsedMs - measured);
     const rowVersion = Number.isSafeInteger(args.rowVersion) ? args.rowVersion : 0;
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    const schedulerFields = args.schedulerDecision
+        ? ` scheduler=${args.schedulerDecision}${args.schedulerDeferReason ? ` defer_reason=${args.schedulerDeferReason}` : ""}`
+        : "";
+    const historianFields = args.historianCanonicalCause
+        ? ` historian_no_fire=${args.historianNoFire ?? "unknown"} canonical_cause=${args.historianCanonicalCause}`
+        : "";
+    return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields}${historianFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -1300,6 +1364,7 @@ function toolInputKeyOrders(input: unknown[]): Record<string, string[]> {
             const toolInput = kindRecord.input;
             if (
                 kindRecord.type === "tool_call" &&
+                isEditTool(typeof kindRecord.name === "string" ? kindRecord.name : undefined) &&
                 toolInput !== null &&
                 typeof toolInput === "object" &&
                 !Array.isArray(toolInput)
@@ -1428,7 +1493,7 @@ export function createRustModeTransform(
         output: { messages: unknown[] },
         sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
     ) => Promise<void>;
-    clearSession: (sessionId: string) => void;
+    clearSession: (sessionId: string) => Promise<void>;
     invalidateWireState: (sessionId: string) => void;
     getState: (sessionId: string) => Readonly<RustSessionState>;
 } {
@@ -1436,6 +1501,7 @@ export function createRustModeTransform(
     const wireCaches = new Map<string, RustWireCache>();
     const scheduleLkgCapture =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
+    const installNativeMessages = options.installNativeMessagesForTests ?? replaceMessagesInPlace;
     const rawFallbackEstimator =
         options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
@@ -1467,7 +1533,11 @@ export function createRustModeTransform(
             attemptTimeoutMs,
         );
         try {
-            return await options.moduleClient.call({ ...args, signal: controller.signal });
+            return await options.moduleClient.call({
+                ...args,
+                signal: controller.signal,
+                timeoutMs: attemptTimeoutMs,
+            });
         } finally {
             clearTimeout(timer);
         }
@@ -1556,6 +1626,12 @@ export function createRustModeTransform(
         }
         const replayModel =
             modelFromMessages(currentMessages) ?? findLastAssistantModelFromOpenCodeDb(sessionId);
+        replayRustModeBindingMismatchStrips({
+            db: deps.db,
+            sessionId,
+            messages: replay.messages as MessageLike[],
+            resolvedProviderID: replayModel?.providerID,
+        });
         const trustedReplayLimit = replayModel
             ? resolveTrustedContextLimit(replayModel.providerID, replayModel.modelID, {
                   db: deps.db,
@@ -1603,13 +1679,13 @@ export function createRustModeTransform(
     const prepareRustCapture = (
         state: RustSessionState,
         sessionId: string,
-        input: MessageLike[],
+        inputIds: readonly unknown[],
+        inputKeys: ReturnType<typeof resolveLkgModelKeys>,
         inputSnapshots: readonly MessageContentSnapshot[],
         nativeMessages: readonly unknown[],
         responseRowVersion: number,
     ): RustLkgCapturePlan | null => {
         state.lkgCaptureSequence += 1;
-        const inputIds = input.map((message) => message.info.id);
         if (
             inputIds.some((id) => typeof id !== "string") ||
             new Set(inputIds).size !== inputIds.length ||
@@ -1620,14 +1696,13 @@ export function createRustModeTransform(
         }
         const jsonPrefix = JSON.stringify(nativeMessages);
         if (typeof jsonPrefix !== "string") return null;
-        const keys = resolveLkgModelKeys(input);
         return {
             sessionId,
             inputIds: inputIds as string[],
             inputSnapshots,
             jsonPrefix,
-            modelKey: keys.modelKey,
-            providerKey: keys.providerKey,
+            modelKey: inputKeys.modelKey,
+            providerKey: inputKeys.providerKey,
             capturedAt: Date.now(),
             rowVersion: responseRowVersion,
             captureSequence: state.lkgCaptureSequence,
@@ -1697,6 +1772,10 @@ export function createRustModeTransform(
         const passStartedAt = performance.now();
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
+        const trailingBlankNewestAssistantId = [...messages]
+            .reverse()
+            .find((message) => message.info.role === "assistant")?.info.id;
         const timings = emptyRustPassTimings();
         state.passCount += 1;
         const syntheticTurn = observeSyntheticTurn(state, messages);
@@ -1712,9 +1791,21 @@ export function createRustModeTransform(
         let requestInputTokens = 0;
         let decision = "error";
         let materializeReason = "none";
+        let schedulerDecision: string | undefined;
+        let schedulerDeferReason: string | undefined;
+        let historianNoFire: string | undefined;
+        let historianCanonicalCause: string | undefined;
         let servedFrom = "none";
         let moduleElapsedMs = 0;
         let rowVersion = 0;
+        let coveredOrdinal = 0;
+        let markerAt: string | null = null;
+        try {
+            const marker = getPersistedCompactionMarkerState(deps.db, sessionId);
+            markerAt = marker?.targetEndMessageId ?? marker?.boundaryMessageId ?? null;
+        } catch {
+            // Diagnostics remain available even when the local state database is unavailable.
+        }
         let appliedAt: number | undefined;
         let emergencyFailClosed = false;
         // Parking must not hide pressure from the recovery policy. Usage is cheap to read
@@ -1761,8 +1852,10 @@ export function createRustModeTransform(
             ? transformGeometry.usable_hard > 0
             : resolvedContextLimit !== undefined && resolvedContextLimit > 0;
         emergencyFailClosed =
-            hardWallUsagePercentage(passUsageSnapshot, transformGeometry) >=
-                RUST_EMERGENCY_WALL_PCT && hasTrustedEmergencyWall;
+            isProviderOverflowFailClosedProven(sessionId) ||
+            (hardWallUsagePercentage(passUsageSnapshot, transformGeometry) >=
+                RUST_EMERGENCY_WALL_PCT &&
+                hasTrustedEmergencyWall);
         if (overflowState) {
             const detectedLimitMatchesModel =
                 overflowState.detectedContextLimitModelKey === null ||
@@ -1832,9 +1925,21 @@ export function createRustModeTransform(
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
             sessionLog(
                 sessionId,
+                formatRustInputCoverageLog({
+                    ocInput: inputCount,
+                    markerAt,
+                    covered: coveredOrdinal,
+                }),
+            );
+            sessionLog(
+                sessionId,
                 formatRustPassLog({
                     decision,
                     reason: materializeReason,
+                    schedulerDecision,
+                    schedulerDeferReason,
+                    historianNoFire,
+                    historianCanonicalCause,
                     servedFrom,
                     inputCount,
                     outputCount: output.messages.length,
@@ -1866,6 +1971,21 @@ export function createRustModeTransform(
                         : "unknown";
             servedFrom =
                 typeof response.served_from === "string" ? response.served_from : "unknown";
+            schedulerDecision =
+                typeof response.scheduler_decision === "string"
+                    ? response.scheduler_decision
+                    : undefined;
+            schedulerDeferReason =
+                typeof response.scheduler_defer_reason === "string"
+                    ? response.scheduler_defer_reason
+                    : undefined;
+            const historian = isRecord(response.historian) ? response.historian : undefined;
+            historianNoFire =
+                typeof historian?.no_fire === "string" ? historian.no_fire : undefined;
+            historianCanonicalCause =
+                typeof historian?.canonical_cause === "string"
+                    ? historian.canonical_cause
+                    : undefined;
             materializeReason =
                 typeof response.materialize_reason === "string" &&
                 response.materialize_reason.length > 0
@@ -1884,6 +2004,12 @@ export function createRustModeTransform(
                 typeof response.row_version === "number" &&
                 Number.isSafeInteger(response.row_version)
                     ? response.row_version
+                    : 0;
+            coveredOrdinal =
+                typeof response.coverage_ordinal === "number" &&
+                Number.isSafeInteger(response.coverage_ordinal) &&
+                response.coverage_ordinal >= 0
+                    ? response.coverage_ordinal
                     : 0;
             if (
                 timings &&
@@ -2416,7 +2542,15 @@ export function createRustModeTransform(
                 payload: Record<string, unknown>,
                 detail = "",
             ): Promise<TransformSeriesResult> => {
-                const pages = buildPagedModuleTransformPayloads(payload);
+                const pages = buildPagedModuleTransformPayloads(
+                    payload,
+                    options.modulePageMaxBytes,
+                );
+                const seedMessageCount = Array.isArray(payload.input)
+                    ? payload.input.length
+                    : Array.isArray(payload.messages)
+                      ? payload.messages.length
+                      : 0;
                 const paged = pages.some(
                     (entry) => typeof entry.page.transform_page_id === "string",
                 );
@@ -2433,7 +2567,7 @@ export function createRustModeTransform(
                         const attemptTimeoutMs =
                             options.moduleTimeoutMs ??
                             (attemptClass === "transform_series_execute"
-                                ? TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS
+                                ? transformColdStartExecuteTimeoutMs(seedMessageCount)
                                 : attemptClass === "transform_page_upload"
                                   ? TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS
                                   : timeoutMs);
@@ -2685,7 +2819,9 @@ export function createRustModeTransform(
                 // so the previous last-known-good (LKG) snapshot is already stale.
                 decisionUpper === "SOFT" ||
                 !explicitDecision;
+            const materializedBoundary = materializedCompactionBoundary(response);
             let appliedMessages: unknown[];
+            let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
             const applyStartedAt = performance.now();
             try {
                 // Validate and postprocess the module result before touching the caller-owned
@@ -2726,16 +2862,30 @@ export function createRustModeTransform(
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
-                    runRustModePostprocess({
+                    const postprocess = runRustModePostprocess({
                         db: deps.db,
                         sessionId,
                         messages: appliedMessages as MessageLike[],
                         projectPath: memoryProjectPath,
+                        sessionDirectory: directory,
+                        materializedBoundary,
                         fullFeatureMode: !sessionMeta.isSubagent,
                         compactionOff: deps.compactionOff,
+                        resolvedProviderID: model?.providerID,
+                        thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+                            model?.providerID,
+                            model?.modelID,
+                        ),
+                        trailingBlankSourceDecisions,
+                        trailingBlankNewestAssistantId:
+                            typeof trailingBlankNewestAssistantId === "string"
+                                ? trailingBlankNewestAssistantId
+                                : undefined,
                         tagger: deps.tagger,
                         ctxReduceAvailability: reduceAvailability,
                     });
+                    thinkingBindingRecovery = postprocess.thinkingBindingRecovery;
+                    markerAt = postprocess.markerAt;
                 }
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
@@ -2759,21 +2909,41 @@ export function createRustModeTransform(
                     });
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
+                // output.messages commonly aliases the raw input array, so preserve the entry ids
+                // before installation replaces that array with native output.
+                const lkgInputIds = messages.map((message) => message.info.id);
+                const lkgInputKeys = resolveLkgModelKeys(messages);
+                const applyReplaceStartedAt = performance.now();
+                installNativeMessages(output, appliedMessages);
+                logStage(sessionId, "apply", applyReplaceStartedAt, timings);
+                if (thinkingBindingRecovery) {
+                    const cleared = clearThinkingBindingRecoveryIf(
+                        deps.db,
+                        sessionId,
+                        thinkingBindingRecovery.flagTarget,
+                    );
+                    sessionLog(
+                        sessionId,
+                        `rust thinking binding recovery: stripped bound reasoning from assistant ${thinkingBindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+                    );
+                }
+
                 const lkgSnapshotStartedAt = performance.now();
-                // When the response changes the served bytes, discard the previous last-known-good
-                // snapshot before scheduling the new capture. Otherwise, a transport failure on the
-                // next turn could replay obsolete output.
+                // A cache-busting replacement invalidates the previous snapshot only after the
+                // replacement is installed. If installation fails, the prior LKG remains available
+                // and its replay still applies durable binding-mismatch strips.
                 if (cacheBustingPass) {
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
                 }
-                // Reuse the wire-cache field snapshots for this input. Serialize the served
-                // response here, but defer hashing so LKG work does not block installing the result.
+                // Build the capture from the installed array, then defer hashing and persistence so
+                // LKG work stays off the output-installation critical path.
                 const capturePlan = prepareRustCapture(
                     state,
                     sessionId,
-                    messages,
+                    lkgInputIds,
+                    lkgInputKeys,
                     pendingWireCache.rawContentSnapshots,
-                    appliedMessages,
+                    output.messages,
                     rowVersion,
                 );
                 let captureMode = "async";
@@ -2830,9 +3000,6 @@ export function createRustModeTransform(
                     timings,
                     `mode=${captureMode} row_version=${rowVersion}`,
                 );
-                const applyReplaceStartedAt = performance.now();
-                replaceMessagesInPlace(output, appliedMessages);
-                logStage(sessionId, "apply", applyReplaceStartedAt, timings);
             } catch (error) {
                 logStage(sessionId, "apply", applyStartedAt, timings, "failed=true");
                 try {
@@ -3046,21 +3213,28 @@ export function createRustModeTransform(
 
     return {
         run,
-        clearSession(sessionId: string): void {
+        async clearSession(sessionId: string): Promise<void> {
             const projectRoot =
                 states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
-            dropSlot(sessionId, "session-deleted");
-            states.delete(sessionId);
-            wireCaches.delete(sessionId);
-            clearCompartmentMirrorCursor(sessionId);
-            if (projectRoot && options.moduleClient.deleteSession) {
-                void options.moduleClient
-                    .deleteSession(sessionId, projectRoot)
-                    .catch((error) => {
-                        sessionLog(sessionId, "rust module session deletion failed:", error);
-                    })
-                    .finally(() => options.moduleClient.closeSession?.(sessionId));
-            } else {
+            const clearLocalState = () => {
+                dropSlot(sessionId, "session-deleted");
+                states.delete(sessionId);
+                wireCaches.delete(sessionId);
+                clearCompartmentMirrorCursor(sessionId);
+            };
+            clearLocalState();
+            try {
+                if (projectRoot && options.moduleClient.deleteSession) {
+                    await options.moduleClient.deleteSession(sessionId, projectRoot);
+                }
+            } catch (error) {
+                sessionLog(sessionId, "rust module session deletion failed:", error);
+                throw error;
+            } finally {
+                // A transform that was already running may finish while session.delete waits.
+                // Clear the state again so its completion cannot repopulate this route's
+                // wire or last-known-good state after deletion has begun.
+                clearLocalState();
                 options.moduleClient.closeSession?.(sessionId);
             }
         },
@@ -3106,6 +3280,8 @@ export const __rustModeTransformTest = {
     muralInputForWire,
     resolvedHistorianModelChain,
     formatRustPassLog,
+    formatRustInputCoverageLog,
+    materializedCompactionBoundary,
     shouldDisarmRustEmergencyRecovery,
     createRustModeTransform,
     directiveTextOf,

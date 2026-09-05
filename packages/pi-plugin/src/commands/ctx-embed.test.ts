@@ -6,6 +6,7 @@ import type {
 	EmbeddingProvider,
 	EmbeddingPurpose,
 } from "@magic-context/core/features/magic-context/memory/embedding-provider";
+import { backfillMessageFtsRowidMapBatch } from "@magic-context/core/features/magic-context/message-fts-rowid-map";
 import {
 	_resetProjectEmbeddingRegistryForTests,
 	_setTestProviderFactoryForProject,
@@ -107,6 +108,7 @@ function seedCompartments(
 			"INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
 		).run(sessionId, end, `${sessionId}-a${end}`, "assistant", `Answer ${i}.`);
 	}
+	backfillMessageFtsRowidMapBatch(db);
 }
 
 function registerEmbedding(

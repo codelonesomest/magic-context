@@ -92,7 +92,10 @@ use classify::{
 };
 use config::{derive_historian_chunk_tokens, ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
-use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
+use historian::{
+    reattach_historian_producer, run_historian_firing, HistorianNoFireCause,
+    HistorianProducerDriver,
+};
 use historian_chunk::{
     assemble_historian_firing, AssembleHistorianFiringOutcome, AssembledHistorianFiring,
     HistorianAssemblerConfig,
@@ -333,15 +336,24 @@ fn store_open_error_is_live_lease(error: &McStoreError) -> bool {
     )
 }
 
-/// The transform heartbeat is deliberately process-wide: the SDK health callback runs on
-/// the channel-0 control path and must be able to observe the data-plane lane without
-/// borrowing a handler lock or touching the store.
+/// The process-wide transform heartbeat observes the data-plane lane from the SDK's channel-0
+/// control path without touching the store. Route-lifecycle accounting uses one short registry
+/// lock so a closed request route can release its accepted dispatch even when no response
+/// consumer remains.
+#[derive(Default)]
+struct DispatchRegistry {
+    next_id: u64,
+    active: HashMap<u64, u16>,
+    closed_channels: HashSet<u16>,
+}
+
 struct DispatchHealth {
     last_dispatch_started_at_ms: AtomicU64,
     last_dispatch_completed_at_ms: AtomicU64,
     in_flight_count: AtomicU64,
     oldest_queued_at_ms: AtomicU64,
     consecutive_error_count: AtomicU64,
+    registry: OnceLock<Mutex<DispatchRegistry>>,
 }
 
 impl DispatchHealth {
@@ -352,7 +364,79 @@ impl DispatchHealth {
             in_flight_count: AtomicU64::new(0),
             oldest_queued_at_ms: AtomicU64::new(0),
             consecutive_error_count: AtomicU64::new(0),
+            registry: OnceLock::new(),
         }
+    }
+
+    fn registry(&self) -> &Mutex<DispatchRegistry> {
+        self.registry
+            .get_or_init(|| Mutex::new(DispatchRegistry::default()))
+    }
+
+    fn route_open(&self, channel: u16) {
+        self.registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed_channels
+            .remove(&channel);
+    }
+
+    fn route_gone(&self, channel: u16) {
+        let released = {
+            let mut registry = self
+                .registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.closed_channels.insert(channel);
+            let before = registry.active.len();
+            registry
+                .active
+                .retain(|_, active_channel| *active_channel != channel);
+            before.saturating_sub(registry.active.len()) as u64
+        };
+        if released > 0 {
+            let _ =
+                self.in_flight_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        Some(count.saturating_sub(released))
+                    });
+        }
+    }
+
+    fn accept(&self, channel: u16) -> Option<u64> {
+        let mut registry = self
+            .registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.closed_channels.contains(&channel) {
+            return None;
+        }
+        registry.next_id = registry.next_id.wrapping_add(1).max(1);
+        let id = registry.next_id;
+        registry.active.insert(id, channel);
+        self.in_flight_count.fetch_add(1, Ordering::Relaxed);
+        Some(id)
+    }
+
+    fn release(&self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let removed = self
+            .registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .remove(&id)
+            .is_some();
+        if removed {
+            let _ =
+                self.in_flight_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        Some(count.saturating_sub(1))
+                    });
+        }
+        removed
     }
 
     fn report(&self, now_ms: u64) -> HealthReport {
@@ -435,14 +519,18 @@ static DISPATCH_HEALTH: DispatchHealth = DispatchHealth::new();
 
 struct TransformDispatchTicket<'a> {
     health: &'a DispatchHealth,
+    channel: u16,
+    dispatch_id: AtomicU64,
     accepted: AtomicBool,
     finished: AtomicBool,
 }
 
 impl<'a> TransformDispatchTicket<'a> {
-    fn new(health: &'a DispatchHealth) -> Self {
+    fn new(health: &'a DispatchHealth, channel: u16) -> Self {
         Self {
             health,
+            channel,
+            dispatch_id: AtomicU64::new(0),
             accepted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         }
@@ -452,7 +540,10 @@ impl<'a> TransformDispatchTicket<'a> {
         if self.accepted.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.health.in_flight_count.fetch_add(1, Ordering::Relaxed);
+        let Some(id) = self.health.accept(self.channel) else {
+            return;
+        };
+        self.dispatch_id.store(id, Ordering::Release);
         self.health
             .last_dispatch_started_at_ms
             .store(now_ms().max(0) as u64, Ordering::Relaxed);
@@ -460,6 +551,10 @@ impl<'a> TransformDispatchTicket<'a> {
 
     fn finish(&self, errored: bool) {
         if !self.accepted.load(Ordering::Acquire) || self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let id = self.dispatch_id.load(Ordering::Acquire);
+        if !self.health.release(id) {
             return;
         }
         // This is the completion point, after the handler has produced its outcome. A panic
@@ -476,7 +571,6 @@ impl<'a> TransformDispatchTicket<'a> {
                 .consecutive_error_count
                 .store(0, Ordering::Relaxed);
         }
-        self.health.in_flight_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -486,9 +580,10 @@ impl Drop for TransformDispatchTicket<'_> {
             && !self.finished.load(Ordering::Acquire)
             && self.accepted.swap(false, Ordering::AcqRel)
         {
-            // A panic unwinds through this guard. Decrement the count, but do not stamp a
-            // completion: a panicking dispatch did not prove that the lane advanced.
-            self.health.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+            // A panic unwinds through this guard. Release the accepted ticket, but do not stamp
+            // a completion: a panicking dispatch did not prove that the lane advanced.
+            self.health
+                .release(self.dispatch_id.load(Ordering::Acquire));
         }
     }
 }
@@ -598,8 +693,10 @@ const STATE_SYNC_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_SYNC_SEED_COLLECTOR_TTL: Duration = Duration::from_secs(10 * 60);
 // These bounds apply to every live transform page so no session can bypass the
 // handler-wide staging budget.
-const TRANSFORM_PAGE_MAX_BYTES: usize = 512 * 1024;
-const TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 128 * 1024 * 1024;
+const SUBC_FRAME_BODY_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
+const TRANSFORM_PAGE_MAX_BYTES: usize =
+    subc_protocol::MAX_FRAME_BODY_LEN as usize - SUBC_FRAME_BODY_HEADROOM_BYTES;
+const TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 256 * 1024 * 1024;
 const TRANSFORM_PAGE_MAX_PENDING: usize = 64;
 const TRANSFORM_PAGE_MAX_ID_BYTES: usize = 128;
 const ITEM_CONTINUATION_KEY: &str = "__shadow_item_continuation";
@@ -619,6 +716,7 @@ const TRANSFORM_PAGE_ARRAY_FIELDS: [&str; 6] = [
     "ts_ck_messages",
     "normalizations",
 ];
+const TRANSFORM_PAGE_MAP_FIELDS: [&str; 1] = ["tool_input_key_orders"];
 const STATE_IMPORT_MAX_ID_BYTES: usize = 128;
 const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_IMPORT_MAX_PENDING: usize = 64;
@@ -2354,6 +2452,49 @@ impl BoundaryTokenCache {
         }
     }
 
+    fn prime_from_persisted_tags(&mut self, session_id: &str, tags: &[mc_store::McTagRow]) {
+        if self.sessions.contains_key(session_id) || tags.is_empty() {
+            return;
+        }
+        let entries = tags
+            .iter()
+            .filter_map(|tag| {
+                usize::try_from(tag.token_count).ok().map(|token_count| {
+                    (
+                        tag.block_id.clone(),
+                        BoundaryTokenCacheEntry {
+                            byte_size: tag.source_bytes.len(),
+                            content_hash: Sha256::digest(&tag.source_bytes).into(),
+                            token_count,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        let retained_bytes = boundary_token_maps_retained_bytes(entries.iter(), 0);
+        if entries.is_empty() || retained_bytes > self.max_retained_bytes {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            BoundaryTokenCacheSession {
+                retained_bytes,
+                entries: Arc::new(entries),
+                formatted_tokens: Arc::default(),
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+
     fn remove(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
@@ -2989,6 +3130,13 @@ impl ProjectionCache {
     }
 }
 
+#[derive(Clone)]
+struct RuntimeStoreError {
+    code: String,
+    message: String,
+    at_ms: i64,
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -3063,6 +3211,7 @@ pub struct McHandler {
     /// Back-compat facade callers may omit the host tool-call id. Warn once per resolved session
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
+    runtime_store_errors: Mutex<HashMap<String, RuntimeStoreError>>,
 }
 
 #[async_trait]
@@ -3163,6 +3312,44 @@ enum LiveHistorianSessionClaim {
 struct PreparedHistorianFiring {
     diagnostics: HistorianDiagnostics,
     task: HistorianFiringTask,
+}
+
+fn historian_no_fire_detail(
+    kind: &str,
+    cause: HistorianNoFireCause,
+    extra: Option<&str>,
+) -> String {
+    let suffix = extra
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(",{value}"))
+        .unwrap_or_default();
+    format!(
+        "{kind}{{raw_cause={},canonical_cause={}{suffix}}}",
+        cause.raw_cause(),
+        cause.canonical_cause(),
+    )
+}
+
+fn historian_no_fire_diagnostics(
+    no_fire: impl Into<String>,
+    detail_kind: &str,
+    cause: HistorianNoFireCause,
+    extra: Option<&str>,
+    reason: Option<String>,
+    state: String,
+    progress: Option<transform::HistorianTriggerProgress>,
+    last_failure: Option<String>,
+) -> HistorianDiagnostics {
+    HistorianDiagnostics {
+        fired: false,
+        reason,
+        no_fire: Some(no_fire.into()),
+        no_fire_detail: Some(historian_no_fire_detail(detail_kind, cause, extra)),
+        canonical_cause: Some(cause.canonical_cause().to_string()),
+        state,
+        progress,
+        last_failure,
+    }
 }
 
 enum PreparedHistorianAction {
@@ -3484,6 +3671,7 @@ impl McHandler {
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
+            runtime_store_errors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3740,6 +3928,7 @@ impl McHandler {
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
+            runtime_store_errors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3747,6 +3936,7 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, binding: SessionBinding) {
+        DISPATCH_HEALTH.route_open(channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -4095,6 +4285,7 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
+        DISPATCH_HEALTH.route_gone(channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -4123,6 +4314,10 @@ impl McHandler {
             self.scheduler_observations
                 .lock()
                 .expect("scheduler observations mutex")
+                .remove(&session);
+            self.runtime_store_errors
+                .lock()
+                .expect("runtime store errors mutex")
                 .remove(&session);
             self.state_sync_seeds
                 .lock()
@@ -4668,38 +4863,64 @@ impl McHandler {
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some(format!("state_load_failed:{e}")),
-                    state: "unknown".to_string(),
-                    progress: None,
-                    last_failure: None,
-                });
+                return PreparedHistorianAction::Complete(historian_no_fire_diagnostics(
+                    format!("state_load_failed:{e}"),
+                    "state_load_failed",
+                    HistorianNoFireCause::StateLoadFailed,
+                    None,
+                    None,
+                    "unknown".to_string(),
+                    None,
+                    None,
+                ));
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
         let last_failure = loaded.meta.historian.last_failure.clone();
         if loaded.meta.pending_rewrite.is_some() {
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some("pending_rewrite".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "pending_rewrite",
+                "pending_rewrite",
+                HistorianNoFireCause::PendingRewrite,
+                None,
+                None,
                 state,
-                progress: None,
+                None,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
+            let diagnostics = historian_no_fire_diagnostics(
+                "busy",
+                "busy",
+                HistorianNoFireCause::LiveHistorianClaimBusy,
+                None,
+                None,
+                state,
+                None,
+                last_failure,
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
             return PreparedHistorianAction::Busy {
-                diagnostics: HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some("busy".to_string()),
-                    state,
-                    progress: None,
-                    last_failure,
-                },
+                diagnostics,
                 completion,
             };
         }
@@ -4715,16 +4936,34 @@ impl McHandler {
                     now,
                 )
                 .unwrap_or("busy");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some(no_fire.to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                no_fire,
+                "restart_recovery",
+                HistorianNoFireCause::RestartRecoveryInProgress,
+                None,
+                None,
                 state,
-                progress: None,
+                None,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let boundary_build_started_at = Instant::now();
+        if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
+            self.boundary_tokens
+                .lock()
+                .expect("boundary token cache mutex")
+                .prime_from_persisted_tags(&parsed.session_id, &tags);
+        }
         let CachedBoundaryMessages {
             messages: boundary_messages,
             token_cache_hits,
@@ -4750,15 +4989,26 @@ impl McHandler {
                     "mc-module: aborting historian trigger for {}: {detail}",
                     parsed.session_id
                 );
-                self.record_no_fire(&store, &parsed.session_id, &loaded, detail);
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some(detail.to_string()),
+                let diagnostics = historian_no_fire_diagnostics(
+                    detail,
+                    detail,
+                    HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
+                    None,
+                    None,
                     state,
-                    progress: None,
+                    None,
                     last_failure,
-                });
+                );
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
+                );
+                return PreparedHistorianAction::Complete(diagnostics);
             }
             Ok(_) | Err(_) => None,
         };
@@ -4826,37 +5076,40 @@ impl McHandler {
                 protected_start_ordinal: p.protected_start_ordinal,
             });
         if !trigger.fire {
-            let reason = if loaded.meta.historian.state == HistorianPhase::Idle {
-                "trigger_false"
-            } else {
-                "busy"
-            };
-            if reason == "trigger_false" {
-                // Carry the measurement, not just the branch: a bare trigger_false is
-                // not actionable from a state dump (is the bar honestly uncrossed, or
-                // is eligible measuring zero against real content?). Sizes quantize to
-                // the nearest 1k so routine content growth keeps the change-gate
-                // effective instead of rewriting the row on every pass.
-                let detail = match trigger.progress.as_ref() {
-                    Some(p) => format!(
-                        "trigger_false{{eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}}}",
-                        (p.eligible_chunk_tokens / 1000.0).round(),
-                        (p.tail_size_bar / 1000.0).round(),
-                        (p.n_tokens / 1000.0).round(),
-                        context_limit,
-                    ),
-                    None => "trigger_false".to_string(),
-                };
-                self.record_no_fire(&store, &parsed.session_id, &loaded, &detail);
-            }
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some(reason.to_string()),
+            let cause = trigger
+                .no_fire_cause
+                .expect("a false historian trigger carries its concrete cause");
+            // Quantized measurements keep the durable change gate effective while the raw and
+            // canonical causes make each refusal branch independently diagnosable.
+            let extra = trigger.progress.as_ref().map(|p| {
+                format!(
+                    "eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}",
+                    (p.eligible_chunk_tokens / 1000.0).round(),
+                    (p.tail_size_bar / 1000.0).round(),
+                    (p.n_tokens / 1000.0).round(),
+                    context_limit,
+                )
+            });
+            let diagnostics = historian_no_fire_diagnostics(
+                "trigger_false",
+                "trigger_false",
+                cause,
+                extra.as_deref(),
+                None,
                 state,
                 progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let trigger_reason = trigger.reason.map(|r| r.as_str().to_string());
         let model_chain = parsed
@@ -4864,26 +5117,48 @@ impl McHandler {
             .as_deref()
             .unwrap_or(&cfg.model_chain);
         if model_chain.is_empty() {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "no_models");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: trigger_reason,
-                no_fire: Some("no_models".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "no_models",
+                "no_models",
+                HistorianNoFireCause::NoModels,
+                None,
+                trigger_reason,
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let Some(boundary) = trigger.boundary.clone() else {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "missing_boundary");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some("missing_boundary".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "missing_boundary",
+                "missing_boundary",
+                HistorianNoFireCause::MissingBoundary,
+                None,
+                None,
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         };
         if loaded
             .meta
@@ -4891,15 +5166,26 @@ impl McHandler {
             .failure_backoff_at_ms
             .is_some_and(|backoff_at_ms| now < backoff_at_ms)
         {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "backoff");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: trigger_reason,
-                no_fire: Some("backoff".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "backoff",
+                "backoff",
+                HistorianNoFireCause::FailureBackoff,
+                None,
+                trigger_reason,
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let live: Vec<_> = projection
             .blocks
@@ -4947,42 +5233,60 @@ impl McHandler {
         let firing = match assemble {
             Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                let raw_no_fire = format!("assemble:{reason:?}");
+                let raw_detail = format!("detail={reason:?}");
+                let diagnostics = historian_no_fire_diagnostics(
+                    raw_no_fire,
+                    "assemble",
+                    reason.cause(),
+                    Some(&raw_detail),
+                    trigger_reason,
+                    state,
+                    progress,
+                    last_failure,
+                );
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
                     &loaded,
-                    &format!("assemble:{reason:?}"),
+                    diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
                 );
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: trigger_reason,
-                    no_fire: Some(format!("assemble:{reason:?}")),
-                    state,
-                    progress: progress.clone(),
-                    last_failure,
-                });
+                return PreparedHistorianAction::Complete(diagnostics);
             }
             Err(e) => {
+                let raw_no_fire = format!("assemble_failed:{e}");
+                let raw_detail = format!("error={e}");
+                let diagnostics = historian_no_fire_diagnostics(
+                    raw_no_fire,
+                    "assemble_failed",
+                    HistorianNoFireCause::AssemblyFailed,
+                    Some(&raw_detail),
+                    trigger_reason,
+                    state,
+                    progress,
+                    last_failure,
+                );
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
                     &loaded,
-                    &format!("assemble_failed:{e}"),
+                    diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
                 );
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: trigger_reason,
-                    no_fire: Some(format!("assemble_failed:{e}")),
-                    state,
-                    progress: progress.clone(),
-                    last_failure,
-                });
+                return PreparedHistorianAction::Complete(diagnostics);
             }
         };
         let diagnostics = HistorianDiagnostics {
             fired: true,
             reason: trigger_reason,
             no_fire: None,
+            no_fire_detail: None,
+            canonical_cause: None,
             state: state.clone(),
             progress: progress.clone(),
             last_failure: last_failure.clone(),
@@ -4990,15 +5294,27 @@ impl McHandler {
         let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
             LiveHistorianSessionClaim::Acquired(live_guard) => live_guard,
             LiveHistorianSessionClaim::Busy(completion) => {
+                let busy_diagnostics = historian_no_fire_diagnostics(
+                    "busy",
+                    "busy",
+                    HistorianNoFireCause::LiveHistorianClaimBusy,
+                    None,
+                    diagnostics.reason,
+                    state,
+                    progress,
+                    last_failure,
+                );
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    busy_diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
+                );
                 return PreparedHistorianAction::Busy {
-                    diagnostics: HistorianDiagnostics {
-                        fired: false,
-                        reason: diagnostics.reason,
-                        no_fire: Some("busy".to_string()),
-                        state,
-                        progress,
-                        last_failure,
-                    },
+                    diagnostics: busy_diagnostics,
                     completion,
                 };
             }
@@ -5152,11 +5468,11 @@ impl McHandler {
         diagnostics
     }
 
-    /// Persist the skip-branch discriminant so a supervised rig can read WHY the
-    /// historian declined to fire from the state dump (the transform response's
-    /// diagnostics block never reaches disk). Change-gated: steady-state passes that
-    /// skip for the same reason write nothing, so this stays off the hot path. A CAS
-    /// conflict just drops the diagnostic; it must never fail a pass.
+    /// Persist structured skip detail so a supervised rig can read why the historian declined
+    /// to fire from the state dump (the transform response's diagnostics block never reaches
+    /// disk). Change-gated: steady-state passes with the same cause and quantized measurements
+    /// write nothing, so this stays off the hot path. A CAS conflict just drops the diagnostic;
+    /// it must never fail a pass.
     fn record_no_fire(
         &self,
         store: &McStore,
@@ -5937,6 +6253,21 @@ impl McHandler {
         }
     }
 
+    fn runtime_store_error_value(&self, session_id: &str) -> Value {
+        self.runtime_store_errors
+            .lock()
+            .expect("runtime store errors mutex")
+            .get(session_id)
+            .map(|error| {
+                json!({
+                    "code": error.code,
+                    "message": error.message,
+                    "at_ms": error.at_ms,
+                })
+            })
+            .unwrap_or(Value::Null)
+    }
+
     fn handle_session_delete_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (session_id, binding) =
             match self.management_binding(channel, request, "session.delete") {
@@ -5949,6 +6280,10 @@ impl McHandler {
         };
         match store.delete_session(&session_id, &binding.project_root.to_string_lossy()) {
             Ok(deleted_rows) => {
+                self.runtime_store_errors
+                    .lock()
+                    .expect("runtime store errors mutex")
+                    .remove(&session_id);
                 self.reattaching_sessions
                     .lock()
                     .expect("reattaching sessions mutex")
@@ -6168,6 +6503,7 @@ impl McHandler {
             // Keep the current-pass attribution separate from the explicitly historical
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
+            "runtime_store_error": self.runtime_store_error_value(&session_id),
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
                 "compaction_seen": descent_counters.compaction_seen,
@@ -7761,6 +8097,7 @@ impl McHandler {
             "publication_floor_ordinal": loaded.meta.publication_floor_ordinal,
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "pass_trace": pass_trace,
+            "runtime_store_error": self.runtime_store_error_value(session_id),
             "epochs": {
                 "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
                 "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
@@ -7778,7 +8115,7 @@ impl McHandler {
         request: Value,
         inbound_bytes: Option<usize>,
     ) -> HandlerOutcome {
-        let ticket = TransformDispatchTicket::new(&DISPATCH_HEALTH);
+        let ticket = TransformDispatchTicket::new(&DISPATCH_HEALTH, channel);
         let outcome = if has_transform_page_fields(&request) {
             self.handle_transform_page_value(channel, request, TransformLane::Authority, &ticket)
                 .await
@@ -7810,6 +8147,7 @@ impl McHandler {
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let handler_started_at = Instant::now();
+        let request_decode_started_at = Instant::now();
         let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
         let request_observed_to_handler = request
@@ -7827,6 +8165,8 @@ impl McHandler {
                 };
             }
         };
+        let request_decode_ms = request_decode_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let handler_prepare_started_at = Instant::now();
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile);
         if serializer_profile.is_none() {
             return unknown_serializer_profile_error();
@@ -8130,16 +8470,39 @@ impl McHandler {
                 "transform_failed"
             };
             let message = e.to_string();
+            if matches!(&e, crate::transform::TransformError::Store(_)) {
+                self.runtime_store_errors
+                    .lock()
+                    .expect("runtime store errors mutex")
+                    .insert(
+                        parsed.session_id.clone(),
+                        RuntimeStoreError {
+                            code: code.to_string(),
+                            message: message.clone(),
+                            at_ms: now_ms(),
+                        },
+                    );
+            }
             let _ = store.trace_pass_rejected(&parsed.session_id, &message, now_ms());
             HandlerOutcome::Error {
                 code: code.to_string(),
                 message,
             }
         };
+        let handler_prepare_ms = handler_prepare_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let transform_execute_started_at = Instant::now();
         let mut result = match run_transform() {
-            Ok(result) => result,
+            Ok(result) => {
+                self.runtime_store_errors
+                    .lock()
+                    .expect("runtime store errors mutex")
+                    .remove(&parsed.session_id);
+                result
+            }
             Err(e) => return reject_transform(e),
         };
+        let transform_execute_ms = transform_execute_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let handler_followup_started_at = Instant::now();
         let mut emergency_pre_floor =
             if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
                 store
@@ -8160,14 +8523,16 @@ impl McHandler {
         }
         let mut trigger_timings = HistorianTriggerTimings::default();
         let diagnostics = if parsed.is_subagent {
-            HistorianDiagnostics {
-                fired: false,
-                reason: Some("subagent_session".to_string()),
-                no_fire: Some("subagent_session".to_string()),
-                state: "disabled".to_string(),
-                progress: None,
-                last_failure: None,
-            }
+            historian_no_fire_diagnostics(
+                "subagent_session",
+                "subagent_session",
+                HistorianNoFireCause::SubagentSession,
+                None,
+                Some("subagent_session".to_string()),
+                "disabled".to_string(),
+                None,
+                None,
+            )
         } else if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             match self.prepare_historian_fire(
                 Arc::clone(&store),
@@ -8300,6 +8665,7 @@ impl McHandler {
                 };
             }
         }
+        let handler_followup_ms = handler_followup_started_at.elapsed().as_secs_f64() * 1_000.0;
         let post_attach_started_at = Instant::now();
         let revert_epoch = result.revert_epoch;
         let reasoning_watermark = result.reasoning_watermark;
@@ -8388,6 +8754,10 @@ impl McHandler {
         let snapshot_store_ms = snapshot_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         if let Some(timings) = response.timings.as_mut() {
             timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
+            timings.request_decode = request_decode_ms;
+            timings.handler_prepare = handler_prepare_ms;
+            timings.transform_execute = transform_execute_ms;
+            timings.handler_followup = handler_followup_ms;
             timings.request_observed_to_handler = request_observed_to_handler;
             timings.delta_expand = delta_expand_ms;
             timings.side_channel_drain = side_channel_drain_ms;
@@ -9271,6 +9641,7 @@ impl McHandler {
                         .into_iter()
                         .chain(TRANSFORM_PAGE_FIELDS)
                         .chain(TRANSFORM_PAGE_ARRAY_FIELDS)
+                        .chain(TRANSFORM_PAGE_MAP_FIELDS)
                         .any(|allowed| allowed == key.as_str())
                 })
             })
@@ -9279,10 +9650,13 @@ impl McHandler {
             return transform_page_error(
                 lane,
                 "protocol_mismatch",
-                "non-final transform pages may carry only message arrays",
+                "non-final transform pages may carry only message arrays and pageable maps",
             );
         }
-        if transform_page_content_digest(&request) != page_digest {
+        let page_digest_started_at = Instant::now();
+        let digest_matches = transform_page_content_digest(&request) == page_digest;
+        let page_digest_ms = page_digest_started_at.elapsed().as_secs_f64() * 1_000.0;
+        if !digest_matches {
             self.discard_transform_pages(&binding.session);
             return transform_page_error(
                 lane,
@@ -9290,6 +9664,7 @@ impl McHandler {
                 "transform page content digest did not match the supplied digest",
             );
         }
+        let page_size_started_at = Instant::now();
         let page_bytes = match serde_json::to_vec(&request) {
             Ok(bytes) => bytes.len(),
             Err(error) => {
@@ -9297,6 +9672,7 @@ impl McHandler {
                 return invalid_params_error(error.to_string());
             }
         };
+        let page_size_encode_ms = page_size_started_at.elapsed().as_secs_f64() * 1_000.0;
         if page_bytes > TRANSFORM_PAGE_MAX_BYTES {
             self.discard_transform_pages(&binding.session);
             return transform_page_error(
@@ -9308,10 +9684,26 @@ impl McHandler {
         {
             let transforms = self.transform_pages.lock().expect("transform page mutex");
             if let Some(completed) = transforms.completed(&binding.session, &transform_id) {
-                if completed.generation == generation
-                    && page_complete
-                    && completed.final_digest == page_digest
-                {
+                if completed.generation != generation {
+                    return transform_page_error(
+                        lane,
+                        "digest_mismatch",
+                        "completed transform generation changed",
+                    );
+                }
+                if !page_complete {
+                    // Content-addressed attempt ids let a caller whose route disappeared
+                    // replay page admission cheaply. The final-page digest below remains
+                    // the response adoption fence; random ids from older adapters never
+                    // collide with a retained completion.
+                    return respond(json!({
+                        "ok": true,
+                        "staged": true,
+                        "next_expected_index": page_index + 1,
+                        "completed_replay": true,
+                    }));
+                }
+                if completed.final_digest == page_digest {
                     return HandlerOutcome::Response(completed.result.clone());
                 }
                 return transform_page_error(
@@ -9322,6 +9714,7 @@ impl McHandler {
             }
         }
         let queued_at_ms = now_ms().max(0) as u64;
+        let page_stage_started_at = Instant::now();
         let staged = {
             let mut transforms = self.transform_pages.lock().expect("transform page mutex");
             transforms.stage(
@@ -9337,7 +9730,18 @@ impl McHandler {
                 queued_at_ms,
             )
         };
+        let page_stage_ms = page_stage_started_at.elapsed().as_secs_f64() * 1_000.0;
         self.refresh_oldest_queued_at_ms();
+        eprintln!(
+            "mc-transform-page-timing session={} page={}/{} bytes={} digest={:.1} size_encode={:.1} stage={:.1}",
+            binding.session,
+            page_index + 1,
+            page_total,
+            page_bytes,
+            page_digest_ms,
+            page_size_encode_ms,
+            page_stage_ms,
+        );
         let action = match staged {
             Ok(action) => {
                 ticket.accept();
@@ -9380,13 +9784,27 @@ impl McHandler {
                 final_digest,
                 inbound_bytes,
             } => {
+                let page_assembly_started_at = Instant::now();
                 let assembled = match assemble_transform_pages(pages) {
                     Ok(assembled) => assembled,
-                    Err(message) => {
+                    Err(error) => {
                         self.discard_transform_pages(&binding.session);
-                        return transform_page_error(lane, "protocol_mismatch", message);
+                        let (suffix, message) = match error {
+                            TransformPageAssemblyError::ProtocolMismatch(message) => {
+                                ("protocol_mismatch", message)
+                            }
+                            TransformPageAssemblyError::DigestMismatch(message) => {
+                                ("digest_mismatch", message)
+                            }
+                        };
+                        return transform_page_error(lane, suffix, message);
                     }
                 };
+                let page_assembly_ms = page_assembly_started_at.elapsed().as_secs_f64() * 1_000.0;
+                eprintln!(
+                    "mc-transform-page-assembly session={} pages={} inbound_bytes={} assembly={:.1}",
+                    binding.session, page_total, inbound_bytes, page_assembly_ms,
+                );
                 let outcome = self
                     .handle_transform_unpaged_value(
                         channel,
@@ -11323,6 +11741,10 @@ impl McHandler {
                                     current.status_version,
                                     content,
                                     condition.map(Some),
+                                    string_arg(args, "compiled_provider"),
+                                    string_arg(args, "compiled_config"),
+                                    i64_arg(args, "compiled_at"),
+                                    string_arg(args, "compile_status"),
                                     now,
                                 )
                                 .map_err(|error| error.to_string())?
@@ -11854,6 +12276,7 @@ fn native_value_retained_bytes(value: &Value) -> usize {
 fn native_reasoning_should_clear(
     served: &transform::ServedMessage,
     request: &TransformRequest,
+    ingress_ordinals: &HashMap<&str, u64>,
     reasoning_watermark: u64,
     tag_numbers: &BTreeMap<String, u64>,
     newest_assistant_mid: Option<&str>,
@@ -11861,10 +12284,10 @@ fn native_reasoning_should_clear(
     let Some(mid) = served.meta.harness_id.as_deref() else {
         return (0, false);
     };
-    let Some(ingress) = request.messages.iter().find(|message| message.mid == mid) else {
+    let Some(ordinal) = ingress_ordinals.get(mid).copied() else {
         return (0, false);
     };
-    let tag_number = tag_numbers.get(mid).copied().unwrap_or(ingress.ordinal);
+    let tag_number = tag_numbers.get(mid).copied().unwrap_or(ordinal);
     let should_clear = served.role == "assistant"
         && !served.meta.synthetic
         && reasoning_watermark > 0
@@ -12037,6 +12460,11 @@ fn attach_native_messages_incremental(
         .collect::<Vec<_>>();
     let newest_assistant_mid =
         transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages);
+    let ingress_ordinals = request
+        .messages
+        .iter()
+        .map(|message| (message.mid.as_str(), message.ordinal))
+        .collect::<HashMap<_, _>>();
 
     let mut sidecar_hashes = cached
         .as_mut()
@@ -12086,6 +12514,7 @@ fn attach_native_messages_incremental(
         let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
             served,
             request,
+            &ingress_ordinals,
             reasoning_watermark,
             tag_numbers,
             newest_assistant_mid,
@@ -12752,10 +13181,13 @@ fn canonical_object_fields(request: &Value, fields: &[&str]) -> String {
 }
 
 fn transform_page_content_digest(request: &Value) -> String {
-    // Keep the digest's canonical object shape while borrowing page arrays. The page is
-    // subsequently consumed by assembly, so cloning these values just to hash them would
-    // duplicate the largest allocation in the request.
-    sha256_hex(canonical_object_fields(request, &TRANSFORM_PAGE_ARRAY_FIELDS).as_bytes())
+    // Hash only pageable content: scalar fields arrive on the final page, while arrays
+    // and map slices must be protected independently as each page is staged.
+    let fields = TRANSFORM_PAGE_ARRAY_FIELDS
+        .into_iter()
+        .chain(TRANSFORM_PAGE_MAP_FIELDS)
+        .collect::<Vec<_>>();
+    sha256_hex(canonical_object_fields(request, &fields).as_bytes())
 }
 
 fn transform_continuation_chunk<'a>(
@@ -12858,12 +13290,28 @@ fn assemble_transform_page_field(field: &str, values: Vec<Value>) -> Result<Vec<
     Ok(assembled)
 }
 
-fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, String> {
-    let mut final_page = pages
-        .pop()
-        .ok_or_else(|| "transform page collection was empty".to_string())?;
+#[derive(Debug)]
+enum TransformPageAssemblyError {
+    ProtocolMismatch(String),
+    DigestMismatch(String),
+}
+
+impl From<String> for TransformPageAssemblyError {
+    fn from(message: String) -> Self {
+        Self::ProtocolMismatch(message)
+    }
+}
+
+fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, TransformPageAssemblyError> {
+    let mut final_page = pages.pop().ok_or_else(|| {
+        TransformPageAssemblyError::ProtocolMismatch(
+            "transform page collection was empty".to_string(),
+        )
+    })?;
     if !final_page.is_object() {
-        return Err("transform page was not an object".to_string());
+        return Err(TransformPageAssemblyError::ProtocolMismatch(
+            "transform page was not an object".to_string(),
+        ));
     }
     if let Some(object) = final_page.as_object_mut() {
         for field in [
@@ -12890,9 +13338,45 @@ fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, String> {
         if had_field || !values.is_empty() {
             let values = assemble_transform_page_field(field, values)?;
             let Some(object) = final_page.as_object_mut() else {
-                return Err("transform page was not an object".to_string());
+                return Err(TransformPageAssemblyError::ProtocolMismatch(
+                    "transform page was not an object".to_string(),
+                ));
             };
             object.insert(field.to_string(), Value::Array(values));
+        }
+    }
+    for field in TRANSFORM_PAGE_MAP_FIELDS {
+        let had_field = final_page.get(field).is_some();
+        let mut merged = serde_json::Map::new();
+        for page in pages.iter_mut().chain(std::iter::once(&mut final_page)) {
+            let Some(object) = page.as_object_mut() else {
+                return Err(TransformPageAssemblyError::ProtocolMismatch(
+                    "transform page was not an object".to_string(),
+                ));
+            };
+            let Some(value) = object.remove(field) else {
+                continue;
+            };
+            let Value::Object(entries) = value else {
+                return Err(TransformPageAssemblyError::ProtocolMismatch(format!(
+                    "transform pageable map field {field} was not an object"
+                )));
+            };
+            for (key, value) in entries {
+                if merged.insert(key.clone(), value).is_some() {
+                    return Err(TransformPageAssemblyError::DigestMismatch(format!(
+                        "transform pageable map field {field} repeated key {key} across pages"
+                    )));
+                }
+            }
+        }
+        if had_field || !merged.is_empty() {
+            let Some(object) = final_page.as_object_mut() else {
+                return Err(TransformPageAssemblyError::ProtocolMismatch(
+                    "transform page was not an object".to_string(),
+                ));
+            };
+            object.insert(field.to_string(), Value::Object(merged));
         }
     }
     Ok(final_page)
@@ -13048,12 +13532,9 @@ fn store_unavailable_error() -> HandlerOutcome {
     }
 }
 
-const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
-/// Transform-class requests carry a session's full message array. The transport
-/// frame ceiling is 64 MiB; half that leaves headroom for envelope overhead while
-/// still admitting the largest observed live sessions (multi-MiB CK arrays with
-/// retained ingress bytes).
-const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_FACADE_FRAME_BYTES: usize =
+    subc_protocol::MAX_FRAME_BODY_LEN as usize - SUBC_FRAME_BODY_HEADROOM_BYTES;
+const MAX_TRANSFORM_FRAME_BYTES: usize = MAX_FACADE_FRAME_BYTES;
 
 /// Minimal probe deserialized from an oversized body ONLY to pick the right byte
 /// cap. serde ignores every other field, so this stays cheap relative to a full
@@ -13092,10 +13573,12 @@ fn enforce_request_byte_cap(body: &[u8]) -> Result<(), HandlerOutcome> {
             return Ok(());
         }
         return Err(invalid_params_error(
-            "request body exceeds the 32 MiB transform limit",
+            "request body exceeds the 48 MiB transform limit",
         ));
     }
-    Err(invalid_params_error("request body exceeds the 1 MiB limit"))
+    Err(invalid_params_error(
+        "request body exceeds the 48 MiB limit",
+    ))
 }
 const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
@@ -15062,6 +15545,22 @@ fn ctx_note_schema() -> Value {
 
 /// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
 /// bound sessions obtain preset-selected description text through `manifest.get`.
+/// The single-line `--version` self-report: `ck-mc <crate version> (<build sha>)`.
+/// The build sha is the same compile-time `MC_BUILD_SHA` that stamps manifest
+/// provenance, so a release train tag whose id is a prefix of that sha
+/// (`ck-mc-alpha.<short sha>`) can be checked against the placed binary by
+/// substring — the fleet's placement-acceptance contract. A bare `cargo build`
+/// prints the crate version alone rather than a fabricated sha.
+pub fn version_line() -> String {
+    match option_env!("MC_BUILD_SHA")
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+    {
+        Some(sha) => format!("ck-mc {} ({sha})", env!("CARGO_PKG_VERSION")),
+        None => format!("ck-mc {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 pub fn manifest(module_id: &str) -> ModuleManifest {
     // Constructed via the subc-protocol builder (never a struct literal): ModuleManifest is
     // #[non_exhaustive], so builder methods are the only construction path that survives additive
@@ -15104,7 +15603,19 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     // verification a queryable build identity instead of binary archaeology.
     // build_provenance is the subc-protocol library call (re-exported through
     // subc-client-rs); it normalizes sentinel/empty values to field omission.
-    .provenance(Some(build_provenance(option_env!("MC_BUILD_SHA"), None, None)))
+    // Provenance is a deploy marker, not a load-bearing capability: a
+    // non-canonical stamp (subc-protocol 0.17 requires full lowercase 40-hex;
+    // short `rev-parse --short` stamps fail its form check) must degrade to
+    // omission, never panic the module at boot. Deploy verification greps for
+    // the marker and fails loudly on absence, which is the correct failure
+    // surface for a malformed stamp.
+    .provenance(match build_provenance(option_env!("MC_BUILD_SHA"), None, None) {
+        Ok(provenance) => Some(provenance),
+        Err(err) => {
+            eprintln!("mc-module: MC_BUILD_SHA rejected by provenance form check, omitting deploy marker: {err}");
+            None
+        }
+    })
     .provides(vec![ProviderRole::ToolProvider {
         tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -15336,6 +15847,31 @@ mod tests {
             durability_class: mc_core::DurabilityClass::Lineage,
             reset_rule: String::new(),
         }
+    }
+
+    #[test]
+    fn boundary_token_cache_primes_cold_entries_from_durable_tag_tokens() {
+        let bytes = b"durable tagged block".to_vec();
+        let mut cache = BoundaryTokenCache::new(1024 * 1024);
+        cache.prime_from_persisted_tags(
+            "session",
+            &[mc_store::McTagRow {
+                tag_number: 1,
+                block_id: "m1#0".to_string(),
+                kind: "text".to_string(),
+                token_count: 37,
+                created_at_ms: 1,
+                source_bytes: bytes.clone(),
+            }],
+        );
+        let mut snapshot = cache.snapshot("session");
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(
+            snapshot.token_count("m1#0", "durable tagged block", &digest),
+            37
+        );
+        assert_eq!(snapshot.hits, 1);
+        assert_eq!(snapshot.misses, 0);
     }
 
     #[test]
@@ -15914,6 +16450,22 @@ mod tests {
     }
 
     #[test]
+    fn version_line_carries_the_build_sha_when_stamped() {
+        let line = version_line();
+        let expected_prefix = format!("ck-mc {}", env!("CARGO_PKG_VERSION"));
+        assert!(line.starts_with(&expected_prefix), "got {line}");
+        match option_env!("MC_BUILD_SHA") {
+            Some(sha) if !sha.trim().is_empty() => {
+                assert_eq!(line, format!("{expected_prefix} ({})", sha.trim()));
+                // A train tag id is a short prefix of the full sha; acceptance
+                // checks the tag id as a substring of this line.
+                assert!(line.contains(&sha.trim()[..8.min(sha.trim().len())]));
+            }
+            _ => assert_eq!(line, expected_prefix),
+        }
+    }
+
+    #[test]
     fn manifest_declares_module_id_and_storage() {
         let m = manifest("magic-context");
         assert_eq!(m.module_id, "magic-context");
@@ -15928,7 +16480,10 @@ mod tests {
         // The wire_crate_version is always present (a compile-time constant of
         // the linked subc-protocol crate); build_git_sha is present only when
         // MC_BUILD_SHA was set at compile time.
-        let provenance = m.provenance.as_ref().expect("manifest must carry provenance");
+        let provenance = m
+            .provenance
+            .as_ref()
+            .expect("manifest must carry provenance");
         assert_eq!(
             provenance.wire_crate_version.as_deref(),
             Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
@@ -16369,7 +16924,7 @@ mod tests {
     }
 
     #[test]
-    fn request_byte_cap_widens_for_transform_class_only() {
+    fn request_byte_cap_uses_the_subc_frame_budget_for_every_request_class() {
         let pad = |method: &str, key: &str, bytes: usize| {
             format!(
                 "{{\"{key}\":\"{method}\",\"pad\":\"{}\"}}",
@@ -16377,19 +16932,32 @@ mod tests {
             )
             .into_bytes()
         };
-        // Under the facade cap everything passes without parsing.
         assert!(enforce_request_byte_cap(b"{}").is_ok());
-        // Oversized transform-class bodies pass up to the transform cap.
         let two_mib = 2 * 1024 * 1024;
         assert!(enforce_request_byte_cap(&pad("transform", "kind", two_mib)).is_ok());
         assert!(enforce_request_byte_cap(&pad("state_sync", "method", two_mib)).is_ok());
-        // Oversized facade bodies still reject at 1 MiB.
-        assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
-        // Unparseable oversized bodies reject conservatively.
-        assert!(enforce_request_byte_cap(&vec![b'x'; two_mib]).is_err());
-        // The transform cap itself is still a hard ceiling.
+        assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_ok());
+        assert!(enforce_request_byte_cap(&vec![b'x'; two_mib]).is_ok());
         assert!(
             enforce_request_byte_cap(&pad("transform", "kind", MAX_TRANSFORM_FRAME_BYTES)).is_err()
+        );
+    }
+
+    #[test]
+    fn application_frame_limits_are_derived_from_subc_protocol() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/subc-frame-limits.json")).unwrap();
+        assert_eq!(
+            fixture["max_frame_body_bytes"].as_u64().unwrap() as usize,
+            subc_protocol::MAX_FRAME_BODY_LEN as usize
+        );
+        assert_eq!(
+            fixture["application_body_bytes"].as_u64().unwrap() as usize,
+            TRANSFORM_PAGE_MAX_BYTES
+        );
+        assert_eq!(
+            fixture["transform_staging_bytes"].as_u64().unwrap() as usize,
+            TRANSFORM_PAGE_MAX_STAGED_BYTES
         );
     }
 
@@ -16721,6 +17289,72 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
         (handler, store, dir, project)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_mural_write_family_is_hash_gated_and_claude_code_inherits_by_project() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let project_path = project.to_string_lossy().to_string();
+        let mural_a = "data:image/png;base64,YQ==";
+
+        let mut first = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        first["serializer_profile"] = json!("opencode-aisdk");
+        first["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": mural_a,
+            "content_hash": "mural-a",
+        });
+        let first_response = call_transform_request(&handler, first).await;
+        assert_eq!(first_response["status"], "ok", "{first_response}");
+        let artifact = store
+            .load_project_mural_artifact(&project_path)
+            .unwrap()
+            .expect("OpenCode host artifact");
+        assert_eq!(artifact.data_url, mural_a.as_bytes());
+        assert_eq!(artifact.content_hash, "mural-a");
+
+        let mut same_hash = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        same_hash["serializer_profile"] = json!("opencode-aisdk");
+        same_hash["render_config"] = json!("cfg1");
+        same_hash["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,c2FtZS1oYXNoLWRyaWZ0",
+            "content_hash": "mural-a",
+        });
+        let same_hash_response = call_transform_request(&handler, same_hash).await;
+        assert_eq!(same_hash_response["status"], "ok", "{same_hash_response}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(&project_path)
+                .unwrap()
+                .expect("hash-gated artifact"),
+            artifact,
+        );
+
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "claude-code", "cc-ses"),
+        );
+        let mut claude_code = request(vec![ck("cc-1", 1, "Claude Code tail")]);
+        claude_code["serializer_profile"] = json!("claude-code-anthropic");
+        claude_code["session_id"] = json!("cc-ses");
+        claude_code["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,dW50cnVzdGVkLWNjLWJ5dGVz",
+            "content_hash": "untrusted-cc-hash",
+        });
+        let claude_code_response = call_transform_request(&handler, claude_code).await;
+        assert_eq!(
+            claude_code_response["status"], "ok",
+            "{claude_code_response}"
+        );
+        let response_bytes = serde_json::to_string(&claude_code_response).unwrap();
+        assert!(response_bytes.contains(mural_a));
+        assert!(!response_bytes.contains("dW50cnVzdGVkLWNjLWJ5dGVz"));
     }
 
     #[test]
@@ -17527,7 +18161,7 @@ mod tests {
     #[test]
     fn transform_health_normal_advance_is_ok_and_errors_still_advance() {
         let health = DispatchHealth::new();
-        let ticket = TransformDispatchTicket::new(&health);
+        let ticket = TransformDispatchTicket::new(&health, 7);
         ticket.accept();
         assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 1);
         ticket.finish(false);
@@ -17540,7 +18174,7 @@ mod tests {
             json!(0)
         );
 
-        let error_ticket = TransformDispatchTicket::new(&health);
+        let error_ticket = TransformDispatchTicket::new(&health, 7);
         error_ticket.accept();
         error_ticket.finish(true);
         let error_report = health.report(now_ms().max(0) as u64);
@@ -17567,7 +18201,7 @@ mod tests {
         {
             // A refused item never calls accept, so dropping its ticket cannot make the
             // refusal loop look like completed transform work.
-            let _refused = TransformDispatchTicket::new(&health);
+            let _refused = TransformDispatchTicket::new(&health, 7);
         }
 
         let report = health.report(200_001);
@@ -17582,7 +18216,7 @@ mod tests {
     fn transform_dispatch_panic_drop_guard_decrements_without_completion_stamp() {
         let health = DispatchHealth::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let ticket = TransformDispatchTicket::new(&health);
+            let ticket = TransformDispatchTicket::new(&health, 7);
             ticket.accept();
             panic!("simulated transform dispatch panic");
         }));
@@ -17592,6 +18226,44 @@ mod tests {
             health.last_dispatch_completed_at_ms.load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn route_close_releases_only_its_in_flight_dispatch_and_cannot_double_decrement() {
+        let health = DispatchHealth::new();
+        health.route_open(7);
+        health.route_open(8);
+        let closed_route_ticket = TransformDispatchTicket::new(&health, 7);
+        let live_route_ticket = TransformDispatchTicket::new(&health, 8);
+        closed_route_ticket.accept();
+        live_route_ticket.accept();
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 2);
+
+        health.route_gone(7);
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 1);
+        closed_route_ticket.finish(false);
+        assert_eq!(
+            health.in_flight_count.load(Ordering::Relaxed),
+            1,
+            "a late completion from the abandoned requester must not decrement another route"
+        );
+
+        let post_close_ticket = TransformDispatchTicket::new(&health, 7);
+        post_close_ticket.accept();
+        assert_eq!(
+            health.in_flight_count.load(Ordering::Relaxed),
+            1,
+            "a torn handler cannot register after route.gone"
+        );
+        live_route_ticket.finish(false);
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 0);
+
+        health.route_open(7);
+        let rebound_ticket = TransformDispatchTicket::new(&health, 7);
+        rebound_ticket.accept();
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 1);
+        rebound_ticket.finish(false);
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 0);
     }
 
     // (the same gate as the corruption path itself); a default build has neither the arm
@@ -17895,6 +18567,114 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frozen_strip_native_transform_path_is_position_independent() {
+        fn assistant(mid: &str, ordinal: u64, trailing: bool) -> CkIngressMessage {
+            let mut content = vec![CkWireBlock::bare(CkKind::Text {
+                text: format!("answer-{mid}"),
+            })];
+            if trailing {
+                content.push(CkWireBlock::bare(CkKind::Text {
+                    text: String::new(),
+                }));
+            }
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn native(mid: &str, role: &str, text: &str, trailing: bool) -> Value {
+            let mut parts = vec![json!({ "type": "text", "text": text })];
+            if trailing {
+                parts.push(json!({ "type": "text", "text": "" }));
+            }
+            json!({
+                "info": { "id": mid, "sessionID": "ses", "role": role },
+                "parts": parts,
+            })
+        }
+
+        fn rust_mode_request(
+            messages: Vec<CkIngressMessage>,
+            native_messages: Vec<Value>,
+        ) -> Value {
+            let mut value = request(messages);
+            value["serializer_profile"] = json!("opencode-aisdk");
+            value["provider_id"] = json!("anthropic");
+            value["serve_native"] = json!(true);
+            value["native_messages"] = Value::Array(native_messages);
+            value
+        }
+
+        fn native_target_bytes(response: &Value) -> Vec<u8> {
+            let target = response["native_messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["info"]["id"] == "target")
+                .expect("native target must be served");
+            serde_json::to_vec(target).unwrap()
+        }
+
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![assistant("target", 1, false)],
+                vec![native("target", "assistant", "answer-target", false)],
+            ),
+        )
+        .await;
+
+        let newest = call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![assistant("target", 1, true)],
+                vec![native("target", "assistant", "answer-target", true)],
+            ),
+        )
+        .await;
+        let newest_bytes = native_target_bytes(&newest);
+        let historical = call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![
+                    assistant("target", 1, true),
+                    ck_with_role("user-next", 2, "user", "continue"),
+                    assistant("newest", 3, false),
+                ],
+                vec![
+                    native("target", "assistant", "answer-target", true),
+                    native("user-next", "user", "continue", false),
+                    native("newest", "assistant", "answer-newest", false),
+                ],
+            ),
+        )
+        .await;
+
+        assert_eq!(historical["status"], "ok");
+        assert_eq!(native_target_bytes(&historical), newest_bytes);
+        let target = historical["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["info"]["id"] == "target")
+            .unwrap();
+        assert_eq!(target["parts"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn native_response_release_guard_full_serializes_without_frontier() {
         let request = native_cache_request(
@@ -17953,7 +18733,24 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cold_soft_plus_full_sync_primes_the_next_tail_delta() {
         let producer = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .replace_compartments(
+                "ses",
+                &[StoredCompartment {
+                    sequence: 1,
+                    start_message: 1,
+                    end_message: 1,
+                    start_message_id: "m1#0".to_string(),
+                    end_message_id: "m1#0".to_string(),
+                    title: "covered history".to_string(),
+                    content: "summary of m1".to_string(),
+                    p1: Some("summary of m1".to_string()),
+                    importance: 50,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
         let first_native = json!({
             "info": {
                 "id": "m1",
@@ -17963,11 +18760,15 @@ mod tests {
             },
             "parts": [{ "type": "text", "text": "hello", "customPart": 7 }]
         });
+        let tail_native = json!({
+            "info": { "id": "m2", "sessionID": "ses", "role": "user" },
+            "parts": [{ "type": "text", "text": "tail" }]
+        });
         let full_request = |fingerprint: &str| {
-            let mut body = request(vec![ck("m1", 1, "hello")]);
+            let mut body = request(vec![ck("m1", 1, "hello"), ck("m2", 2, "tail")]);
             body["serializer_profile"] = json!("opencode-aisdk");
             body["serve_native"] = json!(true);
-            body["native_messages"] = json!([first_native.clone()]);
+            body["native_messages"] = json!([first_native.clone(), tail_native.clone()]);
             body["full_array_fingerprint"] = json!(fingerprint);
             body
         };
@@ -17986,6 +18787,12 @@ mod tests {
         assert!(cold["native_messages"]
             .as_array()
             .is_some_and(|messages| messages.first() != Some(&first_native)));
+        assert_eq!(cold["timings"]["build_serialized_messages"], 3);
+        assert!(!cold["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["meta"]["harness_id"] == "m1"));
         assert!(handler
             .transform_snapshots
             .lock()
@@ -17994,31 +18801,35 @@ mod tests {
             .is_none());
 
         let second_native = json!({
-            "info": { "id": "m2", "sessionID": "ses", "role": "user" },
+            "info": { "id": "m3", "sessionID": "ses", "role": "user" },
             "parts": [{ "type": "text", "text": "next" }]
         });
-        let mut delta = request(vec![ck("m2", 2, "next")]);
+        let mut delta = request(vec![ck("m3", 3, "next")]);
         delta["serializer_profile"] = json!("opencode-aisdk");
         delta["serve_native"] = json!(true);
         delta["native_messages"] = json!([second_native]);
         delta["full_array_fingerprint"] = json!("cold-fp-2");
         delta["tail_delta"] = json!({
             "after": "cold-fp-1",
-            "replace_from": 1,
-            "native_replace_from": 1,
+            "replace_from": 2,
+            "native_replace_from": 2,
         });
         let delta_bytes = serde_json::to_vec(&delta).unwrap().len();
-        let mut full_followup = request(vec![ck("m1", 1, "hello"), ck("m2", 2, "next")]);
+        let mut full_followup = request(vec![
+            ck("m1", 1, "hello"),
+            ck("m2", 2, "tail"),
+            ck("m3", 3, "next"),
+        ]);
         full_followup["serializer_profile"] = json!("opencode-aisdk");
         full_followup["serve_native"] = json!(true);
-        full_followup["native_messages"] = json!([first_native, second_native]);
+        full_followup["native_messages"] = json!([first_native, tail_native, second_native]);
         full_followup["full_array_fingerprint"] = json!("cold-fp-2");
         assert!(delta_bytes < serde_json::to_vec(&full_followup).unwrap().len());
 
         let attached = call_transform_request(&handler, delta).await;
         assert_eq!(attached["status"], "ok", "{attached}");
         assert_eq!(attached["action"], "SOFT+", "{attached}");
-        assert_eq!(attached["timings"]["projection_reused_messages"], 1);
+        assert_eq!(attached["timings"]["projection_reused_messages"], 2);
         assert!(
             attached["timings"]["native_cache_reused_messages"]
                 .as_u64()
@@ -20505,8 +21316,15 @@ mod tests {
     async fn handler_delta_d5_lineage_descent_forces_full_projection() {
         let target = "projection-lineage-target";
         let source = "projection-lineage-source";
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let resolver = FakeSessionResolver::with(&[
+            (target, FakeResolve::Hit(target.to_string())),
+            (source, FakeResolve::Hit(source.to_string())),
+        ]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
         handler.bind_route(7, binding(project.to_str().unwrap(), target));
         handler.bind_route(8, binding(project.to_str().unwrap(), source));
         let source_messages = (1..=10)
@@ -20536,6 +21354,41 @@ mod tests {
                 ],
             )
             .unwrap();
+        let project_path = project.to_str().unwrap();
+        let seeded_note_ids = store
+            .seed_authority_rows(
+                "context-db",
+                project_path,
+                "notes",
+                &[AuthoritySeedRow {
+                    source_row_id: 52,
+                    snapshot: json!({
+                        "type": "session",
+                        "project_path": project_path,
+                        "session_id": source,
+                        "content": "compiled note inherited by the successor",
+                        "status": "active",
+                        "surface_condition": "when descent completes",
+                        "compiled_provider": "retina-local-fs",
+                        "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}",
+                        "compiled_at": 5200,
+                        "compile_status": "compiled",
+                        "status_version": 3,
+                        "created_at": 5100,
+                        "updated_at": 5200,
+                    }),
+                }],
+            )
+            .unwrap();
+        let source_note = store
+            .get_note_by_id(project_path, source, seeded_note_ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source_note.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(source_note.compiled_at, Some(5200));
         let source_epoch = store.load(source).unwrap().meta.revert_epoch;
         let summary = "This session is being continued from a previous conversation.\n\nSummary:\nDurable summary alpha\n\nFull transcript: /tmp/session.jsonl";
         let compaction_user = CkIngressMessage {
@@ -20614,6 +21467,30 @@ mod tests {
         assert_eq!(descended["timings"]["projection_reused_messages"], 0);
         assert_eq!(descended["timings"]["projection_projected_messages"], 2);
         assert!(store.load(target).unwrap().meta.descent_completed);
+
+        let inherited_notes = store
+            .search_notes_like(project_path, target, "compiled note inherited")
+            .unwrap();
+        assert_eq!(inherited_notes.len(), 1);
+        let inherited = store
+            .get_note_by_id(project_path, target, inherited_notes[0].id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(inherited.id, source_note.id);
+        assert_eq!(
+            inherited.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            inherited.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}")
+        );
+        assert_eq!(inherited.compiled_at, Some(5200));
+        assert_eq!(inherited.compile_status.as_deref(), Some("compiled"));
+        let successor_facade = tool_text(
+            call_facade_on_channel(&handler, 7, "ctx_note", json!({ "action": "read" })).await,
+        );
+        assert!(successor_facade.contains("compiled note inherited by the successor"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21375,6 +22252,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_busy_transform_is_typed_and_visible_in_status_and_health() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, dir, _project) = handler_with_store(producer, default_test_config());
+        let baseline = call_transform_request(&handler, request(vec![ck("m1", 1, "one")])).await;
+        assert_eq!(baseline["status"], "ok", "{baseline}");
+
+        let descriptor = dev_descriptor_at(dir.path().join("data").to_str().unwrap());
+        let StorageBackend::Sqlite { path } = descriptor.backend else {
+            panic!("test descriptor must use SQLite")
+        };
+        let locker = rusqlite::Connection::open(path).unwrap();
+        locker.busy_timeout(Duration::ZERO).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (code, message) = error_frame(
+            call_transform_outcome(
+                &handler,
+                request(vec![ck("m1", 1, "one"), ck("m2", 2, "two")]),
+            )
+            .await,
+        );
+        assert_eq!(code, "transform_failed");
+        assert!(message.contains("database is locked"), "{message}");
+        locker.execute_batch("ROLLBACK").unwrap();
+
+        let status =
+            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
+        assert_eq!(status["runtime_store_error"]["code"], "transform_failed");
+        assert_eq!(status["runtime_store_error"]["message"], message);
+        let health =
+            call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
+        assert_eq!(health["runtime_store_error"], status["runtime_store_error"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_store_error_preserves_distinct_failure_codes_in_status_and_health() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let baseline = call_transform_request(&handler, request(vec![ck("m1", 1, "one")])).await;
+        assert_eq!(baseline["status"], "ok", "{baseline}");
+
+        handler
+            .runtime_store_errors
+            .lock()
+            .expect("runtime store errors mutex")
+            .insert(
+                "ses".to_string(),
+                RuntimeStoreError {
+                    code: "store_write_failed".to_string(),
+                    message: "first diagnostic".to_string(),
+                    at_ms: 101,
+                },
+            );
+        let status =
+            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
+
+        handler
+            .runtime_store_errors
+            .lock()
+            .expect("runtime store errors mutex")
+            .insert(
+                "ses".to_string(),
+                RuntimeStoreError {
+                    code: "store_unavailable".to_string(),
+                    message: "second diagnostic".to_string(),
+                    at_ms: 202,
+                },
+            );
+        let health =
+            call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
+
+        assert_eq!(status["runtime_store_error"]["code"], "store_write_failed");
+        assert_eq!(status["runtime_store_error"]["message"], "first diagnostic");
+        assert_eq!(status["runtime_store_error"]["at_ms"], 101);
+        assert_eq!(health["runtime_store_error"]["code"], "store_unavailable");
+        assert_eq!(
+            health["runtime_store_error"]["message"],
+            "second diagnostic"
+        );
+        assert_eq!(health["runtime_store_error"]["at_ms"], 202);
+        assert_ne!(
+            status["runtime_store_error"]["code"], health["runtime_store_error"]["code"],
+            "runtime store diagnostics must preserve the failure arm rather than a constant code"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn guidance_variant_no_reduce_omits_reduce_and_hashes_differ() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -21899,7 +22862,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn smart_note_writes_require_the_host_evaluator_capability() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
             default_test_config(),
             resolver,
@@ -21950,11 +22913,82 @@ mod tests {
                 "action": "write",
                 "content": "smart note with evaluator",
                 "surface_condition": "when evaluated",
+                "compiled_provider": "retina-local-fs",
+                "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"old\"}",
+                "compiled_at": 100,
+                "compile_status": "compiled",
             }),
         )
         .await;
         let accepted_text = tool_text(accepted);
         assert!(accepted_text.contains("Created smart note"));
+        let project = project.to_str().unwrap();
+        let note_id = store
+            .search_notes_like(project, "ses", "smart note with evaluator")
+            .unwrap()[0]
+            .id;
+        let written = store
+            .get_note_by_id(project, "ses", note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            written.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(written.compiled_at, Some(100));
+        store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: project,
+                note_id,
+                source_revision: written.status_version,
+                verdict: false,
+                compiled_check: Some("old compiled check"),
+                manifest_json: Some("{\"kind\":\"old\"}"),
+                check_hash: Some("old-hash"),
+                next_due_at: Some(999),
+                now_ms: 150,
+            })
+            .unwrap();
+
+        let updated = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "update",
+                "note_id": note_id,
+                "surface_condition": "when the replacement path exists",
+                "compiled_provider": "retina-local-fs",
+                "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"new\"}",
+                "compiled_at": 200,
+                "compile_status": "compiled",
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(updated));
+        let updated = store
+            .get_note_by_id(project, "ses", note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.surface_condition.as_deref(),
+            Some("when the replacement path exists")
+        );
+        assert_eq!(
+            updated.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            updated.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\",\"path\":\"new\"}")
+        );
+        assert_eq!(updated.compiled_at, Some(200));
+        assert_eq!(updated.compile_status.as_deref(), Some("compiled"));
+        assert_eq!(updated.compiled_check, None);
+        assert_eq!(updated.manifest_json, None);
+        assert_eq!(updated.check_hash, None);
+        assert_eq!(updated.check_next_due_at, None);
+        assert_eq!(updated.last_checked_at, None);
+        assert_eq!(updated.check_status.as_deref(), Some("uncompiled"));
 
         let plain_with_capability = call_facade(
             &handler,
@@ -22663,36 +23697,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn note_facade_reads_a_preexisting_seeded_ts_note_after_authority_flip() {
+    async fn note_facade_recovers_pre_and_post_migration_compilation_metadata() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
+        let (handler, store, dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(7, binding("/repo", "token"));
-        store
-            .seed_authority_row(
-                "context-db",
-                "notes",
-                42,
-                &json!({
+        let rows = [
+            AuthoritySeedRow {
+                source_row_id: 42,
+                snapshot: json!({
                     "type": "smart",
                     "project_path": "/repo",
                     "session_id": "session",
-                    "content": "seeded before Rust mode",
+                    "content": "seeded before migration 52",
                     "status": "ready",
-                    "surface_condition": "condition",
-                    "ready_reason": "condition met",
+                    "surface_condition": "legacy condition",
+                    "ready_reason": "legacy condition met",
                     "status_version": 2,
                     "created_at": 1,
                     "updated_at": 2
                 }),
-            )
+            },
+            AuthoritySeedRow {
+                source_row_id: 43,
+                snapshot: json!({
+                    "type": "smart",
+                    "project_path": "/repo",
+                    "session_id": "session",
+                    "content": "seeded after migration 52",
+                    "status": "ready",
+                    "surface_condition": "compiled condition",
+                    "compiled_provider": "retina-local-fs",
+                    "compiled_config": "{\"kind\":\"path_exists\"}",
+                    "compiled_at": 123,
+                    "compile_status": "compiled",
+                    "ready_reason": "compiled condition met",
+                    "status_version": 3,
+                    "created_at": 3,
+                    "updated_at": 4
+                }),
+            },
+        ];
+        store
+            .seed_authority_rows("context-db", "/repo", "notes", &rows)
             .unwrap();
+
+        let pre_migration = store
+            .get_note_by_id("/repo", "session", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre_migration.compiled_provider, None);
+        assert_eq!(pre_migration.compiled_config, None);
+        assert_eq!(pre_migration.compiled_at, None);
+        assert_eq!(pre_migration.compile_status, None);
+        let post_migration = store
+            .get_note_by_id("/repo", "session", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            post_migration.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            post_migration.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\"}")
+        );
+        assert_eq!(post_migration.compiled_at, Some(123));
+        assert_eq!(post_migration.compile_status.as_deref(), Some("compiled"));
 
         let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(output.contains("## 🔔 Ready Smart Notes"));
-        assert!(output.contains("seeded before Rust mode"));
+        assert!(output.contains("seeded before migration 52"));
+        assert!(output.contains("seeded after migration 52"));
+
+        drop(handler);
+        drop(store);
+        let reopened = McStore::open(&dev_descriptor_at(
+            dir.path().join("data").to_str().unwrap(),
+        ))
+        .unwrap();
+        let durable = reopened
+            .get_note_by_id("/repo", "session", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(durable.compiled_at, Some(123));
+        assert_eq!(durable.compile_status.as_deref(), Some("compiled"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -27630,6 +28725,136 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn all_terminal_wrapup_dispositions_replay_after_module_restart() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(2, 8));
+        store
+            .record_wrapup_command("ses", "completed", "completed", 2, "finished", 10)
+            .unwrap();
+        store
+            .record_wrapup_command(
+                "ses",
+                "nothing",
+                "nothing_to_compact",
+                0,
+                "nothing eligible",
+                11,
+            )
+            .unwrap();
+        let failed_record = tool_body(handler.terminal_wrapup_response(
+            &store,
+            "ses",
+            Some("failed"),
+            1,
+            0,
+            TerminalWrapupResponse {
+                disposition: "failed",
+                rounds: 1,
+                summary: "wrapup failed".to_string(),
+                reason: Some("producer_failed"),
+                detail: Some("producer unavailable".to_string()),
+                include_rounds_without_command: false,
+            },
+        ));
+        assert_eq!(failed_record["disposition"], json!("failed"));
+        drop(handler);
+        drop(store);
+
+        let reopened = Arc::new(
+            McStore::open(&dev_descriptor_at(
+                dir.path().join("data").to_str().unwrap(),
+            ))
+            .unwrap(),
+        );
+        let restarted = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory {
+                state: Arc::clone(&producer),
+            }),
+            default_test_config(),
+            Arc::new(MissingSessionResolver),
+        );
+        restarted.store.set(reopened).ok().unwrap();
+        restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+
+        let completed = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "completed"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            completed,
+            json!({
+                "ok": true,
+                "disposition": "completed",
+                "rounds": 2,
+                "summary": "finished",
+                "replayed": true
+            })
+        );
+
+        let nothing = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "nothing"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            nothing,
+            json!({
+                "ok": true,
+                "disposition": "nothing_to_compact",
+                "rounds": 0,
+                "summary": "nothing eligible",
+                "replayed": true
+            })
+        );
+
+        let failed = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "failed"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            failed,
+            json!({
+                "ok": false,
+                "disposition": "failed",
+                "rounds": 1,
+                "summary": "wrapup failed",
+                "reason": "producer_failed",
+                "detail": "producer unavailable",
+                "replayed": true
+            })
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn legacy_failed_wrapup_row_is_replaced_and_response_loss_replays() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
@@ -29039,6 +30264,7 @@ mod tests {
         let backed_off = call_transform(&handler, messages.clone()).await;
         assert_eq!(backed_off["historian"]["fired"], false);
         assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(backed_off["historian"]["canonical_cause"], "rate_limit");
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
 
         expire_historian_backoff(&store);
@@ -29251,10 +30477,14 @@ mod tests {
         let response = call_transform(&handler, messages).await;
         assert_eq!(response["historian"]["fired"], false);
         assert_eq!(response["historian"]["no_fire"], "backoff");
+        assert_eq!(response["historian"]["canonical_cause"], "rate_limit");
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
-        assert_eq!(state.last_no_fire.as_deref(), Some("backoff"));
+        assert_eq!(
+            state.last_no_fire.as_deref(),
+            Some("backoff{raw_cause=FailureBackoff,canonical_cause=rate_limit}")
+        );
         assert!(
             state
                 .failure_backoff_at_ms
@@ -29392,6 +30622,7 @@ mod tests {
         let backed_off = call_transform(&handler, messages.clone()).await;
         assert_eq!(backed_off["historian"]["fired"], false);
         assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(backed_off["historian"]["canonical_cause"], "rate_limit");
         assert_eq!(producer.connects.load(Ordering::SeqCst), 1);
 
         expire_historian_backoff(&store);
@@ -29419,7 +30650,7 @@ mod tests {
         let loaded = store.load("ses").unwrap();
         assert_eq!(
             loaded.meta.historian.last_no_fire.as_deref(),
-            Some("no_models")
+            Some("no_models{raw_cause=NoModels,canonical_cause=no_models}")
         );
         let version_after_first = loaded.row_version;
 
@@ -29493,7 +30724,13 @@ mod tests {
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         let messages = vec![ck("m1", 1, "small turn")];
         let _ = call_transform(&handler, messages.clone()).await;
-        let _ = call_transform(&handler, messages).await;
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["canonical_cause"], "protected_tail");
+        assert_eq!(response["historian"]["no_fire"], "trigger_false");
+        assert!(response["historian"]["no_fire_detail"]
+            .as_str()
+            .unwrap()
+            .contains("raw_cause=ProtectedTailWindowEmpty"));
         let loaded = store.load("ses").unwrap();
         let detail = loaded
             .meta
@@ -29502,6 +30739,8 @@ mod tests {
             .expect("trigger_false recorded");
         assert!(
             detail.starts_with("trigger_false{")
+                && detail.contains("raw_cause=ProtectedTailWindowEmpty")
+                && detail.contains("canonical_cause=protected_tail")
                 && detail.contains("bar~")
                 && detail.contains("ctx_limit="),
             "detail carries the numbers: {detail}"
@@ -29669,6 +30908,7 @@ mod tests {
                 }
             ],
             "native_messages": [{"text": "native first"}],
+            "tool_input_key_orders": {"m0#0": ["filePath", "content"]},
             "transform_page_id": "golden-page",
             "transform_generation": 4,
             "transform_page_index": 0,
@@ -29692,6 +30932,7 @@ mod tests {
                 {"mid": "m2", "text": "last"}
             ],
             "native_messages": [{"text": "native last"}],
+            "tool_input_key_orders": {"m2#0": ["filePath", "oldString", "newString"]},
             "extra": "preserved",
             "transform_page_id": "golden-page",
             "transform_generation": 4,
@@ -29716,8 +30957,266 @@ mod tests {
                     {"text": "native first"},
                     {"text": "native last"}
                 ],
+                "tool_input_key_orders": {
+                    "m0#0": ["filePath", "content"],
+                    "m2#0": ["filePath", "oldString", "newString"]
+                },
                 "extra": "preserved"
             })
+        );
+    }
+
+    #[test]
+    fn pageable_map_digest_matches_the_typescript_canonical_fixture() {
+        let request = json!({
+            "messages": [{"mid": "m1", "text": "hello"}],
+            "tool_input_key_orders": {
+                "m1#2": ["newString", "filePath"],
+                "m1#0": ["path", "content"]
+            }
+        });
+        assert_eq!(
+            transform_page_content_digest(&request),
+            "db28d9596edc518ebe4131403a892c60868ee683f80c248e6c1c1a6f0e9bbf17"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pageable_key_order_map_accepts_over_cap_input_and_preserves_served_bytes() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        let key_order_map = |start: usize, end: usize| {
+            Value::Object(
+                (start..end)
+                    .map(|index| {
+                        (
+                            format!("msg_{index:024x}#0"),
+                            json!(["filePath", "oldString", "newString"]),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let mut large_response = None;
+        for index in 0..3 {
+            let complete = index == 2;
+            let messages = if complete {
+                vec![
+                    serde_json::to_value(ck("large-map-message", 0, "large map accepted")).unwrap(),
+                ]
+            } else {
+                Vec::new()
+            };
+            let mut page = paged_transform_page(
+                "transform",
+                "ses",
+                "large-key-order-map",
+                0,
+                index,
+                3,
+                complete,
+                messages,
+            );
+            page["tool_input_key_orders"] = key_order_map(index * 4_000, (index + 1) * 4_000);
+            page["transform_page_digest"] = json!(transform_page_content_digest(&page));
+            assert!(serde_json::to_vec(&page).unwrap().len() <= TRANSFORM_PAGE_MAX_BYTES);
+            match handler.dispatch_value(7, page).await {
+                HandlerOutcome::Response(bytes) if complete => large_response = Some(bytes),
+                HandlerOutcome::Response(_) => {}
+                other => panic!("large key-order map page should be accepted: {other:?}"),
+            }
+        }
+        assert!(large_response.is_some());
+        let large_request = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_request_clone("ses")
+            .expect("large paged transform snapshot");
+        assert_eq!(large_request.tool_input_key_orders.len(), 12_000);
+
+        let project_root = project.to_str().expect("test project path");
+        handler.bind_route(8, binding(project_root, "unpaged-map-parity"));
+        handler.bind_route(9, binding(project_root, "paged-map-parity"));
+        let messages = vec![ck("parity-message", 0, "paging parity")];
+        let small_map = json!({
+            "unused#0": ["filePath", "content"],
+            "unused#1": ["filePath", "oldString", "newString"]
+        });
+        let mut unpaged_request = request(messages.clone());
+        unpaged_request["method"] = json!("transform");
+        unpaged_request["session_id"] = json!("unpaged-map-parity");
+        unpaged_request["tool_input_key_orders"] = small_map.clone();
+        let unpaged_output = match handler.dispatch_value(8, unpaged_request).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unpaged parity control should execute: {other:?}"),
+        };
+
+        let mut first = paged_transform_page(
+            "transform",
+            "paged-map-parity",
+            "small-key-order-map",
+            0,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        first["tool_input_key_orders"] = json!({"unused#0": ["filePath", "content"]});
+        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
+        let mut final_page = paged_transform_page(
+            "transform",
+            "paged-map-parity",
+            "small-key-order-map",
+            0,
+            1,
+            2,
+            true,
+            messages
+                .into_iter()
+                .map(|message| serde_json::to_value(message).unwrap())
+                .collect(),
+        );
+        final_page["usage"] = json!({
+            "current_total_input_tokens": 45_000,
+            "context_limit_tokens": 50_000,
+            "final_wire_input_tokens": 0,
+            "final_wire_trusted": false,
+        });
+        final_page["tool_input_key_orders"] =
+            json!({"unused#1": ["filePath", "oldString", "newString"]});
+        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+        let assembled = assemble_transform_pages(vec![first.clone(), final_page.clone()]).unwrap();
+        let mut parity_control = request(vec![ck("parity-message", 0, "paging parity")]);
+        parity_control["method"] = json!("transform");
+        parity_control["session_id"] = json!("paged-map-parity");
+        parity_control["tool_input_key_orders"] = small_map;
+        assert_eq!(assembled, parity_control);
+
+        assert!(matches!(
+            handler.dispatch_value(9, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let paged_output = match handler.dispatch_value(9, final_page).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("paged parity request should execute: {other:?}"),
+        };
+        assert_eq!(
+            serde_json::to_vec(&paged_output["ck_messages"]).unwrap(),
+            serde_json::to_vec(&unpaged_output["ck_messages"]).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_content_addressed_page_series_replays_without_reexecution() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "content-addressed-attempt",
+            0,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        let final_page = paged_transform_page(
+            "transform",
+            "ses",
+            "content-addressed-attempt",
+            0,
+            1,
+            2,
+            true,
+            vec![serde_json::to_value(ck("adopted", 0, "completed result")).unwrap()],
+        );
+
+        assert!(matches!(
+            handler.dispatch_value(7, first.clone()).await,
+            HandlerOutcome::Response(_)
+        ));
+        let completed = match handler.dispatch_value(7, final_page.clone()).await {
+            HandlerOutcome::Response(bytes) => bytes,
+            other => panic!("completed series should execute: {other:?}"),
+        };
+        let row_version = store.load("ses").unwrap().row_version;
+
+        let replay_ack = match handler.dispatch_value(7, first).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("completed series prefix should replay admission: {other:?}"),
+        };
+        assert_eq!(replay_ack["completed_replay"], true);
+        let adopted = match handler.dispatch_value(7, final_page).await {
+            HandlerOutcome::Response(bytes) => bytes,
+            other => panic!("completed series final page should adopt result: {other:?}"),
+        };
+
+        assert_eq!(adopted, completed);
+        assert_eq!(store.load("ses").unwrap().row_version, row_version);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pageable_map_digest_rejects_tampering() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+        let mut tampered = paged_transform_page(
+            "transform",
+            "ses",
+            "tampered-map",
+            0,
+            0,
+            1,
+            true,
+            vec![serde_json::to_value(ck("tampered", 0, "tampered map")).unwrap()],
+        );
+        tampered["tool_input_key_orders"] = json!({"tampered#0": ["filePath", "content"]});
+        tampered["transform_page_digest"] = json!(transform_page_content_digest(&tampered));
+        tampered["tool_input_key_orders"]["tampered#0"] = json!(["content", "filePath"]);
+
+        assert_eq!(
+            error_code(handler.dispatch_value(7, tampered).await),
+            "authority_transform_page_digest_mismatch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pageable_map_duplicate_keys_are_integrity_errors() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+        let mut first = paged_transform_page(
+            "transform",
+            "ses",
+            "duplicate-map-key",
+            0,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        first["tool_input_key_orders"] = json!({"duplicate#0": ["filePath", "content"]});
+        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let mut final_page = paged_transform_page(
+            "transform",
+            "ses",
+            "duplicate-map-key",
+            0,
+            1,
+            2,
+            true,
+            vec![serde_json::to_value(ck("duplicate", 0, "duplicate map key")).unwrap()],
+        );
+        final_page["tool_input_key_orders"] = json!({"duplicate#0": ["oldString", "newString"]});
+        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+
+        assert_eq!(
+            error_code(handler.dispatch_value(7, final_page).await),
+            "authority_transform_page_digest_mismatch"
         );
     }
 
@@ -30670,12 +32169,6 @@ mod tests {
             "native_replace_from": 0,
         });
         final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
-        assert!(
-            serde_json::to_vec(&first).unwrap().len()
-                + serde_json::to_vec(&final_page).unwrap().len()
-                > TRANSFORM_PAGE_MAX_BYTES
-        );
-
         let first_ack = handler.dispatch_value(7, first).await;
         let HandlerOutcome::Response(first_ack) = first_ack else {
             panic!("first delta page should stage: {first_ack:?}");
@@ -31532,5 +33025,24 @@ mod tests {
         for property in ["message", "start", "end"] {
             assert_eq!(schema["properties"][property]["minimum"], json!(0));
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_form_degradation {
+    use subc_client_rs::build_provenance;
+
+    // Short 8-hex deploy stamps (the pre-0.17 ladder convention) must fail the
+    // canonical form check — this pins WHY the manifest call site degrades to
+    // omission instead of unwrapping.
+    #[test]
+    fn short_sha_is_rejected_by_form_check_and_full_sha_is_accepted() {
+        assert!(build_provenance(Some("22464bf2"), None, None).is_err());
+        let ok = build_provenance(Some("22464bf25db24c4037f5efda72c8bb02d64baf51"), None, None)
+            .expect("full lowercase 40-hex sha is canonical");
+        assert_eq!(
+            ok.build_git_sha.as_deref(),
+            Some("22464bf25db24c4037f5efda72c8bb02d64baf51")
+        );
     }
 }

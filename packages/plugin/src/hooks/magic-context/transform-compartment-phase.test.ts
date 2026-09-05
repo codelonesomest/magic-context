@@ -10,6 +10,7 @@ import type { PluginContext } from "../../plugin/types";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getActiveCompartmentRun, registerActiveCompartmentRun } from "./compartment-runner";
+import { __ignoredNotificationTest } from "./send-session-notification";
 import { runCompartmentPhase } from "./transform-compartment-phase";
 
 function createOpenCodeDb(
@@ -79,9 +80,11 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "mc-compartment-phase-"));
     process.env.XDG_DATA_HOME = tempDir;
+    __ignoredNotificationTest.setMidTurnDetector(() => false);
 });
 
 afterEach(() => {
+    __ignoredNotificationTest.reset();
     closeDatabase();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
@@ -101,7 +104,7 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
      * usage that keeps reporting 85k tokens), the same compartment run stays active
      * for the duration of historian execution. Without the `notificationSent`
      * guard, each transform pass would call `sendIgnoredMessage(...)`, which uses
-     * `client.session.prompt({ noReply: true })`. OpenCode persists each such
+     * `client.session.prompt` for an ignored status. OpenCode persists each such
      * call as a USER message with finish=null in the session DB.
      *
      * On the next loop iteration, `latest(msgs)` returns the new notification-user
@@ -129,7 +132,7 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
         const db = openDatabase();
 
         // Stub a client that exposes session.prompt. sendIgnoredMessage calls
-        // session.prompt with noReply:true — we count those to verify the guard.
+        // the ignored-status prompt path — we count those to verify the guard.
         const promptMock = mock(async () => ({ data: {} }));
         const client = {
             session: {

@@ -25,7 +25,11 @@ import {
     type SubcClient,
 } from "@cortexkit/subc-client";
 
-import { __moduleTransportTest, SubcModuleTransport } from "./module-transport";
+import {
+    __moduleTransportTest,
+    SubcModuleTransport,
+    transformColdStartExecuteTimeoutMs,
+} from "./module-transport";
 
 class FakeServerReader {
     private buffered = Buffer.alloc(0);
@@ -434,6 +438,13 @@ describe("SubcModuleTransport", () => {
         expect(requestCount).toBe(2);
     });
 
+    it("scales cold execution for ENGRAM and ASTRO while retaining a bounded ceiling", () => {
+        expect(transformColdStartExecuteTimeoutMs(0)).toBe(15_000);
+        expect(transformColdStartExecuteTimeoutMs(7_400)).toBe(29_800);
+        expect(transformColdStartExecuteTimeoutMs(9_600)).toBe(34_200);
+        expect(transformColdStartExecuteTimeoutMs(100_000)).toBe(90_000);
+    });
+
     it("uses a cold-start deadline only for a completed transform page series", async () => {
         const transport = new SubcModuleTransport("unused-connection-file");
         const route = { channel: 8, epoch: 88 } as RouteHandle;
@@ -484,8 +495,8 @@ describe("SubcModuleTransport", () => {
         expect(observedTimeouts).toHaveLength(2);
         expect(observedTimeouts[0]).toBeGreaterThan(4_500);
         expect(observedTimeouts[0]).toBeLessThanOrEqual(5_000);
-        expect(observedTimeouts[1]).toBeGreaterThan(29_000);
-        expect(observedTimeouts[1]).toBeLessThanOrEqual(30_000);
+        expect(observedTimeouts[1]).toBeGreaterThan(14_500);
+        expect(observedTimeouts[1]).toBeLessThanOrEqual(15_000);
     });
 
     it("fails a completed-series deadline without reconnecting or retrying", async () => {
@@ -793,6 +804,55 @@ describe("SubcModuleTransport", () => {
         releaseTransform.resolve();
         await Promise.all([stateSync, transform, status]);
         expect(starts).toEqual(["state_sync", "transform", "session.status"]);
+    });
+
+    it("queues session.delete behind an in-flight transform on the same route", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const transformStarted = deferred();
+        const releaseTransform = deferred();
+        const starts: string[] = [];
+        const client = {
+            request: async (_route: RouteHandle, body: unknown) => {
+                const method = (body as { method: string }).method;
+                starts.push(method);
+                if (method === "transform") {
+                    transformStarted.resolve();
+                    await releaseTransform.promise;
+                }
+                return { result: { method } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "delete-race-session\0/workspace/project",
+            generation: 0,
+        });
+        const transform = transport.call({
+            sessionId: "delete-race-session",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform" },
+        });
+        await transformStarted.promise;
+
+        const deletion = transport.deleteSession("delete-race-session", "/workspace/project");
+        await Promise.resolve();
+        expect(starts).toEqual(["transform"]);
+        releaseTransform.resolve();
+        await Promise.all([transform, deletion]);
+        expect(starts).toEqual(["transform", "session.delete"]);
     });
 
     it("coalesces concurrent connection recovery and retries two sessions on one fresh generation", async () => {

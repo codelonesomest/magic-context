@@ -40,12 +40,28 @@ const CONNECT_BACKOFF_WAIT_JITTER_MS = 100;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 export const TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS = 5_000;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS = 15_000;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_PER_MESSAGE_MS = 2;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MAX_MS = 90_000;
+
 /**
- * A completed giant page series makes the module assemble, project, and encode the whole cold
- * snapshot. ASTRO-scale cold passes have exceeded five seconds while still making progress, so
- * leave enough headroom for that one execute attempt without weakening steady-state deadlines.
+ * Cold execution includes full projection and native encoding after the final page lands.
+ * The hermetic 9.6k-message/8k-tool cold gate completes module-side in 8.0s at load 9 and
+ * 10.2s at load 18 after the cold-path fixes, and this box routinely runs at load 40+ during
+ * release gates. A 15s floor plus two milliseconds per message keeps ~3x margin over the
+ * measured cold time (30s for ENGRAM's 7.4k messages, 34s for ASTRO's 9.6k); a miss is no
+ * longer fatal because a completed series the requester abandoned is adopted by the next
+ * identical pass, but each miss still costs the user one refused turn.
  */
-export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS = 30_000;
+export function transformColdStartExecuteTimeoutMs(seedMessageCount: number): number {
+    const messages = Number.isSafeInteger(seedMessageCount) ? Math.max(0, seedMessageCount) : 0;
+    return Math.min(
+        TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MAX_MS,
+        TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS +
+            messages * TRANSFORM_COLD_START_EXECUTE_TIMEOUT_PER_MESSAGE_MS,
+    );
+}
+
 /** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
 export const MAX_WRAPUP_REQUEST_BUDGET_MS = 3_800_000;
 const SERIAL_LANE_MAX_WAITERS = 16;

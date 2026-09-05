@@ -1,6 +1,6 @@
 {
 	"name": "@cortexkit/pi-magic-context",
-	"version": "0.41.1-omp.1",
+	"version": "0.41.3-omp.1",
 	"type": "module",
 	"description": "Pi and OMP coding agent extension for Magic Context — cross-session memory and context management",
 	"main": "dist/index.js",
@@ -28,7 +28,7 @@
 		"README.md"
 	],
 	"scripts": {
-		"build": "tsc -p ../retina-local-fs/tsconfig.build.json && rm -f dist/index.js dist/subagent-entry.js dist/historian-calibration-extension.js dist/transformers-web.js dist/*-*.js && bun build ../plugin/src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun build src/index.ts src/subagent-entry.ts src/historian-calibration-extension.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external onnxruntime-node --external onnxruntime-web --external sharp --external node:sqlite",
+		"build": "tsc -p ../retina-local-fs/tsconfig.build.json && rm -f dist/index.js dist/subagent-entry.js dist/historian-calibration-extension.js dist/transformers-web.js dist/transformers-node-wasm.js dist/*-*.js && bun build ../plugin/src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun ../plugin/scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts src/subagent-entry.ts src/historian-calibration-extension.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external onnxruntime-node --external onnxruntime-web --external sharp --external node:sqlite",
 		"build:e2e-argv": "bun build src/subagent-runner.ts --outfile ../../tests/docker/.generated/subagent-runner-e2e.mjs --target node --format esm --external node:sqlite",
 		"typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit",
 		"test": "bun install --frozen-lockfile && bun test",
@@ -51,7 +51,7 @@
 	},
 	"optionalDependencies": {
 		"onnxruntime-node": "1.24.3",
-		"sharp": "^0.34.5"
+		"sharp": "^0.35.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.1",
@@ -65,8 +65,8 @@
 		"typescript": "^5.8.0"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "^0.80.2",
-		"@earendil-works/pi-tui": "^0.80.2"
+		"@earendil-works/pi-coding-agent": ">=0.80.2",
+		"@earendil-works/pi-tui": ">=0.80.2"
 	},
 	"peerDependenciesMeta": {
 		"@earendil-works/pi-coding-agent": {

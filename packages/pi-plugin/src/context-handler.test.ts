@@ -97,16 +97,26 @@ describe("Pi pressure guards", () => {
 		expect(src).not.toContain("usagePercentage = 95;");
 	});
 	describe("two-pass tool reclaim source invariants", () => {
-		it("uses confirmed mutation booleans rather than executedWorkThisPass for the reclaim gate", () => {
+		it("only advances reclaim on a priced application opportunity", () => {
+			// Whitespace-normalized so the formatter's line-wrapping of long boolean
+			// chains cannot break a check that is about the predicate, not layout.
 			const src = readFileSync(
 				join(import.meta.dir, "context-handler.ts"),
 				"utf8",
-			);
+			).replace(/\s+/g, " ");
 			expect(src).toContain("let pendingOpsDidMutate = false");
 			expect(src).toContain("let heuristicOrReasoningDidMutate = false");
 			expect(src).toContain(
-				"const alreadyMutatingThisPass =\n\t\tpendingOpsDidMutate || heuristicOrReasoningDidMutate",
+				"const alreadyMutatingThisPass = pendingOpsDidMutate || heuristicOrReasoningDidMutate || foldExecutedThisPass",
 			);
+			expect(src).toContain(
+				"const toolReclaimApplicationOpportunity = toolReclaimExecutePass && alreadyMutatingThisPass",
+			);
+			expect(src).toContain(
+				"if (toolReclaimApplicationOpportunity && !emergencyDropEligible)",
+			);
+			expect(src).toContain("if (toolReclaimApplicationOpportunity) {");
+			expect(src).toContain("recentSupersessionOwnerMessageIds");
 			expect(src).toContain("heuristicsResult.droppedStaleReduceCalls");
 			expect(src).toContain("buildSyntheticToolReclaimOps");
 			expect(src).not.toContain(
@@ -2124,6 +2134,42 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("ignores a late older assistant model event after a newer model has been pinned", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-interleaved-model-switch";
+		try {
+			const { persistPiMessageEndModelMeta } = await import("./index");
+			const cacheTtlConfig = {
+				default: "5m",
+				"anthropic/fable-5.1": "never",
+			};
+
+			persistPiMessageEndModelMeta({
+				db,
+				sessionId,
+				message: assistantMessage("new model", 2, {
+					provider: "anthropic",
+					model: "fable-5.1",
+				}),
+				cacheTtlConfig,
+			});
+			persistPiMessageEndModelMeta({
+				db,
+				sessionId,
+				message: assistantMessage("late old model", 1, {
+					provider: "anthropic",
+					model: "fable-5",
+				}),
+				cacheTtlConfig,
+			});
+
+			expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("never");
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("tracks Pi observed safe input token high-water mark", async () => {
 		const db = createTestDb();
 		try {
@@ -4104,6 +4150,88 @@ describe("registerPiContextHandler", () => {
 		});
 	});
 
+	describe("Pi wrapup then flush boundary adoption", () => {
+		it("trims a first m[1] compartment on the busting pass and keeps the defer replay byte-identical", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-wrapup-flush-boundary";
+			try {
+				updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					injection: { injectionBudgetTokens: 10_000 },
+					scheduler: { executeThresholdPercentage: 80 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const buildMessages = () =>
+					[
+						userMessage("covered request", 1),
+						assistantMessage("covered answer", 2),
+						userMessage("live tail", 3),
+					] as never[];
+				const runPass = async () => {
+					const messages = buildMessages();
+					return handler(
+						{ messages },
+						fakeContext(
+							sessionId,
+							process.cwd(),
+							["entry-1", "entry-2", "entry-3"],
+							messages,
+						) as never,
+					);
+				};
+
+				// Prime an empty m[0] baseline before wrapup publishes the first
+				// compartment. Its max-compartment watermark is therefore -1.
+				await runPass();
+				appendCompartments(db, sessionId, [
+					{
+						sequence: 0,
+						startMessage: 1,
+						endMessage: 2,
+						startMessageId: "entry-1",
+						endMessageId: "entry-2",
+						title: "Wrapped history",
+						content: "U: covered request\nA: covered answer",
+						p1: "U: covered request\nA: covered answer",
+					},
+				]);
+				// /ctx-wrapup queues deferred publication signals; /ctx-flush upgrades
+				// the next provider call to the priced busting/materializing pass.
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				signalPiHistoryRefresh(sessionId);
+				signalPiPendingMaterialization(sessionId);
+
+				const busting = await runPass();
+				const deferred = await runPass();
+				expect(JSON.stringify(deferred.messages)).toBe(
+					JSON.stringify(busting.messages),
+				);
+
+				const bustingText = busting.messages.map((message) =>
+					textOf(message as never),
+				);
+				expect(bustingText.join("\n")).toContain("Wrapped history");
+				const rawTailText = bustingText.slice(2);
+				expect(rawTailText).not.toContainEqual(
+					expect.stringContaining("covered request"),
+				);
+				expect(rawTailText).not.toContainEqual(
+					expect.stringContaining("covered answer"),
+				);
+				expect(rawTailText).toEqual([expect.stringContaining("live tail")]);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	});
+
 	describe("Pi deferred compaction marker drain", () => {
 		function seedCompartment(
 			db: ReturnType<typeof createTestDb>,
@@ -4187,6 +4315,40 @@ describe("registerPiContextHandler", () => {
 				expect(appendCompaction).toHaveBeenCalledTimes(1);
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("re-derives an unresolved kept entry on the next materializing pass", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-rederive";
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: null,
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				signalPiPendingMaterialization(sessionId);
+				const appendCompaction = mock(() => "compact-rederived");
+
+				await runDrainPass({ db, sessionId, appendCompaction });
+
+				expect(appendCompaction).toHaveBeenCalledWith(
+					"summary",
+					"entry-3",
+					10,
+					expect.objectContaining({ lastCompactedOrdinal: 2 }),
+					true,
+				);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
@@ -4828,6 +4990,25 @@ describe("Pi branch projection cache", () => {
 });
 
 describe("maybeFireHistorian raw provider cleanup", () => {
+	it("contains spawned historian and cleanup failures before the parked finalizer", () => {
+		const src = readFileSync(
+			join(import.meta.dir, "context-handler.ts"),
+			"utf8",
+		);
+		const start = src.indexOf("function spawnPiHistorianRun");
+		const end = src.indexOf("function resolvePiAppendCompaction", start);
+		const body = src.slice(start, end);
+		const catchIndex = body.indexOf(".catch((error) => {");
+		const finallyIndex = body.indexOf(".finally(() => {");
+
+		expect(catchIndex).toBeGreaterThan(0);
+		expect(finallyIndex).toBeGreaterThan(catchIndex);
+		expect(body).toContain("pi historian finalizer failed");
+		expect(body).not.toContain(
+			"releaseCompartmentLease(db, sessionId, holderId)",
+		);
+	});
+
 	it("unregisters the raw-message provider in finally when no historian is spawned", () => {
 		const src = readFileSync(
 			join(import.meta.dir, "context-handler.ts"),

@@ -110,6 +110,21 @@ struct CkWireMessageData {
     pub meta: HarnessMeta,
 }
 
+#[derive(Serialize)]
+struct CkWireMessageRef<'a> {
+    role: &'a str,
+    content: &'a [CkWireBlock],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a MessageOrigin>,
+    #[serde(skip_serializing_if = "provider_extras_ref_is_empty")]
+    provider_extras: &'a ProviderExtras,
+    meta: &'a HarnessMeta,
+}
+
+fn provider_extras_ref_is_empty(value: &&ProviderExtras) -> bool {
+    value.is_empty()
+}
+
 impl<'de> Deserialize<'de> for CkWireMessage {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -137,12 +152,12 @@ impl Serialize for CkWireMessage {
         if let Some(original) = &self.original {
             return original.serialize(serializer);
         }
-        CkWireMessageData {
-            role: self.role.clone(),
-            content: self.content.clone(),
-            origin: self.origin.clone(),
-            provider_extras: self.provider_extras.clone(),
-            meta: self.meta.clone(),
+        CkWireMessageRef {
+            role: &self.role,
+            content: &self.content,
+            origin: self.origin.as_ref(),
+            provider_extras: &self.provider_extras,
+            meta: &self.meta,
         }
         .serialize(serializer)
     }
@@ -183,6 +198,23 @@ impl CkWireMessage {
         self.original = None;
     }
 
+    /// Serialize canonical JSON without rebuilding retained ingress messages as a second JSON tree.
+    /// Typed messages continue through the sorted-key value form that defines the existing wire
+    /// format; an unchanged retained value already has that canonical representation.
+    pub fn to_canonical_json_vec(&self) -> Result<Vec<u8>, serde_json::Error> {
+        if let Some(original) = &self.original {
+            serde_json::to_vec(original)
+        } else {
+            let canonical = serde_json::to_value(self)?;
+            serde_json::to_vec(&canonical)
+        }
+    }
+
+    /// The parsed object retained for lossless pass-through, when this message is unchanged.
+    pub fn retained_original_json(&self) -> Option<&Value> {
+        self.original.as_ref()
+    }
+
     fn mark_fully_typed(&mut self) {
         self.original = None;
         for block in &mut self.content {
@@ -205,6 +237,13 @@ struct CkWireBlockData {
     pub kind: CkKind,
     #[serde(default, skip_serializing_if = "ProviderExtras::is_empty")]
     pub provider_extras: ProviderExtras,
+}
+
+#[derive(Serialize)]
+struct CkWireBlockRef<'a> {
+    kind: &'a CkKind,
+    #[serde(skip_serializing_if = "provider_extras_ref_is_empty")]
+    provider_extras: &'a ProviderExtras,
 }
 
 impl<'de> Deserialize<'de> for CkWireBlock {
@@ -231,9 +270,9 @@ impl Serialize for CkWireBlock {
         if let Some(original) = &self.original {
             return original.serialize(serializer);
         }
-        CkWireBlockData {
-            kind: self.kind.clone(),
-            provider_extras: self.provider_extras.clone(),
+        CkWireBlockRef {
+            kind: &self.kind,
+            provider_extras: &self.provider_extras,
         }
         .serialize(serializer)
     }
@@ -263,6 +302,11 @@ impl CkWireBlock {
     /// bytes and the edit never reaches the wire.
     pub fn mark_modified(&mut self) {
         self.original = None;
+    }
+
+    /// The parsed object retained for lossless pass-through, when this block is unchanged.
+    pub fn retained_original_json(&self) -> Option<&Value> {
+        self.original.as_ref()
     }
 }
 
@@ -416,8 +460,8 @@ const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
 const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
 /// The recency entry is at most 99 bytes. An interesting entry is at most 1,906 bytes with
 /// sender identity and arc counters; JSON's worst case expands fingerprint bytes to `\u00xx`.
-const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
-const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_906;
+const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 157;
+const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_964;
 /// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
 pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
     + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
@@ -2786,10 +2830,11 @@ pub struct HistorianDurableState {
     /// later firing establishes its producer run.
     #[serde(default)]
     pub last_failure: Option<String>,
-    /// Why the most recent pass declined to fire (reason discriminant only, no numbers,
-    /// so steady-state passes rewrite nothing). The twin of `last_failure` for the
-    /// pre-fire half: a supervised rig cannot read the transform response's diagnostics
-    /// block, so the skip branch must be readable from the state dump. Cleared on fire.
+    /// Why the most recent pass declined to fire. The structured text retains the raw Rust
+    /// cause, a TypeScript-aligned canonical cause, and quantized measurements when available.
+    /// Its change gate prevents steady-state passes from rewriting the row. The twin of
+    /// `last_failure` for the pre-fire half: a supervised rig cannot read the transform response's
+    /// diagnostics block, so the skip branch must be readable from the state dump. Cleared on fire.
     #[serde(default)]
     pub last_no_fire: Option<String>,
     /// Consecutive failures on the historian publication path. This is diagnostic-only
@@ -2823,7 +2868,14 @@ impl Default for HistorianDurableState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassSchedulerObservation {
     pub timestamp_ms: i64,
+    /// Detailed Rust pass band retained for existing incident tooling.
     pub scheduler_decision: String,
+    /// Execute/defer class shared with TypeScript `transform_decisions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_decision: Option<String>,
+    /// Canonical TypeScript refusal reason when the final class is defer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_reason: Option<String>,
     pub drain_latch_active: bool,
 }
 
@@ -2832,6 +2884,10 @@ pub struct PassSchedulerObservation {
 pub struct InterestingPassSchedulerObservation {
     pub timestamp_ms: i64,
     pub scheduler_decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_reason: Option<String>,
     pub drain_latch_active: bool,
     /// Sender-stamped request instant. Missing remains missing; it is never backfilled from the
     /// module clock because the two clocks are not interchangeable correlation keys.
@@ -2869,6 +2925,8 @@ impl InterestingPassSchedulerObservation {
         Self {
             timestamp_ms: observation.timestamp_ms,
             scheduler_decision: observation.scheduler_decision.clone(),
+            canonical_decision: observation.canonical_decision.clone(),
+            defer_reason: observation.defer_reason.clone(),
             drain_latch_active: observation.drain_latch_active,
             request_observed_at_ms,
             full_array_fingerprint: full_array_fingerprint
@@ -2893,6 +2951,29 @@ fn serialize_scheduler_observation(
             "unknown scheduler decision {:?}",
             observation.scheduler_decision
         )));
+    }
+    if let Some(canonical_decision) = observation.canonical_decision.as_deref() {
+        let expected = if observation.scheduler_decision == "Defer" {
+            "defer"
+        } else {
+            "execute"
+        };
+        if canonical_decision != expected {
+            return Err(McStoreError::Serde(format!(
+                "scheduler pass {} requires canonical decision {expected}, got {canonical_decision}",
+                observation.scheduler_decision
+            )));
+        }
+    }
+    if let Some(defer_reason) = observation.defer_reason.as_deref() {
+        if observation.scheduler_decision != "Defer"
+            || !matches!(defer_reason, "scheduler_defer" | "mid_turn_boundary")
+        {
+            return Err(McStoreError::Serde(format!(
+                "invalid scheduler defer reason {defer_reason} for pass {}",
+                observation.scheduler_decision
+            )));
+        }
     }
     serde_json::to_string(observation).map_err(|error| McStoreError::Serde(error.to_string()))
 }
@@ -6066,6 +6147,10 @@ impl<'a> FacadeMutationTxn<'a> {
         expected_version: i64,
         content: Option<&str>,
         surface_condition: Option<Option<&str>>,
+        compiled_provider: Option<&str>,
+        compiled_config: Option<&str>,
+        compiled_at: Option<i64>,
+        compile_status: Option<&str>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
         let current = load_note_tx(self.tx, note_id)
@@ -6098,19 +6183,36 @@ impl<'a> FacadeMutationTxn<'a> {
             .tx
             .execute(
                 "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
+                    compiled_provider = CASE WHEN ?2 THEN ?4 ELSE compiled_provider END,
+                    compiled_config = CASE WHEN ?2 THEN ?5 ELSE compiled_config END,
+                    compiled_at = CASE WHEN ?2 THEN ?6 ELSE compiled_at END,
+                    compile_status = CASE WHEN ?2 THEN ?7 ELSE compile_status END,
+                    status = ?8, status_version = status_version + 1, updated_at_ms = ?9,
                     last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
                     ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
                     ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
                     compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
                     manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
                     check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
-                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                    check_cron = CASE WHEN ?2 THEN NULL ELSE check_cron END,
+                    check_version = CASE WHEN ?2 THEN 0 ELSE check_version END,
+                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END,
+                    check_failure_count = CASE WHEN ?2 THEN 0 ELSE check_failure_count END,
+                    check_network_failure_count = CASE WHEN ?2 THEN 0 ELSE check_network_failure_count END,
+                    check_quarantined_until = CASE WHEN ?2 THEN NULL ELSE check_quarantined_until END,
+                    check_next_due_at = CASE WHEN ?2 THEN NULL ELSE check_next_due_at END,
+                    check_compiled_at = CASE WHEN ?2 THEN NULL ELSE check_compiled_at END,
+                    check_false_since_at = CASE WHEN ?2 THEN NULL ELSE check_false_since_at END,
+                    check_last_liveness_at = CASE WHEN ?2 THEN NULL ELSE check_last_liveness_at END
+                  WHERE id = ?10 AND project_path = ?11 AND status = ?12 AND status_version = ?13",
                 params![
                     next_content,
                     condition_changed,
                     next_condition,
+                    compiled_provider,
+                    compiled_config,
+                    compiled_at,
+                    compile_status,
                     next_status,
                     now_ms,
                     note_id,
@@ -10655,9 +10757,10 @@ impl McStore {
                     )?;
                     tx.execute(
                         &format!(
-                            "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
-                             SELECT type, project_path, ?1, content, status, surface_condition,
-                                    ready_at, ready_reason, manifest_json, compiled_check, check_hash,
+                             "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
+                              SELECT type, project_path, ?1, content, status, surface_condition,
+                                     compiled_provider, compiled_config, compiled_at, compile_status,
+                                     ready_at, ready_reason, manifest_json, compiled_check, check_hash,
                                     check_cron, check_failure_count, check_network_failure_count,
                                     check_quarantined_until, check_next_due_at, check_compiled_at,
                                     check_false_since_at, check_last_liveness_at, last_checked_at,
@@ -13182,8 +13285,9 @@ impl McStore {
             tx.execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
+                  compiled_provider, compiled_config, compiled_at, compile_status,
                   anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'module', ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -13193,6 +13297,10 @@ impl McStore {
                         .surface_condition
                         .map(str::trim)
                         .filter(|value| !value.is_empty()),
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.anchor_block_id,
                     input.anchor_ordinal,
                     input.now_ms,
@@ -15363,11 +15471,14 @@ impl McStore {
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
                  ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
                     type=excluded.type, project_path=excluded.project_path,
                     session_id=excluded.session_id, content=excluded.content,
                     status=excluded.status, surface_condition=excluded.surface_condition,
+                    compiled_provider=excluded.compiled_provider,
+                    compiled_config=excluded.compiled_config, compiled_at=excluded.compiled_at,
+                    compile_status=excluded.compile_status,
                     ready_at=excluded.ready_at, ready_reason=excluded.ready_reason,
                     manifest_json=excluded.manifest_json, compiled_check=excluded.compiled_check,
                     check_hash=excluded.check_hash, check_cron=excluded.check_cron,
@@ -15409,6 +15520,10 @@ impl McStore {
                     text("content").unwrap_or(""),
                     text("status").unwrap_or("active"),
                     text("surface_condition"),
+                    text("compiled_provider"),
+                    text("compiled_config"),
+                    integer("compiled_at"),
+                    text("compile_status"),
                     integer("ready_at"),
                     text("ready_reason"),
                     text("manifest_json"),
@@ -16320,7 +16435,7 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
 }
 
 const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
-const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
 
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
@@ -19238,11 +19353,15 @@ mod tests {
         let defer = PassSchedulerObservation {
             timestamp_ms: 32,
             scheduler_decision: "Defer".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
         let force = PassSchedulerObservation {
             timestamp_ms: 33,
             scheduler_decision: "Force85".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
         store
@@ -19270,6 +19389,8 @@ mod tests {
                     &PassSchedulerObservation {
                         timestamp_ms,
                         scheduler_decision: "Execute".to_string(),
+                        canonical_decision: None,
+                        defer_reason: None,
                         drain_latch_active: false,
                     },
                     None,
@@ -19303,6 +19424,8 @@ mod tests {
         let interesting = PassSchedulerObservation {
             timestamp_ms: 1,
             scheduler_decision: "Force85".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
 
@@ -19322,6 +19445,8 @@ mod tests {
                     &PassSchedulerObservation {
                         timestamp_ms,
                         scheduler_decision: "Execute".to_string(),
+                        canonical_decision: None,
+                        defer_reason: None,
                         drain_latch_active: true,
                     },
                     Some(10_000 + timestamp_ms as u64),
@@ -19388,6 +19513,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: scheduler_decision.to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active,
                 },
                 (
@@ -19435,11 +19562,15 @@ mod tests {
         let reduction = PassSchedulerObservation {
             timestamp_ms: 700,
             scheduler_decision: "Execute".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
         let divergence = PassSchedulerObservation {
             timestamp_ms: 701,
             scheduler_decision: "Emergency95".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
 
@@ -19515,7 +19646,9 @@ mod tests {
     fn scheduler_interesting_history_is_oldest_first_bounded_and_byte_bounded() {
         let worst_observation = PassSchedulerObservation {
             timestamp_ms: i64::MIN,
-            scheduler_decision: "Emergency95".to_string(),
+            scheduler_decision: "Defer".to_string(),
+            canonical_decision: Some("defer".to_string()),
+            defer_reason: Some("mid_turn_boundary".to_string()),
             drain_latch_active: false,
         };
         assert_eq!(
@@ -19551,6 +19684,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: "Emergency95".to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active: true,
                 },
                 (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19598,6 +19733,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: decision.to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active: decision == "Execute",
                 },
                 (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19648,6 +19785,8 @@ mod tests {
             &PassSchedulerObservation {
                 timestamp_ms: 400,
                 scheduler_decision: "Force85".to_string(),
+                canonical_decision: None,
+                defer_reason: None,
                 drain_latch_active: false,
             },
             (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19673,6 +19812,8 @@ mod tests {
         let observation = PassSchedulerObservation {
             timestamp_ms: 500,
             scheduler_decision: "Defer".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
 
@@ -20523,6 +20664,260 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining_classes, vec!["byte-mismatch"]);
+    }
+
+    #[test]
+    fn migration_51_defaults_legacy_mappings_and_seed_upserts_mapping_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .create_scalar_function(
+                "mc_note_caller_project",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                |_context| Ok(String::new()),
+            )
+            .unwrap();
+        for function in ["mc_facade_authority_domain", "mc_facade_authority_route"] {
+            connection
+                .create_scalar_function(function, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                    Ok(String::new())
+                })
+                .unwrap();
+        }
+        connection
+            .execute(
+                "CREATE TABLE cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 )",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 50)
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version(namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO mc_memories(
+                     id, project_path, category, content, normalized_hash, status,
+                     first_seen_at, created_at, updated_at, last_seen_at
+                 ) VALUES (1, 'legacy-project', 'CONSTRAINTS', 'legacy', 'legacy-hash',
+                           'active', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
+                 VALUES (1, 'legacy-project', '[\"src/legacy.rs\"]', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let legacy_origin = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT mapping_origin FROM mc_memory_mappings WHERE memory_id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(legacy_origin, "mapper");
+
+        let snapshot = |origin: &str, mapping: Value, updated_at: i64| AuthoritySeedRow {
+            source_row_id: 51,
+            snapshot: serde_json::json!({
+                "id": 51,
+                "project_path": "seed-project",
+                "category": "CONSTRAINTS",
+                "content": "seeded mapping",
+                "normalized_hash": "seed-hash",
+                "status": "active",
+                "mapping": mapping,
+                "mapping_origin": origin,
+                "updated_at": updated_at,
+            }),
+        };
+        store
+            .seed_authority_rows(
+                "context-seed",
+                "seed-project",
+                "memories",
+                &[snapshot("host_rejected_fallback", serde_json::json!([]), 2)],
+            )
+            .unwrap();
+        store
+            .seed_authority_rows(
+                "context-seed",
+                "seed-project",
+                "memories",
+                &[snapshot("mapper", serde_json::json!(["src/lib.rs"]), 3)],
+            )
+            .unwrap();
+        let seeded_mapping = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT mapping.mapped_files_json, mapping.mapping_origin
+                       FROM mc_memory_mappings mapping
+                       JOIN mc_memories memory ON memory.id = mapping.memory_id
+                      WHERE memory.context_store_uuid = 'context-seed'
+                        AND memory.context_row_id = 51",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            seeded_mapping,
+            ("[\"src/lib.rs\"]".to_string(), "mapper".to_string())
+        );
+    }
+
+    #[test]
+    fn migration_52_preserves_legacy_notes_and_durably_stores_compilation_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .create_scalar_function(
+                "mc_note_caller_project",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                |_context| Ok("/repo".to_string()),
+            )
+            .unwrap();
+        for function in ["mc_facade_authority_domain", "mc_facade_authority_route"] {
+            connection
+                .create_scalar_function(function, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                    Ok(String::new())
+                })
+                .unwrap();
+        }
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 )",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 25)
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS mc_notes_ownership_insert;
+                 DROP TRIGGER IF EXISTS mc_notes_ownership_update;
+                 DROP TRIGGER IF EXISTS mc_notes_ownership_delete;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mc_notes
+                     (project_path, session_id, content, status, surface_condition,
+                      created_at_ms, updated_at_ms)
+                 VALUES ('/repo', 'session', 'legacy note', 'active',
+                         'legacy condition', 1, 2)",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| (26..=51).contains(&migration.version))
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let legacy = store
+            .get_note_by_id("/repo", "session", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.compiled_provider, None);
+        assert_eq!(legacy.compiled_config, None);
+        assert_eq!(legacy.compiled_at, None);
+        assert_eq!(legacy.compile_status, None);
+
+        let compiled = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "/repo",
+                route_project_root: None,
+                session_id: Some("session"),
+                content: "compiled note",
+                surface_condition: Some("compiled condition"),
+                compiled_provider: Some("retina-local-fs"),
+                compiled_config: Some("{\"kind\":\"path_exists\"}"),
+                compiled_at: Some(123),
+                compile_status: Some("compiled"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            compiled.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            compiled.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\"}")
+        );
+        assert_eq!(compiled.compiled_at, Some(123));
+        assert_eq!(compiled.compile_status.as_deref(), Some("compiled"));
+        let compiled_id = compiled.id;
+        drop(store);
+
+        let reopened = McStore::open(&descriptor(dir.path())).unwrap();
+        let durable = reopened
+            .get_note_by_id("/repo", "session", compiled_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(durable.compiled_at, Some(123));
+        assert_eq!(durable.compile_status.as_deref(), Some("compiled"));
     }
 
     #[test]
@@ -26186,6 +26581,10 @@ mod shadow_tests {
                         initial.status_version,
                         Some("  keep surrounding whitespace  "),
                         Some(Some("same condition")),
+                        None,
+                        None,
+                        None,
+                        None,
                         2,
                     )?;
                     Ok(Vec::new())
@@ -26216,6 +26615,10 @@ mod shadow_tests {
                         &updated.status,
                         updated.status_version,
                         Some(""),
+                        None,
+                        None,
+                        None,
+                        None,
                         None,
                         3,
                     )?;

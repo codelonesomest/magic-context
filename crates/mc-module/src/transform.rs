@@ -154,6 +154,19 @@ pub struct ServedMessage {
     retained_bytes: usize,
 }
 
+fn canonical_message_bytes(message: &CkWireMessage) -> Vec<u8> {
+    message
+        .to_canonical_json_vec()
+        .expect("CK wire messages must always serialize")
+}
+
+#[cfg(test)]
+fn canonical_message_bytes_reference(message: &CkWireMessage) -> Vec<u8> {
+    let value = serde_json::to_value(message)
+        .expect("CK wire messages must always have a JSON representation");
+    serde_json::to_vec(&value).expect("CK wire message values must always serialize")
+}
+
 impl ServedMessage {
     fn from_message(message: CkWireMessage) -> Self {
         Self::from_message_reusing(message, None)
@@ -169,10 +182,7 @@ impl ServedMessage {
         message: CkWireMessage,
         projected_blocks: Option<&[&FlatBlock]>,
     ) -> Self {
-        let canonical = serde_json::to_value(&message)
-            .expect("CK wire messages must always have a JSON representation");
-        let canonical_bytes =
-            serde_json::to_vec(&canonical).expect("CK wire message values must always serialize");
+        let canonical_bytes = canonical_message_bytes(&message);
         let block_fingerprints = message
             .content
             .iter()
@@ -1143,6 +1153,14 @@ pub struct TransformTimings {
     #[serde(default)]
     pub handler_total: f64,
     #[serde(default)]
+    pub request_decode: f64,
+    #[serde(default)]
+    pub handler_prepare: f64,
+    #[serde(default)]
+    pub transform_execute: f64,
+    #[serde(default)]
+    pub handler_followup: f64,
+    #[serde(default)]
     pub request_observed_to_handler: f64,
     #[serde(default)]
     pub delta_expand: f64,
@@ -1251,6 +1269,8 @@ pub struct TransformTimings {
     #[serde(default)]
     pub build_serialize_misses: f64,
     #[serde(default)]
+    pub build_serialized_messages: usize,
+    #[serde(default)]
     pub build_tail_loop: f64,
     #[serde(default)]
     pub divergence: f64,
@@ -1329,7 +1349,7 @@ pub fn format_pass_timing_line(
             .collect()
     };
     format!(
-        "mc-pass-timing session={session} total={:.1} handler_total={:.1} request_observed_to_handler={:.1} \
+        "mc-pass-timing session={session} total={:.1} handler_total={:.1} request_decode={:.1} handler_prepare={:.1} transform_execute={:.1} handler_followup={:.1} request_observed_to_handler={:.1} \
          delta_expand={:.1} side_channel_drain={:.1} trace_received={:.1} projection_cache_lookup={:.1} projection_cache_store={:.1} \
          native_attach={:.1} trace_complete={:.1} response_observation={:.1} retained_size={:.1} snapshot_store={:.1} projection={:.1} \
          projection_reused_messages={} projection_projected_messages={} store_cache_state={:.1} store_tags={:.1} store_temporal={:.1} \
@@ -1343,7 +1363,7 @@ pub fn format_pass_timing_line(
          transition_detection={:.3} emergency_reasoning_exclusions={} todo={:.1} \
          blocks_by_mid={:.1} build_frozen_unit_index={:.1} full_drop_tool_ids={:.1} \
          build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
-         build_cache_lookup={:.1} build_serialize_misses={:.1} build_tail_loop={:.1} \
+         build_cache_lookup={:.1} build_serialize_misses={:.1} build_serialized_messages={} build_tail_loop={:.1} \
            divergence={:.1} store_commit={:.1} trigger_ms={:.1} trigger_boundary_build={:.1} trigger_eval={:.1} \
              trigger_cache_store={:.1} trigger_token_cache_hits={} trigger_tokenized_blocks={} \
              post_attach_ms={:.1} native_cache_reused_messages={} native_cache_encoded_messages={} \
@@ -1354,6 +1374,10 @@ pub fn format_pass_timing_line(
            cache_hits={} cache_misses={} cache_dirty_skips={}",
         timings.total,
         timings.handler_total,
+        timings.request_decode,
+        timings.handler_prepare,
+        timings.transform_execute,
+        timings.handler_followup,
         timings.request_observed_to_handler,
         timings.delta_expand,
         timings.side_channel_drain,
@@ -1408,6 +1432,7 @@ pub fn format_pass_timing_line(
         timings.build_frozen_unit_scan,
         timings.build_cache_lookup,
         timings.build_serialize_misses,
+        timings.build_serialized_messages,
         timings.build_tail_loop,
         timings.divergence,
         timings.store_commit,
@@ -1457,6 +1482,12 @@ pub struct TransformResponse {
     /// need to interpret the legacy action field.
     #[serde(default)]
     pub decision: String,
+    /// Canonical execute/defer class shared with TypeScript transform telemetry.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scheduler_decision: Option<String>,
+    /// Canonical TypeScript refusal reason when the scheduler class is defer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scheduler_defer_reason: Option<String>,
     /// The classifier's raw cause for a HARD/SOFT decision. Unknown future causes are retained.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub materialize_reason: Option<String>,
@@ -1543,6 +1574,8 @@ impl TransformResponse {
             full_array_fingerprint,
             action: "NEED_FULL_SYNC".to_string(),
             decision: "NEED_FULL_SYNC".to_string(),
+            scheduler_decision: None,
+            scheduler_defer_reason: None,
             materialize_reason: None,
             first_divergence: None,
             timings: None,
@@ -1578,6 +1611,8 @@ impl TransformResponse {
             full_array_fingerprint,
             action: "PASSTHROUGH".to_string(),
             decision: "PASSTHROUGH".to_string(),
+            scheduler_decision: None,
+            scheduler_defer_reason: None,
             materialize_reason: None,
             first_divergence: None,
             timings: None,
@@ -1613,7 +1648,15 @@ impl TransformResponse {
 pub struct HistorianDiagnostics {
     pub fired: bool,
     pub reason: Option<String>,
+    /// Existing transform consumers still read this coarse Rust discriminant; newer
+    /// consumers use the additional structured fields below.
     pub no_fire: Option<String>,
+    /// Structured diagnostic detail retaining the raw Rust cause and its TypeScript-aligned class.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub no_fire_detail: Option<String>,
+    /// Canonical TypeScript no-fire vocabulary for adapter logs and incident grep parity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub canonical_cause: Option<String>,
     pub state: String,
     /// Tail-size progress numbers from the trigger's boundary resolution, absent when the
     /// pass never reached boundary resolution (busy, load failure, no messages). Purely
@@ -1650,6 +1693,7 @@ pub struct TransformWithProjection {
     /// second numbers-only table scan after the response has been built.
     pub tag_numbers: BTreeMap<String, u64>,
     pub scheduler_pass: scheduler::PassDecision,
+    pub scheduler_defer_reason: Option<scheduler::SchedulerDeferReason>,
     pub scheduler_drain_latch_active: bool,
     pub boundary_state: BoundaryState,
     pub trim_mismatch: Option<TrimMismatch>,
@@ -1992,6 +2036,7 @@ fn record_stable_pass_trace(
     }) {
         let observation = pass_scheduler_observation(
             pass.scheduler_pass,
+            pass.scheduler_defer_reason,
             pass.scheduler_drain_latch_active,
             ctx.now_ms,
         );
@@ -2006,12 +2051,15 @@ fn record_stable_pass_trace(
 
 fn pass_scheduler_observation(
     pass: scheduler::PassDecision,
+    defer_reason: Option<scheduler::SchedulerDeferReason>,
     drain_latch_active: bool,
     timestamp_ms: i64,
 ) -> PassSchedulerObservation {
     PassSchedulerObservation {
         timestamp_ms,
         scheduler_decision: pass.as_str().to_string(),
+        canonical_decision: Some(pass.canonical_decision().to_string()),
+        defer_reason: defer_reason.map(|reason| reason.as_str().to_string()),
         drain_latch_active,
     }
 }
@@ -2453,6 +2501,7 @@ fn lineage_protocol_passthrough(
         tag_numbers: BTreeMap::new(),
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
         scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch: None,
@@ -2702,6 +2751,7 @@ fn apply_additive_only(
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
     {
         scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.defer_reason = None;
         scheduler_outcome.deferred_execute = None;
     }
     timings.decide = elapsed_ms(decide_scheduler_started_at);
@@ -2984,6 +3034,7 @@ fn apply_additive_only(
                 first_divergence: None,
                 scheduler_observation: Some(&pass_scheduler_observation(
                     scheduler_outcome.pass,
+                    scheduler_outcome.defer_reason,
                     scheduler_outcome.drain_latch.is_active(),
                     ctx.now_ms,
                 )),
@@ -3032,6 +3083,7 @@ fn apply_additive_only(
         tag_numbers: BTreeMap::new(),
         projection,
         scheduler_pass: scheduler_outcome.pass,
+        scheduler_defer_reason: scheduler_outcome.defer_reason,
         scheduler_drain_latch_active: scheduler_outcome.drain_latch.is_active(),
         boundary_state: BoundaryState::Absent,
         trim_mismatch: None,
@@ -3048,6 +3100,10 @@ fn apply_additive_only(
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: action.clone(),
             decision: action,
+            scheduler_decision: Some(scheduler_outcome.pass.canonical_decision().to_string()),
+            scheduler_defer_reason: scheduler_outcome
+                .defer_reason
+                .map(|reason| reason.as_str().to_string()),
             materialize_reason,
             first_divergence: None,
             timings: Some(timings),
@@ -3497,6 +3553,7 @@ fn apply_once(
                         first_divergence: first_divergence_json.as_deref(),
                         scheduler_observation: Some(&pass_scheduler_observation(
                             scheduler::PassDecision::Defer,
+                            Some(scheduler::SchedulerDeferReason::SchedulerDefer),
                             false,
                             ctx.now_ms,
                         )),
@@ -3607,6 +3664,7 @@ fn apply_once(
                 first_divergence: first_divergence_json.as_deref(),
                 scheduler_observation: Some(&pass_scheduler_observation(
                     scheduler::PassDecision::Defer,
+                    Some(scheduler::SchedulerDeferReason::SchedulerDefer),
                     false,
                     ctx.now_ms,
                 )),
@@ -3912,6 +3970,7 @@ fn apply_once(
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
     {
         scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.defer_reason = None;
         scheduler_outcome.deferred_execute = None;
     }
     // First-fold HARD trigger: a never-minted boundary (empty boundary_id) means no
@@ -5368,15 +5427,16 @@ fn apply_once(
     // Recheck trailing blanks on every pass, including deferred passes. Decisions come only from
     // the immutable ingress snapshot and are intersected with the served projection. On a deferred
     // pass, record only the newest assistant because no cached message follows it.
-    let (trailing_blank_decisions_updated, newest_keep_updated) = refresh_trailing_blank_decisions(
-        &mut core,
-        req,
-        &trailing_blank_source_decisions,
-        &built_output.messages,
-        is_provider_prefix_mutation_pass,
-    );
+    let (trailing_blank_decisions_updated, newest_replay_required) =
+        refresh_trailing_blank_decisions(
+            &mut core,
+            req,
+            &trailing_blank_source_decisions,
+            &built_output.messages,
+            is_provider_prefix_mutation_pass,
+        );
     if trailing_blank_decisions_updated > 0
-        && (is_provider_prefix_mutation_pass || newest_keep_updated)
+        && (is_provider_prefix_mutation_pass || newest_replay_required)
     {
         built_output = build_output_with_tags(
             &core,
@@ -5443,6 +5503,7 @@ fn apply_once(
     timings.build_frozen_unit_scan = build_timings.frozen_unit_scan;
     timings.build_cache_lookup = build_timings.cache_lookup;
     timings.build_serialize_misses = build_timings.serialize_misses;
+    timings.build_serialized_messages = build_timings.serialized_messages;
     timings.build_tail_loop = build_timings.tail_loop;
     timings.build_identity_messages = build_timings.identity_messages;
     timings.cache_hits = build_timings.cache_hits;
@@ -5530,6 +5591,7 @@ fn apply_once(
                 first_divergence: first_divergence_json.as_deref(),
                 scheduler_observation: Some(&pass_scheduler_observation(
                     scheduler_outcome.pass,
+                    scheduler_outcome.defer_reason,
                     scheduler_outcome.drain_latch.is_active(),
                     ctx.now_ms,
                 )),
@@ -5611,6 +5673,7 @@ fn apply_once(
         tag_numbers,
         projection,
         scheduler_pass: scheduler_outcome.pass,
+        scheduler_defer_reason: scheduler_outcome.defer_reason,
         scheduler_drain_latch_active: scheduler_outcome.drain_latch.is_active(),
         boundary_state,
         trim_mismatch,
@@ -5627,6 +5690,10 @@ fn apply_once(
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: result_action.clone(),
             decision: result_action,
+            scheduler_decision: Some(scheduler_outcome.pass.canonical_decision().to_string()),
+            scheduler_defer_reason: scheduler_outcome
+                .defer_reason
+                .map(|reason| reason.as_str().to_string()),
             materialize_reason,
             first_divergence,
             timings: Some(timings),
@@ -5688,7 +5755,6 @@ fn trailing_blank_identity_replays_stored(
         core,
         profile,
         req.provider_id.as_deref(),
-        false,
         mid,
         &mut normalized.ck,
     ) == 0
@@ -5720,23 +5786,33 @@ fn enforce_block_identity(
         if stored == vector {
             continue;
         }
+        let newest_keep_refresh = latest_assistant_mid(&req.messages) == Some(mid.as_str())
+            && frozen_trailing_blank_decision(core, mid) == Some(FrozenTrailingBlankDecision::Keep)
+            && req
+                .messages
+                .iter()
+                .find(|message| message.mid == mid.as_str())
+                .and_then(trailing_blank_source_decision)
+                .is_some_and(|(source, count)| {
+                    source == FrozenTrailingBlankDecision::Strip
+                        || frozen_trailing_blank_keep_count(core, mid) != Some(count)
+                });
+        if newest_keep_refresh {
+            // The refresh and this identity adoption commit atomically. This permits only
+            // keep-count changes and keep-to-strip demotion; an absorbing strip never adopts
+            // a late suffix from the live source.
+            re_adoptions.push(TailIdentityReAdoption {
+                mid: mid.clone(),
+                old_hash_prefix: block_identity_hash_prefix(stored),
+                new_hash_prefix: block_identity_hash_prefix(vector),
+            });
+            continue;
+        }
         // A provider may append an invisible suffix after a message was stored.
         // Accept it only when the stored strip/keep decision reconstructs the full
-        // message identity that was previously served.
+        // message identity that was previously served. The frozen decision remains
+        // authoritative, so an absorbing strip never re-adopts the late source suffix.
         if trailing_blank_identity_replays_stored(req, core, mid, stored) {
-            if latest_assistant_mid(&req.messages) == Some(mid.as_str())
-                && frozen_trailing_blank_decision(core, mid)
-                    == Some(FrozenTrailingBlankDecision::Strip)
-            {
-                // Keep a trailing blank visible while the newest assistant may still
-                // change, and update its stored identity as the decision becomes keep.
-                // Older assistants replay strip and retain their prior identity.
-                re_adoptions.push(TailIdentityReAdoption {
-                    mid: mid.clone(),
-                    old_hash_prefix: block_identity_hash_prefix(stored),
-                    new_hash_prefix: block_identity_hash_prefix(vector),
-                });
-            }
             continue;
         }
         if identity_drift_requires_reject(meta, req, core, mid) {
@@ -7426,6 +7502,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         tag_numbers,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
         scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch,
@@ -8064,7 +8141,9 @@ fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, &str)> {
         return None;
     }
     match &block.wire.kind {
-        ck_wire::CkKind::Text { text } if block.role == "user" || block.role == "assistant" => {
+        ck_wire::CkKind::Text { text }
+            if block.role == "user" || (block.role == "assistant" && !text.trim().is_empty()) =>
+        {
             Some((TaggableKind::Message, text))
         }
         ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
@@ -9164,10 +9243,23 @@ fn sanitize_user_hint_query(text: &str) -> String {
     let without_reminders = strip_system_reminder_wrappers(text);
     let without_comments = html_comment_regex().replace_all(&without_reminders, "");
     let without_markup = xml_html_tag_regex().replace_all(&without_comments, "");
-    strip_mc_tag_notation(&without_markup)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let without_tag_notation = strip_mc_tag_notation(&without_markup);
+    let without_line_trailing_space =
+        trailing_horizontal_whitespace_regex().replace_all(&without_tag_notation, "\n");
+    excess_newlines_regex()
+        .replace_all(&without_line_trailing_space, "\n\n")
+        .trim()
+        .to_string()
+}
+
+fn trailing_horizontal_whitespace_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"[ \t]+\n").expect("valid trailing whitespace regex"))
+}
+
+fn excess_newlines_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\n{3,}").expect("valid excess newline regex"))
 }
 
 fn html_comment_regex() -> &'static Regex {
@@ -10807,11 +10899,6 @@ fn message_strip_unit<'a>(core: &'a CoreState, kind: &str, mid: &str) -> Option<
     core.frozen_units.iter().find(|unit| unit.key == key)
 }
 
-fn block_strip_unit<'a>(core: &'a CoreState, kind: &str, block_id: &str) -> Option<&'a FrozenUnit> {
-    let key = format!("strip:{kind}:{block_id}");
-    core.frozen_units.iter().find(|unit| unit.key == key)
-}
-
 fn message_tag_number(message: &CkIngressMessage, tag_numbers: &BTreeMap<String, u64>) -> u64 {
     // TypeScript represents a missing tag as age zero for processed-image stripping. Reasoning
     // callers separately require a positive tag before mutating signed or authored text.
@@ -11015,14 +11102,14 @@ struct ReasoningMutationPolicy {
 }
 
 fn remove_frozen_historical_reasoning(
-    core: &CoreState,
+    frozen_units: &FrozenUnitLookup<'_>,
     message: &CkIngressMessage,
     reasoning_mutation_exempt: bool,
     rebuilt: &mut CkWireMessage,
 ) -> usize {
     if reasoning_mutation_exempt
         || message.ck.role != "assistant"
-        || message_strip_unit(core, "reasoning_age", &message.mid).is_none()
+        || output_message_strip_unit(frozen_units, "reasoning_age", &message.mid).is_none()
     {
         return 0;
     }
@@ -11040,7 +11127,7 @@ fn remove_frozen_historical_reasoning(
 }
 
 fn apply_surface_strips(
-    core: &CoreState,
+    frozen_units: &FrozenUnitLookup<'_>,
     req: &TransformRequest,
     message: &CkIngressMessage,
     blocks: &[&FlatBlock],
@@ -11051,8 +11138,9 @@ fn apply_surface_strips(
     let sentinel = provider_sentinel_text(req);
     let whole_strip = (!reasoning_policy.exempt)
         .then(|| {
-            message_strip_unit(core, "placeholder", &message.mid)
-                .or_else(|| message_strip_unit(core, "system_injected", &message.mid))
+            output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
+                output_message_strip_unit(frozen_units, "system_injected", &message.mid)
+            })
         })
         .flatten();
     if whole_strip.is_some() {
@@ -11061,8 +11149,10 @@ fn apply_surface_strips(
         return;
     }
 
-    let stale_reduce = message_strip_unit(core, "stale_reduce", &message.mid).is_some();
-    let image_seed = message_strip_unit(core, "processed_image", &message.mid).is_some();
+    let stale_reduce =
+        output_message_strip_unit(frozen_units, "stale_reduce", &message.mid).is_some();
+    let image_seed =
+        output_message_strip_unit(frozen_units, "processed_image", &message.mid).is_some();
     let message_tag = message_tag_number(message, tag_numbers);
     let aged = message_tag > 0 && message_tag <= reasoning_policy.watermark;
     let mut touched = false;
@@ -11072,7 +11162,9 @@ fn apply_surface_strips(
             continue;
         }
         if !reasoning_policy.exempt {
-            if let Some(unit) = block_strip_unit(core, "system_injected_block", block.id()) {
+            if let Some(unit) =
+                output_message_strip_unit(frozen_units, "system_injected_block", block.id())
+            {
                 rebuilt.content[index].kind = ck_wire::CkKind::Text {
                     text: unit.frozen_payload.clone(),
                 };
@@ -11101,10 +11193,9 @@ fn apply_surface_strips(
                     && request_accepts_empty_content(req)
                     && image_block_is_large(&block.wire))
                     || (request_accepts_empty_content(req)
-                        && core.frozen_units.iter().any(|unit| {
-                            unit.key == format!("{RED_KEY_PREFIX}{}", block.id())
-                                && unit.kind == "image"
-                        })))
+                        && frozen_units
+                            .red_by_block_id(block.id())
+                            .is_some_and(|unit| unit.kind == "image")))
                 || (request_accepts_empty_content(req) && is_structural_noise(&block.wire));
         if should_strip {
             replace_with_sentinel(&mut rebuilt.content[index], &sentinel);
@@ -11593,6 +11684,7 @@ struct BuildOutputTimings {
     cache_lookup: f64,
     serialize_misses: f64,
     tail_loop: f64,
+    serialized_messages: usize,
     identity_messages: usize,
     cache_hits: usize,
     cache_misses: usize,
@@ -11689,6 +11781,41 @@ impl<'a> FrozenUnitLookup<'a> {
     }
 }
 
+fn output_message_strip_unit<'a>(
+    frozen_units: &FrozenUnitLookup<'a>,
+    kind: &str,
+    target: &str,
+) -> Option<&'a FrozenUnit> {
+    frozen_units.by_key(&format!("strip:{kind}:{target}"))
+}
+
+fn output_trailing_blank_keep_count(
+    frozen_units: &FrozenUnitLookup<'_>,
+    mid: &str,
+) -> Option<usize> {
+    let unit = output_message_strip_unit(frozen_units, "trailing_blank_keep", mid)?;
+    if unit.frozen_payload.is_empty() {
+        return Some(1);
+    }
+    unit.frozen_payload
+        .parse::<usize>()
+        .ok()
+        .filter(|count| (2..=10_000).contains(count))
+}
+
+fn output_trailing_blank_decision(
+    frozen_units: &FrozenUnitLookup<'_>,
+    mid: &str,
+) -> Option<FrozenTrailingBlankDecision> {
+    if output_trailing_blank_keep_count(frozen_units, mid).is_some() {
+        Some(FrozenTrailingBlankDecision::Keep)
+    } else if output_message_strip_unit(frozen_units, "trailing_blank_strip", mid).is_some() {
+        Some(FrozenTrailingBlankDecision::Strip)
+    } else {
+        None
+    }
+}
+
 struct BuiltOutput {
     messages: Vec<ServedMessage>,
     cache_entries: HashMap<String, SerializedOutputCacheEntry>,
@@ -11714,7 +11841,6 @@ fn message_output_identity(
     full_drop_ids: &HashSet<String>,
     mutation_exempt: bool,
     reasoning_mutation_exempt: bool,
-    trailing_blank_mutation_exempt: bool,
     first_assistant_in_run: bool,
     frozen_unit_scan_ms: &mut f64,
 ) -> String {
@@ -11745,7 +11871,6 @@ fn message_output_identity(
     digest_field(&mut hasher, &[request_accepts_empty_content(req) as u8]);
     digest_field(&mut hasher, &[mutation_exempt as u8]);
     digest_field(&mut hasher, &[reasoning_mutation_exempt as u8]);
-    digest_field(&mut hasher, &[trailing_blank_mutation_exempt as u8]);
     digest_field(&mut hasher, &[first_assistant_in_run as u8]);
     let message_tag = message_tag_number(message, tag_numbers);
     digest_field(&mut hasher, &message_tag.to_le_bytes());
@@ -11823,6 +11948,7 @@ fn cached_or_serialize_output(
             let serialization_started_at = Instant::now();
             let served = ServedMessage::from_message(build());
             timings.serialize_misses += elapsed_ms(serialization_started_at);
+            timings.serialized_messages = timings.serialized_messages.saturating_add(1);
             (served, false)
         }
     }
@@ -12233,11 +12359,10 @@ fn canonical_blank_block() -> CkWireBlock {
     })
 }
 
-pub(crate) fn apply_frozen_trailing_blank_decision(
-    core: &CoreState,
+fn apply_frozen_trailing_blank_decision_from_lookup(
+    frozen_units: &FrozenUnitLookup<'_>,
     profile: SerializerProfile,
     provider_id: Option<&str>,
-    newest_assistant_exempt: bool,
     mid: &str,
     message: &mut CkWireMessage,
 ) -> usize {
@@ -12247,7 +12372,29 @@ pub(crate) fn apply_frozen_trailing_blank_decision(
     {
         return 0;
     }
-    let Some(decision) = frozen_trailing_blank_decision(core, mid) else {
+    apply_frozen_trailing_blank_decision_resolved(
+        profile,
+        provider_id,
+        output_trailing_blank_decision(frozen_units, mid),
+        output_trailing_blank_keep_count(frozen_units, mid),
+        message,
+    )
+}
+
+fn apply_frozen_trailing_blank_decision_resolved(
+    profile: SerializerProfile,
+    provider_id: Option<&str>,
+    decision: Option<FrozenTrailingBlankDecision>,
+    frozen_keep_count: Option<usize>,
+    message: &mut CkWireMessage,
+) -> usize {
+    if profile != SerializerProfile::OpencodeAiSdk
+        || provider_id != Some("anthropic")
+        || message.role != "assistant"
+    {
+        return 0;
+    }
+    let Some(decision) = decision else {
         return 0;
     };
 
@@ -12269,12 +12416,11 @@ pub(crate) fn apply_frozen_trailing_blank_decision(
     };
 
     let trailing_count = message.content.len() - last_meaningful_index - 1;
+    // Apply a frozen strip while the assistant is newest so the suffix is stable from
+    // streaming (no completion blank) through completion and historical replay.
     let keep_count = if decision == FrozenTrailingBlankDecision::Keep {
-        frozen_trailing_blank_keep_count(core, mid).unwrap_or(1)
-    } else if !newest_assistant_exempt
-        && trailing_count > 0
-        && is_reasoning_block(&message.content[last_meaningful_index])
-    {
+        frozen_keep_count.unwrap_or(1)
+    } else if trailing_count > 0 && is_reasoning_block(&message.content[last_meaningful_index]) {
         1
     } else {
         0
@@ -12302,12 +12448,34 @@ pub(crate) fn apply_frozen_trailing_blank_decision(
         return mutations;
     }
 
-    if newest_assistant_exempt || trailing_count == 0 {
+    if trailing_count == 0 {
         return 0;
     }
     message.content.truncate(last_meaningful_index + 1);
     message.mark_modified();
     trailing_count
+}
+
+pub(crate) fn apply_frozen_trailing_blank_decision(
+    core: &CoreState,
+    profile: SerializerProfile,
+    provider_id: Option<&str>,
+    mid: &str,
+    message: &mut CkWireMessage,
+) -> usize {
+    if profile != SerializerProfile::OpencodeAiSdk
+        || provider_id != Some("anthropic")
+        || message.role != "assistant"
+    {
+        return 0;
+    }
+    apply_frozen_trailing_blank_decision_resolved(
+        profile,
+        provider_id,
+        frozen_trailing_blank_decision(core, mid),
+        frozen_trailing_blank_keep_count(core, mid),
+        message,
+    )
 }
 
 fn heal_poisoned_trailing_blank_decisions(
@@ -12395,21 +12563,27 @@ fn refresh_trailing_blank_decisions(
         let frozen_matches = frozen == Some(decision)
             && (decision == FrozenTrailingBlankDecision::Strip
                 || frozen_trailing_blank_keep_count(core, mid) == Some(keep_count));
-        if frozen.is_some() && (newest_assistant_mid != Some(mid) || frozen_matches) {
+        // A strip is absorbing. If a harness blank arrives after the first serve, stripping it
+        // forever makes streaming, completion, and historical projections suffix-monotonic.
+        // A live keep may still change count or demote to strip when its source suffix disappears.
+        if frozen == Some(FrozenTrailingBlankDecision::Strip)
+            || (frozen.is_some() && (newest_assistant_mid != Some(mid) || frozen_matches))
+        {
             continue;
         }
         if frozen.is_none() && !record_historical && newest_assistant_mid != Some(mid) {
             continue;
         }
-        updates.push((mid.to_string(), decision, keep_count));
+        updates.push((mid.to_string(), decision, keep_count, frozen.is_some()));
     }
 
-    let newest_keep_updated = updates.iter().any(|(mid, decision, _)| {
-        newest_assistant_mid == Some(mid.as_str()) && *decision == FrozenTrailingBlankDecision::Keep
+    let newest_replay_required = updates.iter().any(|(mid, decision, _, had_frozen)| {
+        newest_assistant_mid == Some(mid.as_str())
+            && (*had_frozen || *decision == FrozenTrailingBlankDecision::Keep)
     });
     let replaced_keys = updates
         .iter()
-        .flat_map(|(mid, _, _)| {
+        .flat_map(|(mid, _, _, _)| {
             [
                 format!("strip:trailing_blank_keep:{mid}"),
                 format!("strip:trailing_blank_strip:{mid}"),
@@ -12418,7 +12592,7 @@ fn refresh_trailing_blank_decisions(
         .collect::<HashSet<_>>();
     core.frozen_units
         .retain(|unit| !replaced_keys.contains(&unit.key));
-    for (mid, decision, keep_count) in &updates {
+    for (mid, decision, keep_count, _) in &updates {
         let (kind, payload) = match decision {
             FrozenTrailingBlankDecision::Keep if *keep_count > 1 => {
                 ("trailing_blank_keep", keep_count.to_string())
@@ -12428,7 +12602,7 @@ fn refresh_trailing_blank_decisions(
         };
         core.frozen_units.push(strip_unit(kind, mid, &payload));
     }
-    (updates.len(), newest_keep_updated)
+    (updates.len(), newest_replay_required)
 }
 
 fn apply_serializer_residual_to_message(
@@ -12770,8 +12944,6 @@ fn build_output_with_tags_inner(
             mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
         let reasoning_mutation_exempt =
             reasoning_mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
-        let trailing_blank_mutation_exempt =
-            reasoning_mutation_exempt_mid == Some(msg.mid.as_str());
         let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
         let blocks = blocks_by_mid
             .get(msg.mid.as_str())
@@ -12791,7 +12963,6 @@ fn build_output_with_tags_inner(
             &full_drop_ids,
             mutation_exempt,
             reasoning_mutation_exempt,
-            trailing_blank_mutation_exempt,
             first_assistant_in_run,
             &mut build_timings.frozen_unit_scan,
         );
@@ -12889,7 +13060,7 @@ fn build_output_with_tags_inner(
                 }
                 if !mutation_exempt {
                     apply_surface_strips(
-                        core,
+                        &frozen_units,
                         req,
                         msg,
                         blocks,
@@ -12931,14 +13102,21 @@ fn build_output_with_tags_inner(
                 }
                 rebuilt
             };
-            remove_frozen_historical_reasoning(core, msg, reasoning_mutation_exempt, &mut rendered);
+            remove_frozen_historical_reasoning(
+                &frozen_units,
+                msg,
+                reasoning_mutation_exempt,
+                &mut rendered,
+            );
 
             let present = !rendered.content.is_empty()
                 || rendered.meta.synthetic
                 || !blocks_by_mid.contains_key(msg.mid.as_str());
             let output = if present {
                 if let Some(profile) = serializer_profile {
-                    if message_strip_unit(core, "merged_reasoning", &msg.mid).is_some() {
+                    if output_message_strip_unit(&frozen_units, "merged_reasoning", &msg.mid)
+                        .is_some()
+                    {
                         apply_serializer_residual_to_message(
                             profile,
                             req.provider_id.as_deref(),
@@ -12947,23 +13125,25 @@ fn build_output_with_tags_inner(
                             &mut rendered,
                         );
                     }
-                    apply_frozen_trailing_blank_decision(
-                        core,
+                    apply_frozen_trailing_blank_decision_from_lookup(
+                        &frozen_units,
                         profile,
                         req.provider_id.as_deref(),
-                        trailing_blank_mutation_exempt,
                         &msg.mid,
                         &mut rendered,
                     );
                 }
                 (
-                    Some(
-                        ServedMessage::from_message_reusing(
+                    Some({
+                        let served = ServedMessage::from_message_reusing(
                             rendered,
                             (!blocks.is_empty()).then_some(blocks),
                         )
-                        .with_output_identity(&identity),
-                    ),
+                        .with_output_identity(&identity);
+                        build_timings.serialized_messages =
+                            build_timings.serialized_messages.saturating_add(1);
+                        served
+                    }),
                     false,
                 )
             } else {
@@ -13421,7 +13601,9 @@ fn is_sentinel_invisible_text_block(block: &CkWireBlock) -> bool {
 }
 
 fn is_reasoning_ignored_block(block: &CkWireBlock) -> bool {
-    if is_sentinel_invisible_text_block(block) {
+    if is_sentinel_invisible_text_block(block)
+        || matches!(&block.kind, ck_wire::CkKind::Text { text } if is_dropped_placeholder_text(tag_stripped_text(text)))
+    {
         return true;
     }
     matches!(
@@ -14058,6 +14240,10 @@ pub(crate) mod tests {
         for key in [
             "total",
             "handler_total",
+            "request_decode",
+            "handler_prepare",
+            "transform_execute",
+            "handler_followup",
             "request_observed_to_handler",
             "projection",
             "store_cache_state",
@@ -14099,6 +14285,7 @@ pub(crate) mod tests {
             "projection_blocks",
             "tail_messages_emitted",
             "build_identity_messages",
+            "build_serialized_messages",
             "cache_hits",
             "cache_misses",
             "cache_dirty_skips",
@@ -15256,10 +15443,16 @@ pub(crate) mod tests {
             vec![101, 102, 103]
         );
         assert_eq!(history[0].scheduler_decision, "Defer");
+        assert_eq!(history[0].canonical_decision.as_deref(), Some("defer"));
+        assert_eq!(history[0].defer_reason.as_deref(), Some("scheduler_defer"));
         assert!(!history[0].drain_latch_active);
         assert_eq!(history[1].scheduler_decision, "Defer");
+        assert_eq!(history[1].canonical_decision.as_deref(), Some("defer"));
+        assert_eq!(history[1].defer_reason.as_deref(), Some("scheduler_defer"));
         assert!(!history[1].drain_latch_active);
         assert_eq!(history[2].scheduler_decision, "Force85");
+        assert_eq!(history[2].canonical_decision.as_deref(), Some("execute"));
+        assert_eq!(history[2].defer_reason, None);
         assert!(history[2].drain_latch_active);
         assert_ne!(
             history[0].scheduler_decision, history[2].scheduler_decision,
@@ -15275,6 +15468,35 @@ pub(crate) mod tests {
         assert!(
             correlated.is_empty(),
             "a scheduler arm without a reduction or divergence is not interesting"
+        );
+    }
+
+    #[test]
+    fn scheduler_trace_keeps_mid_turn_downgrades_in_the_defer_pass_class() {
+        let genuine_defer = pass_scheduler_observation(
+            scheduler::PassDecision::Defer,
+            Some(scheduler::SchedulerDeferReason::SchedulerDefer),
+            false,
+            201,
+        );
+        let boundary_defer = pass_scheduler_observation(
+            scheduler::PassDecision::Defer,
+            Some(scheduler::SchedulerDeferReason::MidTurnBoundary),
+            false,
+            202,
+        );
+
+        for observation in [&genuine_defer, &boundary_defer] {
+            assert_eq!(observation.scheduler_decision, "Defer");
+            assert_eq!(observation.canonical_decision.as_deref(), Some("defer"));
+        }
+        assert_eq!(
+            genuine_defer.defer_reason.as_deref(),
+            Some("scheduler_defer")
+        );
+        assert_eq!(
+            boundary_defer.defer_reason.as_deref(),
+            Some("mid_turn_boundary")
         );
     }
 
@@ -15908,6 +16130,31 @@ pub(crate) mod tests {
              canonical fixture, update GOLDEN_SHA256 to match; otherwise restore the \
              vendored bytes."
         );
+    }
+
+    #[test]
+    fn canonical_message_serializer_matches_value_round_trip_for_golden_corpus() {
+        let messages: Vec<CkWireMessage> =
+            serde_json::from_str(include_str!("../testdata/ck_wire_golden.json")).unwrap();
+
+        for message in messages {
+            assert_eq!(
+                canonical_message_bytes(&message),
+                canonical_message_bytes_reference(&message),
+                "retained golden wire must stay byte-identical"
+            );
+
+            let mut typed = message;
+            typed.mark_modified();
+            for block in &mut typed.content {
+                block.mark_modified();
+            }
+            assert_eq!(
+                canonical_message_bytes(&typed),
+                canonical_message_bytes_reference(&typed),
+                "typed golden wire must stay byte-identical"
+            );
+        }
     }
 
     #[test]
@@ -18976,7 +19223,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                true,
                 "target",
                 &mut first_without_trailing,
             ),
@@ -18989,7 +19235,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut late_trailing,
             ),
@@ -19011,7 +19256,6 @@ pub(crate) mod tests {
                 &keep_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut missing_trailing,
             ),
@@ -19028,7 +19272,6 @@ pub(crate) mod tests {
                 &keep_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut empty,
             ),
@@ -19041,7 +19284,6 @@ pub(crate) mod tests {
             &keep_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            true,
             "target",
             &mut newest_with_trailing,
         );
@@ -19051,7 +19293,6 @@ pub(crate) mod tests {
             &keep_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            false,
             "target",
             &mut historical_with_trailing,
         );
@@ -19073,18 +19314,27 @@ pub(crate) mod tests {
                 data: "redacted".to_string(),
             }),
         ] {
-            let mut reasoning_terminal = assistant(vec![terminal, canonical_blank_block()]);
+            let source = assistant(vec![terminal, canonical_blank_block()]);
+            let mut newest_reasoning_terminal = source.clone();
             apply_frozen_trailing_blank_decision(
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
-                &mut reasoning_terminal,
+                &mut newest_reasoning_terminal,
             );
-            assert_eq!(reasoning_terminal.content.len(), 2);
+            let mut historical_reasoning_terminal = source;
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                "target",
+                &mut historical_reasoning_terminal,
+            );
+            assert_eq!(newest_reasoning_terminal, historical_reasoning_terminal);
+            assert_eq!(newest_reasoning_terminal.content.len(), 2);
             assert_eq!(
-                reasoning_terminal.content.last(),
+                newest_reasoning_terminal.content.last(),
                 Some(&canonical_blank_block())
             );
         }
@@ -19106,7 +19356,6 @@ pub(crate) mod tests {
             &strip_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            false,
             "target",
             &mut adjacent_reasoning,
         );
@@ -19126,24 +19375,61 @@ pub(crate) mod tests {
             &keep_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            true,
             "target",
             &mut wholly_blank,
         );
         assert_eq!(wholly_blank.content, vec![canonical_blank_block()]);
 
-        let mut newest_strip_exempt = assistant(stable_content(true));
+        let strip_source = assistant(stable_content(true));
+        let mut newest_strip = strip_source.clone();
+        let newest_strip_mutations = apply_frozen_trailing_blank_decision(
+            &strip_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            "target",
+            &mut newest_strip,
+        );
+        let mut historical_strip = strip_source;
+        let historical_strip_mutations = apply_frozen_trailing_blank_decision(
+            &strip_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            "target",
+            &mut historical_strip,
+        );
+        assert_eq!(newest_strip, historical_strip);
+        assert_eq!((newest_strip_mutations, historical_strip_mutations), (1, 1));
+        assert_eq!(newest_strip.content.len(), 3);
+
+        let keep_two_core = CoreState {
+            frozen_units: vec![strip_unit("trailing_blank_keep", "target", "2")],
+            ..Default::default()
+        };
+        let mut keep_two_source = stable_content(true);
+        keep_two_source.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+            text: "\n".to_string(),
+        }));
+        let keep_two_source = assistant(keep_two_source);
+        let mut newest_keep_two = keep_two_source.clone();
+        apply_frozen_trailing_blank_decision(
+            &keep_two_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            "target",
+            &mut newest_keep_two,
+        );
+        let mut historical_keep_two = keep_two_source;
+        apply_frozen_trailing_blank_decision(
+            &keep_two_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            "target",
+            &mut historical_keep_two,
+        );
+        assert_eq!(newest_keep_two, historical_keep_two);
         assert_eq!(
-            apply_frozen_trailing_blank_decision(
-                &strip_core,
-                SerializerProfile::OpencodeAiSdk,
-                Some("anthropic"),
-                true,
-                "target",
-                &mut newest_strip_exempt,
-            ),
-            0,
-            "the Rust exemption matches TypeScript and contains only the newest assistant"
+            &newest_keep_two.content[newest_keep_two.content.len() - 2..],
+            [canonical_blank_block(), canonical_blank_block()]
         );
         let mut pi_replay = assistant(stable_content(true));
         assert_eq!(
@@ -19151,7 +19437,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::Pi,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut pi_replay,
             ),
@@ -19164,7 +19449,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("openai"),
-                false,
                 "target",
                 &mut non_anthropic,
             ),
@@ -19565,6 +19849,7 @@ pub(crate) mod tests {
             Some(FrozenTrailingBlankDecision::Strip)
         );
 
+        let first_target_bytes = message_bytes(&first, "target");
         let still_newest = run(
             &newest_store,
             &request(
@@ -19578,13 +19863,13 @@ pub(crate) mod tests {
             &spine(),
         );
         assert_eq!(still_newest.action, "SOFT+");
-        let last_newest_bytes = message_bytes(&still_newest, "target");
+        assert_eq!(message_bytes(&still_newest, "target"), first_target_bytes);
         assert_eq!(
             frozen_trailing_blank_decision(
                 &newest_store.load(newest_session).unwrap().core,
                 "target"
             ),
-            Some(FrozenTrailingBlankDecision::Keep)
+            Some(FrozenTrailingBlankDecision::Strip)
         );
 
         let historical = run(
@@ -19602,7 +19887,7 @@ pub(crate) mod tests {
             &spine(),
         );
         assert_eq!(historical.action, "SOFT+");
-        assert_eq!(message_bytes(&historical, "target"), last_newest_bytes);
+        assert_eq!(message_bytes(&historical, "target"), first_target_bytes);
 
         let structural_dir = tempfile::tempdir().unwrap();
         let structural_store = store(structural_dir.path());
@@ -19653,6 +19938,276 @@ pub(crate) mod tests {
         assert_eq!(
             message_bytes(&structural_replay, "structural"),
             structural_bytes
+        );
+    }
+
+    #[test]
+    fn newest_keep_demotes_to_an_absorbing_strip_through_transform() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-newest-demotion";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+
+        let first = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    trailing_regression_assistant("target", 2, Some(""), false),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "target"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+        assert_eq!(
+            first
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .content
+                .len(),
+            2
+        );
+
+        let mut recounted_target = trailing_regression_assistant("target", 2, Some(""), false);
+        recounted_target
+            .ck
+            .content
+            .extend([canonical_blank_block(), canonical_blank_block()]);
+        let recounted = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![item("user-0", 1, "start"), recounted_target],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            frozen_trailing_blank_keep_count(&store.load(session).unwrap().core, "target"),
+            Some(3)
+        );
+        assert_eq!(
+            recounted
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .content
+                .len(),
+            4
+        );
+
+        let demoted = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    trailing_regression_assistant("target", 2, None, false),
+                ],
+            ),
+            &spine(),
+        );
+        let demoted_bytes = trailing_regression_message_bytes(&demoted, "target");
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "target"),
+            Some(FrozenTrailingBlankDecision::Strip)
+        );
+
+        let late_blank = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    trailing_regression_assistant("target", 2, Some(""), false),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            trailing_regression_message_bytes(&late_blank, "target"),
+            demoted_bytes
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "target"),
+            Some(FrozenTrailingBlankDecision::Strip)
+        );
+    }
+
+    #[test]
+    fn frozen_strip_ck_transform_path_is_position_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-ck-position";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+        let mut loaded = store.load(session).unwrap();
+        loaded
+            .core
+            .frozen_units
+            .push(strip_unit("trailing_blank_strip", "target", ""));
+        store
+            .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let target = || trailing_regression_assistant("target", 2, Some(""), false);
+        let newest = run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start"), target()]),
+            &spine(),
+        );
+        let newest_bytes = trailing_regression_message_bytes(&newest, "target");
+        let newest_target = newest
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+            .unwrap();
+        assert_eq!(newest_target.content.len(), 1);
+        assert!(matches!(
+            &newest_target.content[0].kind,
+            ck_wire::CkKind::Text { text } if text == "answer-target"
+        ));
+        let historical = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    target(),
+                    item("user-1", 3, "continue"),
+                    trailing_regression_assistant("newest", 4, None, false),
+                ],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(
+            trailing_regression_message_bytes(&historical, "target"),
+            newest_bytes,
+            "the CK transform path must not depend on assistant position"
+        );
+    }
+
+    #[test]
+    fn deployment_replay_changes_only_the_newest_frozen_strip_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-deployment-replay";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+        let mut loaded = store.load(session).unwrap();
+        loaded.core.frozen_units.extend([
+            strip_unit("trailing_blank_strip", "historical-strip", ""),
+            strip_unit("trailing_blank_keep", "historical-keep", ""),
+            strip_unit("trailing_blank_keep", "historical-keep-three", "3"),
+            strip_unit("trailing_blank_strip", "newest-strip", ""),
+        ]);
+        store
+            .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let historical_strip = CkIngressMessage {
+            mid: "historical-strip".to_string(),
+            ordinal: 2,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                        text: "terminal reasoning".to_string(),
+                        signature: Some("sig".to_string()),
+                    }),
+                    canonical_blank_block(),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("historical-strip".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let historical_keep = trailing_regression_assistant("historical-keep", 4, Some(""), false);
+        let mut historical_keep_three =
+            trailing_regression_assistant("historical-keep-three", 6, Some(""), false);
+        historical_keep_three
+            .ck
+            .content
+            .extend([canonical_blank_block(), canonical_blank_block()]);
+        let newest_strip = trailing_regression_assistant("newest-strip", 8, Some(""), false);
+        let unchanged = [&historical_strip, &historical_keep, &historical_keep_three]
+            .into_iter()
+            .map(|message| {
+                (
+                    message.mid.clone(),
+                    ServedMessage::from_message(message.ck.clone())
+                        .canonical_bytes()
+                        .to_vec(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let newest_before = ServedMessage::from_message(newest_strip.ck.clone())
+            .canonical_bytes()
+            .to_vec();
+        let response = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    historical_strip,
+                    item("user-1", 3, "continue"),
+                    historical_keep,
+                    item("user-2", 5, "continue"),
+                    historical_keep_three,
+                    item("user-3", 7, "continue"),
+                    newest_strip,
+                ],
+            ),
+            &spine(),
+        );
+
+        for (mid, bytes) in unchanged {
+            assert_eq!(trailing_regression_message_bytes(&response, &mid), bytes);
+        }
+        let newest = response
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("newest-strip"))
+            .unwrap();
+        assert_ne!(newest.canonical_bytes(), newest_before);
+        assert!(matches!(
+            &newest.content.last().unwrap().kind,
+            ck_wire::CkKind::Text { text } if text == "answer-newest-strip"
+        ));
+        let historical_reasoning = response
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("historical-strip"))
+            .unwrap();
+        assert_eq!(
+            historical_reasoning.content.last(),
+            Some(&canonical_blank_block())
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "newest-strip"),
+            Some(FrozenTrailingBlankDecision::Strip),
+            "a live source keep must not reopen a frozen strip"
         );
     }
 
@@ -21286,6 +21841,52 @@ pub(crate) mod tests {
         );
         assert_eq!(in_flight[0]["parts"][0]["text"], "");
         assert_eq!(in_flight[1]["parts"][0]["text"], "thinking-latest");
+    }
+
+    #[test]
+    fn dropped_assistant_shell_does_not_steal_signed_reasoning_exemption() {
+        let signed = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed thinking".to_string(),
+                signature: Some("signature".to_string()),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("signed".to_string()),
+                ..Default::default()
+            },
+        );
+        let dropped = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "§12§ [dropped §901§]".to_string(),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("dropped".to_string()),
+                ..Default::default()
+            },
+        );
+        let ingress = vec![
+            CkIngressMessage {
+                mid: "signed".to_string(),
+                ordinal: 1,
+                ck: signed,
+            },
+            CkIngressMessage {
+                mid: "dropped".to_string(),
+                ordinal: 2,
+                ck: dropped,
+            },
+        ];
+
+        assert_eq!(
+            latest_assistant_reasoning_mutation_exempt_mid(&ingress),
+            Some("signed")
+        );
     }
 
     #[test]
@@ -24755,6 +25356,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn opencode_tagging_surface_leaves_whitespace_only_assistant_framing_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = active_opencode_req(
+            "opencode-whitespace-framing",
+            "cfg0",
+            vec![wire_item("assistant", "blank-assistant", 1, &["  \n\t"])],
+        );
+
+        let response = run(&s, &request, &spine());
+
+        assert_eq!(tail_bytes(&response, "blank-assistant"), "  \n\t");
+        assert!(s
+            .load_tags_for_session("opencode-whitespace-framing")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn opencode_tagging_surface_tags_tool_results_and_replays_byte_stably() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -25489,10 +26109,31 @@ pub(crate) mod tests {
             ],
         );
         let query = user_hint_query(&message);
-        assert_eq!(query, format!("keep words {long_tail}"));
+        assert_eq!(query, format!("keep  words\n{long_tail}"));
         assert!(!query.contains("§12§"));
         assert!(!query.contains("drop"));
         assert!(query.chars().count() > 500);
+    }
+
+    #[test]
+    fn user_hint_query_preserves_typescript_whitespace_bytes_after_adversarial_sanitization() {
+        let message = wire_item(
+            "user",
+            "query-byte-parity",
+            1,
+            &[
+                "§17§ alpha   beta\tgamma",
+                "<system-reminder>drop <system-reminder>nested</system-reminder> tail</system-reminder>",
+                "<!-- hidden\ncomment -->",
+                "<custom-tag>delta</custom-tag>",
+                "",
+                "omega  end",
+            ],
+        );
+        assert_eq!(
+            user_hint_query(&message),
+            "alpha   beta\tgamma\n\ndelta\n\nomega  end"
+        );
     }
 
     #[test]
@@ -25501,12 +26142,12 @@ pub(crate) mod tests {
             (
                 "nested system reminder",
                 "retained <system-reminder>drop <system-reminder>nested</system-reminder></system-reminder> text",
-                "retained text",
+                "retained  text",
             ),
             (
                 "HTML comment",
                 "retained <!-- remove <hidden> --> text",
-                "retained text",
+                "retained  text",
             ),
             (
                 "XML tag",
@@ -30034,6 +30675,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn caveman_age_tiers_cross_exact_boundaries_only_when_the_marker_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "caveman-age-tier-boundaries";
+        store
+            .replace_compartments(session, &[comp(1, 1, 1, "anchor", "covered")])
+            .unwrap();
+        let mut messages = vec![item("anchor", 1, "covered")];
+        messages.extend((1..=5u64).map(|index| {
+            item(
+                &format!("aged-{index}"),
+                index + 1,
+                &caveman_test_source(&format!("aged-{index}")),
+            )
+        }));
+        let mut request = req(session, "cfg", messages.clone());
+
+        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tags = 0;
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT+");
+        store.arm_soft_refresh(session).unwrap();
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT");
+        let first_units = stored_caveman_units(&store, session);
+        assert_eq!(
+            first_units.iter().map(caveman_depth).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "five eligible rows place positions 0, 1, and 2 on the exact 20/40/60 percent tiers"
+        );
+        let first_basis = store.load(session).unwrap().meta.caveman_age_basis_tag;
+
+        messages.push(item("aged-6", 7, &caveman_test_source("aged-6")));
+        request.messages = messages;
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT+");
+        assert_eq!(
+            stored_caveman_units(&store, session),
+            first_units,
+            "tag minting beyond the frozen age basis must not retier on a defer"
+        );
+        assert_eq!(
+            store.load(session).unwrap().meta.caveman_age_basis_tag,
+            first_basis
+        );
+
+        store.arm_soft_refresh(session).unwrap();
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT");
+        let advanced = stored_caveman_units(&store, session);
+        assert_eq!(advanced.len(), 4);
+        assert_eq!(
+            advanced.iter().map(caveman_depth).collect::<Vec<_>>(),
+            vec![3, 3, 2, 1],
+            "advancing the marker from five to six eligible rows crosses every exact tier boundary once"
+        );
+        assert_eq!(store.load(session).unwrap().meta.caveman_age_basis_tag, 7);
+    }
+
+    #[test]
     fn caveman_restart_replays_frozen_basis_until_an_independent_bust() {
         let dir = tempfile::tempdir().unwrap();
         let session = "caveman-restart-basis";
@@ -32828,6 +33527,42 @@ pub(crate) mod tests {
             canonical_output(&replay.messages),
             canonical_output(&fresh.messages)
         );
+    }
+
+    #[test]
+    fn cold_output_cache_serializes_only_the_uncovered_tail() {
+        let (core, mut meta, request, projection) = output_cache_fixture("m0-v1", "m1-v1");
+        meta.coverage_ordinal = Some(1);
+
+        let cold = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        assert_eq!(cold.timings.serialized_messages, 3);
+        assert_eq!(cold.cache_entries.len(), 3);
+        assert!(!cold.cache_entries.contains_key("tail:a"));
+        assert!(cold.cache_entries.contains_key("tail:b"));
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|message| !message.meta.synthetic)
+                .filter_map(|message| message.meta.harness_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: cold.cache_entries,
+        };
+        let replay = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            None,
+            Some(&snapshot),
+            false,
+        );
+        assert_eq!(replay.timings.serialized_messages, 0);
+        assert_eq!(replay.cache_stats.serialized_items, 0);
+        assert_eq!(replay.cache_stats.reused_items, 3);
     }
 
     #[test]

@@ -57,6 +57,7 @@ import { matchStrippedMagicContextCommand } from "./stripped-command";
 import { normalizeTodoStateJson } from "./todo-view";
 
 export type LiveModelBySession = Map<string, { providerID: string; modelID: string }>;
+export type LatestAssistantMessageIdBySession = Map<string, string>;
 export type VariantBySession = Map<string, string | undefined>;
 export type AgentBySession = Map<string, string>;
 
@@ -260,27 +261,14 @@ export function createChatMessageHook(args: {
             input.variant !== undefined &&
             previousVariant !== input.variant
         ) {
-            // A reasoning-variant change maps to a thinking-config change
-            // (effort / budget_tokens / toggle — see OpenCode's
-            // `reasoningVariants`). Whether that busts the provider's prompt
-            // cache on its own depends on the provider's cache model: the
-            // Anthropic family renders the thinking config into the prompt
-            // (so the provider itself invalidates message blocks on a change
-            // and our queued ops drain on that natural bust), while
-            // OpenAI-compatible providers carry reasoning_effort / budget as
-            // a request parameter outside the cache key, so a variant flip
-            // is a full cache HIT and our flush would be the ONLY bust — a
-            // gratuitous one. See `variantChangeBustsProviderCache` for the
-            // full rationale and the safety asymmetry.
-            //
-            // providerID comes from the hook input (the live request's
-            // model) with `liveModelBySession` as a fallback for sessions
-            // whose first chat.message predates a model-bearing event. When
-            // no provider is known yet we take the conservative TRUE arm
-            // (today's behavior) so we never silently drop a needed drain.
-            const providerID =
-                input.model?.providerID ?? args.liveModelBySession.get(sessionId)?.providerID;
-            if (variantChangeBustsProviderCache(providerID)) {
+            // Variant changes alter cached thinking blocks on some models. Fable
+            // 5.1 instead applies effort only at message boundaries, leaving the
+            // existing prefix unchanged. Use both live IDs to decide; if either is
+            // unknown, leave the cache unchanged rather than flushing speculatively.
+            const liveModel = args.liveModelBySession.get(sessionId);
+            const providerID = input.model?.providerID ?? liveModel?.providerID;
+            const modelID = input.model?.modelID ?? liveModel?.modelID;
+            if (variantChangeBustsProviderCache(providerID, modelID)) {
                 sessionLog(
                     sessionId,
                     `variant changed (${previousVariant} -> ${input.variant}), triggering flush`,
@@ -299,7 +287,7 @@ export function createChatMessageHook(args: {
                 // but the flush was deferred, not triggered.
                 sessionLog(
                     sessionId,
-                    `variant changed (${previousVariant} -> ${input.variant}) on provider ${providerID} whose cache ignores request params; deferring flush to next natural bust`,
+                    `variant changed (${previousVariant} -> ${input.variant}) on ${providerID ?? "unknown"}/${modelID ?? "unknown"} without a proven natural cache bust; deferring flush to next natural bust`,
                 );
             }
         }
@@ -314,6 +302,8 @@ export function createEventHook(args: {
     >;
     db: Parameters<typeof getOrCreateSessionMeta>[0];
     liveModelBySession: LiveModelBySession;
+    /** The lexicographically newest assistant row observed for each session. */
+    latestAssistantMessageIdBySession?: LatestAssistantMessageIdBySession;
     variantBySession: VariantBySession;
     agentBySession: AgentBySession;
     /**
@@ -333,6 +323,9 @@ export function createEventHook(args: {
     client: PluginContext["client"];
     protectedTags: number;
 }) {
+    const latestAssistantMessageIdBySession =
+        args.latestAssistantMessageIdBySession ?? new Map<string, string>();
+
     return async (input: { event: { type: string; properties?: unknown } }) => {
         await args.eventHandler(input);
 
@@ -356,63 +349,82 @@ export function createEventHook(args: {
 
             const assistantInfo = getMessageUpdatedAssistantInfo(input.event.properties);
             if (assistantInfo?.providerID && assistantInfo?.modelID) {
-                const previous = args.liveModelBySession.get(assistantInfo.sessionID);
-                args.liveModelBySession.set(assistantInfo.sessionID, {
-                    providerID: assistantInfo.providerID,
-                    modelID: assistantInfo.modelID,
-                });
-                // When the model changes (e.g., switching from 128k to 1M context model),
-                // clear stale context percentage and historian failure state so the transform
-                // doesn't keep using the old model's usage metrics or emergency state.
-                if (
-                    previous &&
-                    (previous.providerID !== assistantInfo.providerID ||
-                        previous.modelID !== assistantInfo.modelID)
-                ) {
-                    // The reasoning watermark is only valid for the model that
-                    // produced it. On a switch TO an interleaved-reasoning
-                    // provider (e.g. Moonshot/Kimi), replaying the old
-                    // watermark would re-clear typed reasoning that OpenCode
-                    // must preserve so it can emit `reasoning_content` on the
-                    // wire. On a switch BACK to a normal model, keeping the old
-                    // watermark would make reasoning cleanup resume from the
-                    // previous model's cutoff instead of starting fresh. Clear
-                    // it for both forward and backward transitions.
-                    dropSlot(assistantInfo.sessionID, "model-change");
-                    sessionLog(
-                        assistantInfo.sessionID,
-                        `model changed (${previous.providerID}/${previous.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,
-                    );
-                    // Don't clear lastContextPercentage/lastInputTokens here — the event handler
-                    // already computed the correct percentage using the NEW model's context limit
-                    // (via resolveContextLimit with the new providerID/modelID). Clearing would
-                    // erase the first valid usage sample from the new model.
-                    clearHistorianFailureState(args.db, assistantInfo.sessionID);
-                    clearPersistedReasoningWatermark(args.db, assistantInfo.sessionID);
-                    // Clear the prior model's detected-overflow limit and the
-                    // emergency-recovery flag. The transform has its OWN model-change
-                    // branch that clears these, but it never fires on a mid-session
-                    // switch: this handler updates liveModelBySession first, so by the
-                    // time the transform runs, its knownModel already equals the new
-                    // model. transform.ts explicitly delegates mid-session switches to
-                    // "the first message.updated to trigger hook-handler clearing" —
-                    // so the detected-limit + recovery clears must live HERE too, else
-                    // the old model's limit leaks into the new model's pressure math
-                    // (e.g. a 120K detected limit kept after switching to a 1M model).
-                    clearDetectedContextLimit(args.db, assistantInfo.sessionID);
-                    clearEmergencyRecovery(args.db, assistantInfo.sessionID);
-                    // The emergency idempotence latch is keyed to the prior model's
-                    // ceiling (contextLimit × executeThreshold). A switch to a
-                    // smaller model lowers the ceiling, so the latch must reset to
-                    // re-evaluate the full tail. For the same delegation reason as
-                    // above, the transform-side reset is dead on a live switch —
-                    // clear it HERE.
-                    clearEmergencyDropSample(args.db, assistantInfo.sessionID);
-                    updateSessionMeta(args.db, assistantInfo.sessionID, {
-                        clearedReasoningThroughTag: 0,
-                        observedSafeInputTokens: 0,
-                        cacheAlertSent: false,
+                const latestMessageID = latestAssistantMessageIdBySession.get(
+                    assistantInfo.sessionID,
+                );
+                // OpenCode MessageID.ascending orders assistant ids lexicographically.
+                // Once an ordered event has been observed, an id-less event cannot
+                // prove it belongs to the newest assistant and must not overwrite
+                // the model used to pin synthetic user messages.
+                const acceptsModelUpdate =
+                    latestMessageID === undefined ||
+                    (assistantInfo.messageID !== undefined &&
+                        assistantInfo.messageID >= latestMessageID);
+                if (acceptsModelUpdate) {
+                    if (assistantInfo.messageID !== undefined) {
+                        latestAssistantMessageIdBySession.set(
+                            assistantInfo.sessionID,
+                            assistantInfo.messageID,
+                        );
+                    }
+                    const previous = args.liveModelBySession.get(assistantInfo.sessionID);
+                    args.liveModelBySession.set(assistantInfo.sessionID, {
+                        providerID: assistantInfo.providerID,
+                        modelID: assistantInfo.modelID,
                     });
+                    // When the model changes (e.g., switching from 128k to 1M context model),
+                    // clear stale context percentage and historian failure state so the transform
+                    // doesn't keep using the old model's usage metrics or emergency state.
+                    if (
+                        previous &&
+                        (previous.providerID !== assistantInfo.providerID ||
+                            previous.modelID !== assistantInfo.modelID)
+                    ) {
+                        // The reasoning watermark is only valid for the model that
+                        // produced it. On a switch TO an interleaved-reasoning
+                        // provider (e.g. Moonshot/Kimi), replaying the old
+                        // watermark would re-clear typed reasoning that OpenCode
+                        // must preserve so it can emit `reasoning_content` on the
+                        // wire. On a switch BACK to a normal model, keeping the old
+                        // watermark would make reasoning cleanup resume from the
+                        // previous model's cutoff instead of starting fresh. Clear
+                        // it for both forward and backward transitions.
+                        dropSlot(assistantInfo.sessionID, "model-change");
+                        sessionLog(
+                            assistantInfo.sessionID,
+                            `model changed (${previous.providerID}/${previous.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,
+                        );
+                        // Don't clear lastContextPercentage/lastInputTokens here — the event handler
+                        // already computed the correct percentage using the NEW model's context limit
+                        // (via resolveContextLimit with the new providerID/modelID). Clearing would
+                        // erase the first valid usage sample from the new model.
+                        clearHistorianFailureState(args.db, assistantInfo.sessionID);
+                        clearPersistedReasoningWatermark(args.db, assistantInfo.sessionID);
+                        // Clear the prior model's detected-overflow limit and the
+                        // emergency-recovery flag. The transform has its OWN model-change
+                        // branch that clears these, but it never fires on a mid-session
+                        // switch: this handler updates liveModelBySession first, so by the
+                        // time the transform runs, its knownModel already equals the new
+                        // model. transform.ts explicitly delegates mid-session switches to
+                        // "the first message.updated to trigger hook-handler clearing" —
+                        // so the detected-limit + recovery clears must live HERE too, else
+                        // the old model's limit leaks into the new model's pressure math
+                        // (e.g. a 120K detected limit kept after switching to a 1M model).
+                        clearDetectedContextLimit(args.db, assistantInfo.sessionID);
+                        clearEmergencyRecovery(args.db, assistantInfo.sessionID);
+                        // The emergency idempotence latch is keyed to the prior model's
+                        // ceiling (contextLimit × executeThreshold). A switch to a
+                        // smaller model lowers the ceiling, so the latch must reset to
+                        // re-evaluate the full tail. For the same delegation reason as
+                        // above, the transform-side reset is dead on a live switch —
+                        // clear it HERE.
+                        clearEmergencyDropSample(args.db, assistantInfo.sessionID);
+                        updateSessionMeta(args.db, assistantInfo.sessionID, {
+                            clearedReasoningThroughTag: 0,
+                            observedSafeInputTokens: 0,
+                            cacheAlertSent: false,
+                        });
+                    }
                 }
             }
         }
@@ -429,6 +441,7 @@ export function createEventHook(args: {
             // createEventHandler has already persisted pending_session_cleanup before
             // this process-local indexing latch is discarded.
             args.liveModelBySession.delete(sessionId);
+            latestAssistantMessageIdBySession.delete(sessionId);
             args.variantBySession.delete(sessionId);
             args.agentBySession.delete(sessionId);
             args.sessionDirectoryBySession.delete(sessionId);

@@ -10,6 +10,7 @@ import {
     getActiveTagsBySession,
     getAutoSearchHintDecisions,
     getChannel1NudgeState,
+    getHiddenSeamPlaceholderIds,
     getMaxM0MutationId,
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
@@ -24,6 +25,7 @@ import {
     peekDeferredExecutePending,
     pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
+    setPendingCompactionMarkerState,
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
     updateSessionMeta,
@@ -36,13 +38,18 @@ import {
     getEmergencyInputSample,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
+    getThinkingBindingRecoveryTarget,
     getTrailingBlankDecisions,
+    NEWEST_REASONING_BEARING_ASSISTANT,
     type PersistedCompactionMarkerState,
+    THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+    thinkingBindingRecoveryFrozenId,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
     getOldestActiveUnprotectedToolTags,
     getTagNumberByMessageId,
     getTailHygieneTags,
+    markTagsCompactedByMessageIds,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
@@ -93,14 +100,17 @@ import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
     applyFrozenTrailingBlankDecisions,
+    assistantHasReasoningPart,
     clearOldReasoning,
     findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripCandidateIds,
+    findNewestReasoningBearingAssistantId,
     findTrailingBlankDecisionCandidates,
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
+    stripReasoningFromAssistantIds,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
     type TrailingBlankDecision,
@@ -368,22 +378,141 @@ export async function applyTodoSynthesis(args: {
     return 0;
 }
 
+/** Reapply durable binding-mismatch strips when a Rust LKG snapshot is replayed. */
+export function replayRustModeBindingMismatchStrips(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: MessageLike[];
+    resolvedProviderID?: string;
+}): void {
+    if (!modelAcceptsEmptyContent(args.resolvedProviderID)) return;
+    const recoveryMessageIds = new Set<string>();
+    for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+        if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+        const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+        if (messageId.length > 0) recoveryMessageIds.add(messageId);
+    }
+    stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
+}
+
 /**
  * Rebuild host-owned canonical representation after native Rust serving.
  * The persisted compaction summary is restored with the same canonicalizer as the
  * TypeScript lane, then note and recall anchors are replayed onto the native result.
  */
+export interface RustMaterializedCompactionBoundary {
+    /** Durable module row returned by the same transform response as this boundary. */
+    rowVersion: number;
+    /** Last raw block ordinal included in the module's materialized baseline. */
+    ordinal: number;
+    /** OpenCode message id owning the last covered flat block. */
+    endMessageId: string;
+}
+
+/**
+ * Use the boundary carried in the module response as OpenCode's compaction target;
+ * do not replace it with a target read later from status. Store that target in the
+ * local pending blob, advance it only forward in session metadata, and clear it only
+ * when compare-and-swap confirms that the pending value has not changed.
+ */
+export function applyRustModeDeferredCompactionMarker(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    boundary: RustMaterializedCompactionBoundary;
+    sessionDirectory?: string;
+}): void {
+    const { boundary } = args;
+    if (
+        !Number.isSafeInteger(boundary.rowVersion) ||
+        boundary.rowVersion <= 0 ||
+        !Number.isSafeInteger(boundary.ordinal) ||
+        boundary.ordinal < 0 ||
+        boundary.endMessageId.length === 0
+    ) {
+        sessionLog(args.sessionId, "rust compaction-marker: invalid materialized boundary ignored");
+        return;
+    }
+
+    let target: PendingCompactionMarker = {
+        ordinal: boundary.ordinal,
+        endMessageId: boundary.endMessageId,
+        publishedAt: Date.now(),
+    };
+    args.db.transaction(() => {
+        const persisted = getPersistedCompactionMarkerState(args.db, args.sessionId);
+        const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
+        if (pending && pending.ordinal > target.ordinal) {
+            target = pending;
+            return;
+        }
+        if (
+            pending &&
+            pending.ordinal === target.ordinal &&
+            pending.endMessageId === target.endMessageId
+        ) {
+            target = pending;
+            return;
+        }
+        if (persisted && persisted.boundaryOrdinal >= target.ordinal && pending === null) return;
+        setPendingCompactionMarkerState(args.db, args.sessionId, target);
+    })();
+
+    const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
+    if (!pending || pending.ordinal > boundary.ordinal) return;
+    const outcome = applyDeferredCompactionMarker(
+        args.db,
+        args.sessionId,
+        pending,
+        args.sessionDirectory,
+        {
+            rowVersion: boundary.rowVersion,
+            ordinal: boundary.ordinal,
+            endMessageId: boundary.endMessageId,
+        },
+    );
+    switch (outcome.kind) {
+        case "applied":
+        case "already-current":
+        case "stale-skip":
+            if (!clearPendingCompactionMarkerStateIf(args.db, args.sessionId, pending)) {
+                sessionLog(
+                    args.sessionId,
+                    `rust compaction-marker drain: CAS lost after module row ${boundary.rowVersion}; newer pending target retained`,
+                );
+            }
+            break;
+        case "retryable-failure":
+            sessionLog(
+                args.sessionId,
+                `rust compaction-marker drain: retryable failure after module row ${boundary.rowVersion}; pending target retained`,
+                outcome.error,
+            );
+            break;
+    }
+}
+
 export function runRustModePostprocess(args: {
     db: ContextDatabase;
     sessionId: string;
     messages: MessageLike[];
     projectPath?: string;
+    sessionDirectory?: string;
+    materializedBoundary?: RustMaterializedCompactionBoundary;
     fullFeatureMode: boolean;
     compactionOff?: boolean;
+    resolvedProviderID?: string;
+    thinkingBindingRecoveryEnabledForModel?: boolean;
+    trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
+    trailingBlankNewestAssistantId?: string;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
-}): void {
-    if (!args.fullFeatureMode || args.compactionOff) return;
+}): {
+    thinkingBindingRecovery: { flagTarget: string; messageId: string } | null;
+    markerAt: string | null;
+} {
+    if (!args.fullFeatureMode || args.compactionOff) {
+        return { thinkingBindingRecovery: null, markerAt: null };
+    }
     // Test doubles and older integrations may return the legacy bare message shape.
     // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
     // those responses untouched instead of treating a missing `info` object as a failure.
@@ -395,7 +524,15 @@ export function runRustModePostprocess(args: {
                 !isRecord((message as { info?: unknown }).info),
         )
     ) {
-        return;
+        return { thinkingBindingRecovery: null, markerAt: null };
+    }
+    if (args.materializedBoundary) {
+        applyRustModeDeferredCompactionMarker({
+            db: args.db,
+            sessionId: args.sessionId,
+            boundary: args.materializedBoundary,
+            sessionDirectory: args.sessionDirectory,
+        });
     }
     reconcileMarkerRepresentation(
         args.messages,
@@ -415,6 +552,45 @@ export function runRustModePostprocess(args: {
             appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
+    const trailingBlankDecisions = new Map<string, TrailingBlankDecision>();
+    if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
+        try {
+            for (const [id, decision] of getTrailingBlankDecisions(args.db, args.sessionId)) {
+                trailingBlankDecisions.set(id, decision);
+            }
+            const candidates = findTrailingBlankDecisionCandidates(
+                args.messages,
+                trailingBlankDecisions,
+                { sourceDecisions: args.trailingBlankSourceDecisions },
+            ).filter(([id]) => id === args.trailingBlankNewestAssistantId);
+            if (candidates.length > 0) {
+                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
+                    overwriteMessageId: args.trailingBlankNewestAssistantId,
+                });
+                if (persisted) {
+                    const committed = getTrailingBlankDecisions(args.db, args.sessionId);
+                    for (const [id] of candidates) {
+                        const decision = committed.get(id);
+                        if (decision) trailingBlankDecisions.set(id, decision);
+                    }
+                } else {
+                    sessionLog(
+                        args.sessionId,
+                        "rust trailing blank decision: persistence failed; serving only frozen decisions",
+                    );
+                }
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "rust trailing blank decision failed:", error);
+        }
+    }
+    // The Rust module's core.frozen_units store owns keep shape and canonical blank counts.
+    // The host may only enforce the absorbing strip direction: replaying keep here could
+    // manufacture a suffix the module intentionally omitted or normalize bytes it already chose.
+    const absorbingStripDecisions = new Map(
+        [...trailingBlankDecisions].filter(([, decision]) => decision === "strip"),
+    );
+    applyFrozenTrailingBlankDecisions(args.messages, absorbingStripDecisions);
 
     const currentUserMessageId = findLastUserMessageId(args.messages);
     const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
@@ -425,15 +601,69 @@ export function runRustModePostprocess(args: {
         args.projectPath,
         noteReadStillVisible,
     );
-    if (!deferredNoteText) return;
-    const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
-    const anchoredMessageId = findLastUserMessageId(args.messages);
-    const outcome = markNoteNudgeDelivered(args.db, args.sessionId, instruction, anchoredMessageId);
-    if (anchoredMessageId && outcome.ok) {
-        appendReminderToUserMessageById(args.messages, anchoredMessageId, instruction);
-    } else if (anchoredMessageId && !outcome.ok) {
-        sessionLog(args.sessionId, `rust note-nudge delivery skipped wire append: ${outcome.kind}`);
+    if (deferredNoteText) {
+        const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
+        const anchoredMessageId = findLastUserMessageId(args.messages);
+        const outcome = markNoteNudgeDelivered(
+            args.db,
+            args.sessionId,
+            instruction,
+            anchoredMessageId,
+        );
+        if (anchoredMessageId && outcome.ok) {
+            appendReminderToUserMessageById(args.messages, anchoredMessageId, instruction);
+        } else if (anchoredMessageId && !outcome.ok) {
+            sessionLog(
+                args.sessionId,
+                `rust note-nudge delivery skipped wire append: ${outcome.kind}`,
+            );
+        }
     }
+
+    const recoveryMessageIds = new Set<string>();
+    let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
+    if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
+        try {
+            for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+                if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+                const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+                if (messageId.length > 0) recoveryMessageIds.add(messageId);
+            }
+
+            const flagTarget = args.thinkingBindingRecoveryEnabledForModel
+                ? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+                : null;
+            if (flagTarget) {
+                const messageId =
+                    flagTarget === NEWEST_REASONING_BEARING_ASSISTANT
+                        ? findNewestReasoningBearingAssistantId(args.messages)
+                        : flagTarget;
+                if (messageId && assistantHasReasoningPart(args.messages, messageId)) {
+                    const frozenId = thinkingBindingRecoveryFrozenId(messageId);
+                    const persisted =
+                        recoveryMessageIds.has(messageId) ||
+                        addMergedReasoningStrippedIds(args.db, args.sessionId, [frozenId]);
+                    if (persisted) {
+                        recoveryMessageIds.add(messageId);
+                        thinkingBindingRecovery = { flagTarget, messageId };
+                    } else {
+                        sessionLog(
+                            args.sessionId,
+                            "rust thinking binding recovery: persistence failed; leaving the bound block intact",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "rust thinking binding recovery failed:", error);
+        }
+        stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
+    }
+    const marker = getPersistedCompactionMarkerState(args.db, args.sessionId);
+    return {
+        thinkingBindingRecovery,
+        markerAt: marker?.targetEndMessageId ?? marker?.boundaryMessageId ?? null,
+    };
 }
 
 function dropMarkerSummaryTag(
@@ -634,6 +864,15 @@ interface RunPostTransformPhaseArgs {
      */
     emergencyCeilingTokens?: number;
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
+    /**
+     * Messages trimmed while this transform rebuilds history. OpenCode rebuilds
+     * the next request from the boundary written later in this pass, so some rows
+     * can be absent now and return next time. Keep their objects long enough to
+     * persist empty sentinels for placeholder-only assistant messages before then.
+     */
+    hiddenMessagesAtCompactionSeam?: MessageLike[];
+    /** All source rows removed by the in-memory trim; their fresh tags are never served. */
+    trimmedMessagesAtCompactionBoundary?: MessageLike[];
     didMutateFromFlushedStatuses: boolean;
     watermark: number;
     forceMaterializationPercentage: number;
@@ -672,6 +911,8 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
+    /** True only when the live request is canonical Anthropic Fable 5.1. */
+    thinkingBindingRecoveryEnabledForModel?: boolean;
     /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     passOutcome?: PassOutcome;
@@ -710,6 +951,8 @@ export interface PostTransformPhaseResult {
     droppedCount: number;
     emergency: boolean;
     bustedThisPass: boolean;
+    /** Pending flag applied to the live output; the caller clears it only after the live lane succeeds. */
+    thinkingBindingRecovery: { flagTarget: string; messageId: string } | null;
 }
 
 export interface ConfirmedAbortClient {
@@ -798,8 +1041,8 @@ export function finalizeMessageRepresentation(
         prependedMessageCount?: number;
         reasoningMutatedMessages?: Iterable<MessageLike>;
         reasoningMutationExemptMessage?: MessageLike;
-        trailingBlankNewestAssistant?: MessageLike;
         mergedReasoningStrippedIds?: ReadonlySet<string>;
+        thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
         trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
         skipMergedReasoningStrip?: boolean;
         skipTrailingWhitespaceStrip?: boolean;
@@ -825,27 +1068,23 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
-    let newestAssistant = options?.trailingBlankNewestAssistant;
-    if (!newestAssistant) {
-        for (let index = messages.length - 1; index >= 0; index -= 1) {
-            const message = messages[index];
-            if (message.info.role !== "assistant") continue;
-            newestAssistant = message;
-            break;
-        }
-    }
-    const mergedReasoningParts = options?.skipMergedReasoningStrip
+    const bindingRecoveryParts = options?.skipMergedReasoningStrip
         ? 0
-        : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
-              mutationExemptMessage: options?.reasoningMutationExemptMessage,
-              frozenMessageIds: options?.mergedReasoningStrippedIds,
-          });
+        : stripReasoningFromAssistantIds(
+              messages,
+              resolvedProviderID,
+              options?.thinkingBindingRecoveryMessageIds ?? new Set(),
+          );
+    const mergedReasoningParts =
+        bindingRecoveryParts +
+        (options?.skipMergedReasoningStrip
+            ? 0
+            : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
+                  mutationExemptMessage: options?.reasoningMutationExemptMessage,
+                  frozenMessageIds: options?.mergedReasoningStrippedIds,
+              }));
     if (!options?.skipTrailingWhitespaceStrip && modelAcceptsEmptyContent(resolvedProviderID)) {
-        applyFrozenTrailingBlankDecisions(
-            messages,
-            typeof newestAssistant?.info.id === "string" ? newestAssistant.info.id : undefined,
-            options?.trailingBlankDecisions ?? new Map(),
-        );
+        applyFrozenTrailingBlankDecisions(messages, options?.trailingBlankDecisions ?? new Map());
     }
     return { clearedParts, mergedReasoningParts };
 }
@@ -1783,10 +2022,10 @@ export async function runPostTransformPhase(
 
     // Neutralize messages that are nothing but [dropped §N§] placeholders,
     // plus system-injected messages (notifications, reminders, internal markers).
-    // Both produce IDENTICAL empty-text-sentinel replacements that preserve array
-    // length between passes — cache-stable for both Anthropic-native (where
-    // OpenCode's upstream filter drops the empty parts at the wire) and proxy
-    // providers that hash the serialized message array.
+    // Canonical Anthropic uses empty sentinels that its adapter filters. A seam
+    // row hidden on the fold pass must instead be removed when replayed through a
+    // provider that rejects empty content; rendering `[dropped]` would introduce
+    // bytes that the fold never served.
     //
     // MUST run AFTER compartment injection: renderCompartmentInjection checks whether
     // messages[0] is a dropped placeholder to decide if it needs a synthetic carrier message.
@@ -1800,14 +2039,16 @@ export async function runPostTransformPhase(
     if (!compactionOff) {
         const tPlaceholder = performance.now();
         const persistedIds = getStrippedPlaceholderIds(args.db, args.sessionId);
+        const hiddenSeamIds = getHiddenSeamPlaceholderIds(args.db, args.sessionId);
 
-        // Step 1: Replay — re-apply sentinel to messages whose IDs were neutralized
-        // on a prior bust pass. Preserves array length — no splice.
+        // Step 1: Replay prior decisions. Ordinary rows keep provider-safe
+        // sentinels; non-Anthropic hidden-seam rows are removed to match the fold.
         if (persistedIds.size > 0) {
             const { replayed } = replaySentinelByMessageIds(
                 args.messages,
                 persistedIds,
                 args.resolvedProviderID,
+                hiddenSeamIds,
             );
             if (replayed > 0) {
                 sessionLog(
@@ -1836,24 +2077,52 @@ export async function runPostTransformPhase(
                 protectedTailStart,
                 args.resolvedProviderID,
             );
+            const hiddenMessages = args.hiddenMessagesAtCompactionSeam ?? [];
+            const hiddenDroppedResult = stripDroppedPlaceholderMessages(
+                hiddenMessages,
+                args.resolvedProviderID,
+            );
+            const hiddenSystemInjectedResult = stripSystemInjectedMessages(
+                hiddenMessages,
+                hiddenMessages.length,
+                args.resolvedProviderID,
+            );
 
             const newlyNeutralized =
-                droppedResult.sentineledIds.length + systemInjectedResult.sentineledIds.length;
+                droppedResult.sentineledIds.length +
+                systemInjectedResult.sentineledIds.length +
+                hiddenDroppedResult.sentineledIds.length +
+                hiddenSystemInjectedResult.sentineledIds.length;
 
             if (newlyNeutralized > 0) {
                 const addedIds = [
                     ...droppedResult.sentineledIds,
                     ...systemInjectedResult.sentineledIds,
+                    ...hiddenDroppedResult.sentineledIds,
+                    ...hiddenSystemInjectedResult.sentineledIds,
                 ];
                 for (const id of addedIds) persistedIds.add(id);
                 // CAS delta (add) so a concurrent prune in a sibling process
                 // doesn't clobber these newly-discovered IDs.
-                applyStrippedPlaceholderDelta(args.db, args.sessionId, { add: addedIds });
+                applyStrippedPlaceholderDelta(args.db, args.sessionId, {
+                    add: addedIds,
+                    hiddenSeamAdd: [
+                        ...hiddenDroppedResult.sentineledIds,
+                        ...hiddenSystemInjectedResult.sentineledIds,
+                    ],
+                });
                 sessionLog(
                     args.sessionId,
-                    `neutralized ${droppedResult.stripped} dropped + ${systemInjectedResult.stripped} system-injected messages (${newlyNeutralized} new, ${persistedIds.size} total persisted)`,
+                    `neutralized ${droppedResult.stripped} dropped + ${systemInjectedResult.stripped} system-injected messages + ${hiddenDroppedResult.stripped + hiddenSystemInjectedResult.stripped} hidden-at-marker-seam (${newlyNeutralized} new, ${persistedIds.size} total persisted)`,
                 );
             }
+        }
+
+        const trimmedMessageIds = (args.trimmedMessagesAtCompactionBoundary ?? [])
+            .map((message) => message.info.id)
+            .filter((id): id is string => typeof id === "string");
+        if (trimmedMessageIds.length > 0) {
+            markTagsCompactedByMessageIds(args.db, args.sessionId, trimmedMessageIds);
         }
         logTransformTiming(args.sessionId, "pp.placeholderNeutralize", tPlaceholder);
     }
@@ -2204,11 +2473,46 @@ export async function runPostTransformPhase(
     // any stripped bytes. The newest assistant is excluded from both detection
     // and replay because Anthropic requires its signed blocks byte-identically.
     const mergedReasoningStrippedIds = new Set<string>();
+    const thinkingBindingRecoveryMessageIds = new Set<string>();
+    let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
     if (canUseEmptySentinels && !compactionOff) {
         try {
             for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
                 mergedReasoningStrippedIds.add(id);
+                if (id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
+                    const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+                    if (messageId.length > 0) thinkingBindingRecoveryMessageIds.add(messageId);
+                }
             }
+
+            const flagTarget = args.thinkingBindingRecoveryEnabledForModel
+                ? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+                : null;
+            if (flagTarget) {
+                const messageId =
+                    flagTarget === NEWEST_REASONING_BEARING_ASSISTANT
+                        ? findNewestReasoningBearingAssistantId(args.messages)
+                        : flagTarget;
+                if (messageId && assistantHasReasoningPart(args.messages, messageId)) {
+                    const frozenId = thinkingBindingRecoveryFrozenId(messageId);
+                    const persisted =
+                        mergedReasoningStrippedIds.has(frozenId) ||
+                        addMergedReasoningStrippedIds(args.db, args.sessionId, [frozenId]);
+                    if (persisted) {
+                        mergedReasoningStrippedIds.add(frozenId);
+                        thinkingBindingRecoveryMessageIds.add(messageId);
+                        thinkingBindingRecovery = { flagTarget, messageId };
+                        bustedThisPass = true;
+                    } else {
+                        args.passOutcome?.record("thinking-binding-recovery-persistence-failure");
+                        sessionLog(
+                            args.sessionId,
+                            "thinking binding recovery: persistence failed; leaving the bound block intact",
+                        );
+                    }
+                }
+            }
+
             if (isCacheBustingPass) {
                 const candidates = findMergedReasoningStripCandidateIds(
                     args.messages,
@@ -2314,27 +2618,12 @@ export async function runPostTransformPhase(
         }
     }
 
-    const tFinalRepresentation = performance.now();
-    const finalRepresentation = finalizeMessageRepresentation(
-        args.messages,
-        args.resolvedProviderID,
-        {
-            prependedMessageCount,
-            reasoningMutatedMessages,
-            reasoningMutationExemptMessage,
-            trailingBlankNewestAssistant,
-            mergedReasoningStrippedIds,
-            trailingBlankDecisions,
-            skipMergedReasoningStrip: compactionOff,
-            skipTrailingWhitespaceStrip: compactionOff,
-        },
-    );
-
     if (canUseEmptySentinels && !compactionOff) {
-        // Observe every served pass, including defers. A newly completed assistant is
-        // recorded while it is newest, before a provider can append a blank to the
-        // rebuilt historical message. If a late blank arrives while it is still newest,
-        // refresh its choice; the newest exemption leaves those live bytes untouched.
+        // Observe every pass, including defers. A new decision or an allowed newest keep
+        // refresh is persisted before finalization, so a served demotion cannot outlive a
+        // failed compare-and-swap. An established strip never refreshes to keep: a harness
+        // blank arriving after the first serve stays stripped, and streaming, completion,
+        // and historical projections can only lose suffix bytes, never reintroduce them.
         const detectedCandidates = findTrailingBlankDecisionCandidates(
             args.messages,
             trailingBlankDecisions,
@@ -2357,27 +2646,16 @@ export async function runPostTransformPhase(
                 });
                 if (persisted) {
                     const committed = getTrailingBlankDecisions(args.db, args.sessionId);
-                    const newlyFrozen = new Map<string, TrailingBlankDecision>();
                     for (const [id] of candidates) {
                         const decision = committed.get(id);
-                        if (!decision) continue;
-                        trailingBlankDecisions.set(id, decision);
-                        newlyFrozen.set(id, decision);
+                        if (decision) trailingBlankDecisions.set(id, decision);
                     }
-                    // Apply a new keep decision while the assistant is still newest
-                    // so whitespace becomes canonical without changing the recorded
-                    // suffix length. A strip decision remains exempt while it is live.
-                    applyFrozenTrailingBlankDecisions(
-                        args.messages,
-                        newestAssistantId,
-                        newlyFrozen,
-                    );
                     if (isCacheBustingPass) bustedThisPass = true;
                 } else {
                     args.passOutcome?.record("trailing-blank-decision-persistence-failure");
                     sessionLog(
                         args.sessionId,
-                        "trailing blank decision: persistence failed; leaving newly observed assistants intact",
+                        "trailing blank decision: persistence failed; serving the frozen decisions",
                     );
                 }
             } catch (error) {
@@ -2390,6 +2668,22 @@ export async function runPostTransformPhase(
             }
         }
     }
+
+    const tFinalRepresentation = performance.now();
+    const finalRepresentation = finalizeMessageRepresentation(
+        args.messages,
+        args.resolvedProviderID,
+        {
+            prependedMessageCount,
+            reasoningMutatedMessages,
+            reasoningMutationExemptMessage,
+            mergedReasoningStrippedIds,
+            thinkingBindingRecoveryMessageIds,
+            trailingBlankDecisions,
+            skipMergedReasoningStrip: compactionOff,
+            skipTrailingWhitespaceStrip: compactionOff,
+        },
+    );
 
     sessionLog(
         args.sessionId,
@@ -2554,6 +2848,7 @@ export async function runPostTransformPhase(
         droppedCount,
         emergency,
         bustedThisPass,
+        thinkingBindingRecovery,
     };
 }
 

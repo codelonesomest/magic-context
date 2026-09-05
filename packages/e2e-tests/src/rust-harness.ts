@@ -1,8 +1,8 @@
 /**
  * RustTestHarness — facade for the Rust-mode (ck-mc over subc) e2e lane.
  *
- * Reuses the OpenCode e2e machinery UNCHANGED — the mock Anthropic provider and
- * the `opencode serve` subprocess + SDK session driving — and layers on the two
+ * Reuses the OpenCode e2e mock-provider, `opencode serve`, and SDK session-driving
+ * machinery, then layers on the two
  * things Rust mode needs that the TS lane does not:
  *
  *   1. a hermetic subc daemon + ck-mc module (HermeticSubcStack) whose
@@ -48,6 +48,12 @@ export interface RustTestHarnessOptions {
     modelContextLimit?: number;
     /** Default response used when the mock queue is empty. */
     mockDefault?: MockResponse;
+    /** Mock provider id exposed to OpenCode. Defaults to "mock-anthropic". */
+    providerID?: string;
+    /** AI SDK provider package used by the mock. Defaults to "@ai-sdk/anthropic". */
+    providerAPI?: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+    /** Mock model id used for prompts. Defaults to "mock-sonnet". */
+    modelID?: string;
     /**
      * Start opencode in TS mode instead of Rust mode. The hermetic daemon still
      * runs (so a later `restart({ rust: true })` can flip to Rust against the
@@ -120,6 +126,18 @@ export interface RustPassLine {
     raw: string;
 }
 
+type TrailingBlankReplayPartRow = {
+    id: string;
+    time_created: number;
+    data: string;
+};
+
+type TrailingBlankReplayRows = {
+    sessionId: string;
+    latestTime: number;
+    blankPartId: string;
+};
+
 export class RustTestHarness {
     readonly mock: MockProvider;
     readonly env: IsolatedEnv;
@@ -132,7 +150,11 @@ export class RustTestHarness {
     private modelContextLimit: number | undefined;
     private mockDefault: MockResponse;
     private readonly mockBaseURL: string;
+    private readonly providerID: string;
+    private readonly providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+    private readonly modelID: string;
     private readonly historianProducerAvailable: boolean;
+    private readonly trailingBlankReplayRows = new Map<string, TrailingBlankReplayRows>();
 
     private constructor(args: {
         mock: MockProvider;
@@ -144,6 +166,9 @@ export class RustTestHarness {
         logPath: string;
         modelContextLimit: number | undefined;
         mockDefault: MockResponse;
+        providerID: string;
+        providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+        modelID: string;
         historianProducerAvailable: boolean;
     }) {
         this.mock = args.mock;
@@ -155,6 +180,9 @@ export class RustTestHarness {
         this.logPath = args.logPath;
         this.modelContextLimit = args.modelContextLimit;
         this.mockDefault = args.mockDefault;
+        this.providerID = args.providerID;
+        this.providerAPI = args.providerAPI;
+        this.modelID = args.modelID;
         this.historianProducerAvailable = args.historianProducerAvailable;
     }
 
@@ -225,6 +253,9 @@ export class RustTestHarness {
             logPath,
             modelContextLimit: options.modelContextLimit,
             mockDefault,
+            providerID: options.providerID ?? "mock-anthropic",
+            providerAPI: options.providerAPI ?? "@ai-sdk/anthropic",
+            modelID: options.modelID ?? "mock-sonnet",
             historianProducerAvailable: options.startHistorianProducer ?? true,
         });
     }
@@ -237,14 +268,19 @@ export class RustTestHarness {
         options: RustTestHarnessOptions;
         rustMode: boolean;
     }): Promise<SpawnedOpencode> {
+        const providerID = args.options.providerID ?? "mock-anthropic";
+        const modelID = args.options.modelID ?? "mock-sonnet";
         return spawnOpencode({
             mockProviderURL: args.mockURL,
+            mockProviderID: providerID,
+            mockProviderAPI: args.options.providerAPI,
+            mockModelID: modelID,
             existingEnv: args.env,
             modelContextLimit: args.options.modelContextLimit,
             openCodeConfigExtra: args.options.openCodeConfigExtra,
             magicContextConfig: {
                 ...(args.options.startHistorianProducer ?? true
-                    ? { historian: { opencode: { model: "mock-anthropic/mock-sonnet" } } }
+                    ? { historian: { opencode: { model: `${providerID}/${modelID}` } } }
                     : {}),
                 ...(args.options.magicContextConfig ?? {}),
             },
@@ -292,6 +328,9 @@ export class RustTestHarness {
                 modelContextLimit: this.modelContextLimit,
                 magicContextConfig: opts.magicContextConfig,
                 startHistorianProducer: this.historianProducerAvailable,
+                providerID: this.providerID,
+                providerAPI: this.providerAPI,
+                modelID: this.modelID,
             },
             rustMode: opts.rust ?? true,
         });
@@ -444,18 +483,120 @@ export class RustTestHarness {
         }
     }
 
+    /**
+     * Capture the persisted tool-use assistant that a replay will expose through several
+     * ingress shapes. The original rows are retained so every shape starts from identical data.
+     */
+    prepareTrailingBlankReplay(sessionId: string): string {
+        const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            const message = db
+                .prepare(
+                    "SELECT m.id FROM message m WHERE m.session_id = ? AND json_extract(m.data, '$.role') = 'assistant' AND EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id AND json_extract(p.data, '$.type') = 'tool') ORDER BY m.time_created DESC LIMIT 1",
+                )
+                .get(sessionId) as { id: string } | undefined;
+            if (!message) throw new Error("trailing-blank replay did not persist a tool assistant");
+            const rawRows = db
+                .prepare(
+                    "SELECT id, time_created, data FROM part WHERE message_id = ? ORDER BY time_created, id",
+                )
+                .all(message.id) as TrailingBlankReplayPartRow[];
+            const finishPartId = rawRows.find(
+                (row) => (JSON.parse(row.data) as Record<string, unknown>).type === "step-finish",
+            )?.id;
+            if (!finishPartId) {
+                throw new Error("trailing-blank replay requires a completed tool step");
+            }
+            const blankPartId = `prt_zzzzzzzzzzzz${message.id.slice(-12)}`;
+            this.trailingBlankReplayRows.set(message.id, {
+                sessionId,
+                latestTime: Math.max(...rawRows.map((row) => row.time_created)),
+                blankPartId,
+            });
+            return message.id;
+        } finally {
+            db.close();
+        }
+    }
+
+    /** Append the late empty text part without rewriting the assistant's accepted prefix. */
+    appendTrailingBlankReplayPart(messageId: string): void {
+        const captured = this.trailingBlankReplayRows.get(messageId);
+        if (!captured) throw new Error(`trailing-blank replay assistant ${messageId} was not prepared`);
+        const latestTime = captured.latestTime + 1;
+        const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            db.prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            ).run(
+                captured.blankPartId,
+                messageId,
+                captured.sessionId,
+                latestTime,
+                latestTime,
+                JSON.stringify({ type: "text", text: "" }),
+            );
+        } finally {
+            db.close();
+        }
+    }
+
+    /** Seed the latest isolated tool result for a sanitized provider-wire replay fixture. */
+    seedLatestToolOutputForReplay(sessionId: string, output: string): void {
+        const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            const row = db
+                .prepare(
+                    "SELECT id, data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'tool' ORDER BY time_created DESC LIMIT 1",
+                )
+                .get(sessionId) as { id: string; data: string } | undefined;
+            if (!row) throw new Error("paired replay setup did not persist a tool result");
+            const data = JSON.parse(row.data) as Record<string, unknown>;
+            const state =
+                data.state && typeof data.state === "object"
+                    ? (data.state as Record<string, unknown>)
+                    : null;
+            data.output = output;
+            if (state) {
+                state.output = output;
+                if (state.metadata && typeof state.metadata === "object") {
+                    (state.metadata as Record<string, unknown>).output = output;
+                }
+            }
+            db.prepare("UPDATE part SET data = ? WHERE id = ?").run(JSON.stringify(data), row.id);
+        } finally {
+            db.close();
+        }
+    }
+
     async sendPrompt(
         sessionId: string,
         text: string,
-        options: { agent?: string; timeoutMs?: number } = {},
+        options: {
+            agent?: string;
+            timeoutMs?: number;
+            providerID?: string;
+            modelID?: string;
+            messageID?: string;
+        } = {},
     ): Promise<unknown> {
         const timeoutMs = options.timeoutMs ?? 180_000;
         const promptPromise = this.clientInstance.session.prompt({
             path: { id: sessionId },
             body: {
-                model: { providerID: "mock-anthropic", modelID: "mock-sonnet" },
+                model: {
+                    providerID: options.providerID ?? this.providerID,
+                    modelID: options.modelID ?? this.modelID,
+                },
                 parts: [{ type: "text", text }],
                 ...(options.agent ? { agent: options.agent } : {}),
+                ...(options.messageID ? { messageID: options.messageID } : {}),
             },
         });
         const timeout = new Promise<null>((r) => setTimeout(() => r(null), timeoutMs));
@@ -492,10 +633,22 @@ export class RustTestHarness {
     }
 
     /** Fetch the session's messages via the SDK (for choosing a mid-session id to remove). */
-    async listMessages(sessionId: string): Promise<Array<{ info?: { id?: string; role?: string } }>> {
+    async listMessages(
+        sessionId: string,
+    ): Promise<
+        Array<{
+            info?: { id?: string; role?: string };
+            parts?: Array<{ type?: string; text?: string }>;
+        }>
+    > {
         const res = await this.clientInstance.session.messages({ path: { id: sessionId } });
         const data = (res as { data?: unknown }).data;
-        return Array.isArray(data) ? (data as Array<{ info?: { id?: string; role?: string } }>) : [];
+        return Array.isArray(data)
+            ? (data as Array<{
+                  info?: { id?: string; role?: string };
+                  parts?: Array<{ type?: string; text?: string }>;
+              }>)
+            : [];
     }
 
     // ── wire captures (from the fake provider) ────────────────────────────────
@@ -504,7 +657,7 @@ export class RustTestHarness {
     mainRequests() {
         return this.mock
             .requests()
-            .filter((r) => JSON.stringify(r.body.system ?? "").includes("## Magic Context"));
+            .filter((request) => JSON.stringify(request.body).includes("## Magic Context"));
     }
 
     /** The messages array of the most recent main-agent request. */
@@ -525,10 +678,10 @@ export class RustTestHarness {
         return Buffer.byteLength(stableSerialize(req.body.messages ?? []));
     }
 
-    /** Stable serialization of the most recent main-agent messages array (cache_control stripped). */
-    lastMainWireSerialized(): string {
+    /** Deterministically serialize messages or input from the latest main-provider request. */
+    lastMainWireSerialized(requestField: "messages" | "input" = "messages"): string {
         const req = this.mainRequests().at(-1);
-        return stableSerialize(req?.body.messages ?? []);
+        return stableSerialize(req?.body[requestField] ?? []);
     }
 
     // ── plugin-log rust-pass decisions (secondary signal) ─────────────────────
