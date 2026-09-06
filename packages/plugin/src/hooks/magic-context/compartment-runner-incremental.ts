@@ -69,8 +69,10 @@ import {
 } from "./compartment-runner-validation";
 import { clearInjectionCache, renderMemoryBlock } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
+import { producerWindowFailureReason } from "./producer-window-guard";
 import {
     createDefaultBoundarySnapshotForTests,
+    describeBoundaryDiagnostics,
     hasRunnableCompartmentWindow,
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
@@ -304,7 +306,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         if (protectedTailStart <= offset || eligibleEndOrdinal <= offset) {
             sessionLog(
                 sessionId,
-                `historian no-op: protectedTailStart=${protectedTailStart} eligibleEnd=${eligibleEndOrdinal} <= offset=${offset} — nothing to compact`,
+                `historian no-op: protectedTailStart=${protectedTailStart} eligibleEnd=${eligibleEndOrdinal} <= offset=${offset} — nothing to compact; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
             );
             if (boundarySnapshot.usagePercentage < 80 && !boundarySnapshot.emergencyTailScale) {
                 if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
@@ -375,7 +377,31 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             rollbackDrainReservation();
             return;
         }
-        const chunkText = truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
+        const chunkText = chunk.oversizeAtomicUnit
+            ? chunk.text
+            : truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
+        const producerSourceTokens = estimateTokens(chunkText);
+        if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
+            sessionLog(
+                sessionId,
+                `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+            );
+        }
+        const producerWindowFailure = producerWindowFailureReason({
+            producerSourceTokens,
+            contextLimitTokens: deps.historianContextLimit,
+            maxOutputTokens: deps.historianMaxOutputTokens ?? 32_000,
+        });
+        if (producerWindowFailure) {
+            telemetry.failureReason = producerWindowFailure;
+            retainDrainReservationForRetryThrottle = true;
+            incrementHistorianFailure(db, sessionId, producerWindowFailure);
+            sessionLog(
+                sessionId,
+                `historian oversize admission refused before spawn: ${producerWindowFailure}`,
+            );
+            return;
+        }
         if (chunkText !== chunk.text) {
             sessionLog(
                 sessionId,
@@ -468,6 +494,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             sequenceOffset,
             dumpLabelBase: `incremental-${sessionId}-${chunk.startIndex}-${chunk.endIndex}`,
             timeoutMs: historianTimeoutMs,
+            model: deps.model,
             fallbackModelId: deps.fallbackModelId,
             fallbackModels: deps.fallbackModels,
             twoPass: deps.historianTwoPass,

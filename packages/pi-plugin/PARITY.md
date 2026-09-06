@@ -108,6 +108,18 @@ model-visible context is still trimmed. OpenCode uses its own
 deferred-compaction-marker mechanism (`compaction-marker.ts`); the two are
 mechanism-parallel, not identical.
 
+**OMP:** the native writer is `appendCompaction(summary, shortSummary,
+firstKeptEntryId, tokensBefore, { details, fromExtension })`, not Pi's
+`appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromHook)`.
+Both deferred and explicit drains use the shared host-aware adapter in
+`compaction-marker-manager-pi.ts`; passing Pi's tuple directly to OMP shifts
+the kept ID into `shortSummary` and silently removes unsummarized history from
+the next native context projection. Existing malformed MC-owned records can be
+inspected with `bun scripts/repair-omp-compaction.ts <session.jsonl>` and repaired
+with `--apply` only after closing the session. The utility retains a full backup,
+checks the kept entry belongs to the marker's branch, and preserves non-marker
+lines byte-for-byte. `/ctx-session-upgrade` is not a repair for this API mismatch.
+
 ---
 
 ## 5. Pi rebuilds `AgentMessage[]` from JSONL every pass

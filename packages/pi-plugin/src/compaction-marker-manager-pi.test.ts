@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import type { PendingPiCompactionMarker } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -6,6 +7,8 @@ import {
 	applyDeferredPiCompactionMarker,
 	findLatestCompactionFirstKept,
 } from "./compaction-marker-manager-pi";
+import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
+import { queueAndApplyPiRecompMarker } from "./pi-recomp-marker";
 import { createTestDb } from "./test-utils.test";
 
 function pending(
@@ -45,39 +48,68 @@ describe("Pi deferred compaction marker manager", () => {
 		).toBeNull();
 	});
 
-	it("applies pending marker with Pi appendCompaction arguments", () => {
+	it("keeps unsummarized messages when an OMP marker is persisted and projected", () => {
 		const db = createTestDb();
+		const sm = SessionManager.inMemory();
+		const first = sm.appendMessage({
+			role: "user",
+			content: "covered",
+			timestamp: 1,
+		});
+		const kept = sm.appendMessage({
+			role: "user",
+			content: "must survive",
+			timestamp: 2,
+		});
+		const nativeOmp = {
+			getBranch: () => sm.getBranch(),
+			appendCompaction(
+				summary: string,
+				_shortSummary: string | undefined,
+				firstKeptEntryId: string,
+				tokensBefore: number,
+				options: { details?: unknown; fromExtension?: boolean } = {},
+			) {
+				return sm.appendCompaction(
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					options.details,
+					options.fromExtension,
+				);
+			},
+		};
+		__setPiHarnessKindForTesting("omp");
 		try {
 			appendCompartments(db, "ses", [
 				{
 					sequence: 0,
 					startMessage: 1,
-					endMessage: 2,
-					startMessageId: "m1",
-					endMessageId: "m2",
-					title: "A",
-					content: "B",
+					endMessage: 1,
+					startMessageId: first,
+					endMessageId: first,
+					title: "Covered",
+					content: "Covered history",
 				},
 			]);
-			const appendCompaction = mock(() => "compact-1");
-			const outcome = applyDeferredPiCompactionMarker(
-				{
-					db,
-					readBranchEntries: () => branch(),
-					appendCompaction,
-				},
-				"ses",
-				pending(),
-			);
-			expect(outcome.kind).toBe("applied");
-			expect(appendCompaction).toHaveBeenCalledWith(
-				"summary",
-				"entry-3",
-				200,
-				{ source: "magic-context", lastCompactedOrdinal: 2 },
-				true,
-			);
+			queueAndApplyPiRecompMarker({
+				db,
+				sessionId: "ses",
+				ctx: { sessionManager: nativeOmp },
+			});
+			expect(
+				sm
+					.buildSessionContext()
+					.messages.filter((message) => message.role === "user"),
+			).toEqual([{ role: "user", content: "must survive", timestamp: 2 }]);
+			expect(sm.getBranch().at(-1)).toMatchObject({
+				firstKeptEntryId: kept,
+				tokensBefore: 0,
+				fromHook: true,
+				details: { source: "magic-context", lastCompactedOrdinal: 1 },
+			});
 		} finally {
+			__setPiHarnessKindForTesting(undefined);
 			closeQuietly(db);
 		}
 	});

@@ -2,6 +2,7 @@ import { getCompartmentsByEndMessageId } from "@magic-context/core/features/magi
 import type { PendingPiCompactionMarker } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { resolvePiHarnessKind } from "./pi-harness-kind";
 import { findFirstKeptEntryId } from "./pi-historian-runner";
 
 export type PiMarkerUpdateOutcome =
@@ -24,6 +25,26 @@ export interface ApplyDeferredPiCompactionMarkerDeps {
 		details?: unknown,
 		fromHook?: boolean,
 	) => string | undefined;
+}
+
+/** Normalize the host writer once, before either deferred or explicit marker drain. */
+export function resolvePiAppendCompaction(
+	ctx: unknown,
+): ApplyDeferredPiCompactionMarkerDeps["appendCompaction"] | undefined {
+	const sm = (ctx as { sessionManager?: { appendCompaction?: unknown } } | null)
+		?.sessionManager;
+	if (typeof sm?.appendCompaction !== "function") return undefined;
+	const append = sm.appendCompaction;
+	if (resolvePiHarnessKind() === "omp") {
+		// OMP inserts shortSummary and groups ownership metadata in options.
+		// Passing Pi's positional tuple silently corrupts the kept boundary.
+		return (summary, firstKeptEntryId, tokensBefore, details, fromHook) =>
+			append.call(sm, summary, undefined, firstKeptEntryId, tokensBefore, {
+				details,
+				fromExtension: fromHook,
+			});
+	}
+	return append.bind(sm);
 }
 
 export function applyDeferredPiCompactionMarker(

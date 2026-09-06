@@ -228,7 +228,11 @@ pub enum BindingError {
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
 const TRANSFORM_HEALTH_LANE: &str = "transform";
-const TRANSFORM_WEDGE_THRESHOLD_MS: u64 = 120_000;
+// Emergency historian work continues in its spawned task, but a transform may wait only long
+// enough to finish before the caller's transport deadline. Sharing one budget across the busy
+// join and inline-refire arms prevents their individual deadlines from stacking.
+const TRANSFORM_HISTORIAN_FOLLOWUP_BUDGET: Duration = Duration::from_secs(20);
+const TRANSFORM_WEDGE_THRESHOLD_MS: u64 = 30_000;
 const STORE_OPEN_IDLE: u8 = 0;
 const STORE_OPENING: u8 = 1;
 const STORE_OPEN_WAITING: u8 = 2;
@@ -475,14 +479,15 @@ impl DispatchHealth {
         } else {
             HealthStatus::Ok
         };
+        let state = if stale { "stuck" } else { "advancing" };
         let detail = if stale {
             if queue_stale && !heartbeat_stale {
                 format!(
-                    "{TRANSFORM_HEALTH_LANE} lane queue stale; oldest queued item is {stale_age_ms}ms old; in-flight={in_flight}; consecutive errors={consecutive_errors}"
+                    "{TRANSFORM_HEALTH_LANE} lane stuck: queue stale; oldest queued item is {stale_age_ms}ms old; in-flight={in_flight}; consecutive errors={consecutive_errors}"
                 )
             } else {
                 format!(
-                    "{TRANSFORM_HEALTH_LANE} lane heartbeat stale by {stale_age_ms}ms; in-flight={in_flight}; consecutive errors={consecutive_errors}"
+                    "{TRANSFORM_HEALTH_LANE} lane stuck: heartbeat stale by {stale_age_ms}ms; in-flight={in_flight}; consecutive errors={consecutive_errors}"
                 )
             }
         } else if consecutive_errors > 0 {
@@ -499,6 +504,8 @@ impl DispatchHealth {
             detail: Some(detail),
             metrics: Some(json!({
                 "lane": TRANSFORM_HEALTH_LANE,
+                "state": state,
+                "stuck": stale,
                 "last_dispatch_started_at_ms": started,
                 "last_dispatch_completed_at_ms": completed,
                 "in_flight_count": in_flight,
@@ -3169,6 +3176,8 @@ pub struct McHandler {
     #[cfg(test)]
     between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    transform_historian_followup_budget: Mutex<Option<Duration>>,
+    #[cfg(test)]
     wrapup_operation_budget: Mutex<Option<Duration>>,
     #[cfg(test)]
     unknown_module_retry_delay: Mutex<Option<Duration>>,
@@ -3330,20 +3339,32 @@ fn historian_no_fire_detail(
     )
 }
 
-fn historian_no_fire_diagnostics(
-    no_fire: impl Into<String>,
-    detail_kind: &str,
+struct NoFireDiagnosticsInput<'a> {
+    no_fire: String,
+    detail_kind: &'a str,
     cause: HistorianNoFireCause,
-    extra: Option<&str>,
+    extra: Option<&'a str>,
     reason: Option<String>,
     state: String,
     progress: Option<transform::HistorianTriggerProgress>,
     last_failure: Option<String>,
-) -> HistorianDiagnostics {
+}
+
+fn historian_no_fire_diagnostics(input: NoFireDiagnosticsInput<'_>) -> HistorianDiagnostics {
+    let NoFireDiagnosticsInput {
+        no_fire,
+        detail_kind,
+        cause,
+        extra,
+        reason,
+        state,
+        progress,
+        last_failure,
+    } = input;
     HistorianDiagnostics {
         fired: false,
         reason,
-        no_fire: Some(no_fire.into()),
+        no_fire: Some(no_fire),
         no_fire_detail: Some(historian_no_fire_detail(detail_kind, cause, extra)),
         canonical_cause: Some(cause.canonical_cause().to_string()),
         state,
@@ -3646,6 +3667,8 @@ impl McHandler {
             #[cfg(test)]
             between_transform_and_prepare: Mutex::new(None),
             #[cfg(test)]
+            transform_historian_followup_budget: Mutex::new(None),
+            #[cfg(test)]
             wrapup_operation_budget: Mutex::new(None),
             #[cfg(test)]
             unknown_module_retry_delay: Mutex::new(None),
@@ -3855,6 +3878,7 @@ impl McHandler {
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 historian_context_limit_tokens: 128_000,
+                historian_context_limit_known: false,
                 memory_budget_tokens: 4_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
@@ -3908,6 +3932,7 @@ impl McHandler {
             guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
+            transform_historian_followup_budget: Mutex::new(None),
             wrapup_operation_budget: Mutex::new(None),
             unknown_module_retry_delay: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
@@ -4864,30 +4889,32 @@ impl McHandler {
             Ok(loaded) => loaded,
             Err(e) => {
                 return PreparedHistorianAction::Complete(historian_no_fire_diagnostics(
-                    format!("state_load_failed:{e}"),
-                    "state_load_failed",
-                    HistorianNoFireCause::StateLoadFailed,
-                    None,
-                    None,
-                    "unknown".to_string(),
-                    None,
-                    None,
+                    NoFireDiagnosticsInput {
+                        no_fire: format!("state_load_failed:{e}"),
+                        detail_kind: "state_load_failed",
+                        cause: HistorianNoFireCause::StateLoadFailed,
+                        extra: None,
+                        reason: None,
+                        state: "unknown".to_string(),
+                        progress: None,
+                        last_failure: None,
+                    },
                 ));
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
         let last_failure = loaded.meta.historian.last_failure.clone();
         if loaded.meta.pending_rewrite.is_some() {
-            let diagnostics = historian_no_fire_diagnostics(
-                "pending_rewrite",
-                "pending_rewrite",
-                HistorianNoFireCause::PendingRewrite,
-                None,
-                None,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "pending_rewrite".into(),
+                detail_kind: "pending_rewrite",
+                cause: HistorianNoFireCause::PendingRewrite,
+                extra: None,
+                reason: None,
                 state,
-                None,
+                progress: None,
                 last_failure,
-            );
+            });
             self.record_no_fire(
                 &store,
                 &parsed.session_id,
@@ -4900,16 +4927,16 @@ impl McHandler {
             return PreparedHistorianAction::Complete(diagnostics);
         }
         if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
-            let diagnostics = historian_no_fire_diagnostics(
-                "busy",
-                "busy",
-                HistorianNoFireCause::LiveHistorianClaimBusy,
-                None,
-                None,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "busy".into(),
+                detail_kind: "busy",
+                cause: HistorianNoFireCause::LiveHistorianClaimBusy,
+                extra: None,
+                reason: None,
                 state,
-                None,
+                progress: None,
                 last_failure,
-            );
+            });
             self.record_no_fire(
                 &store,
                 &parsed.session_id,
@@ -4936,16 +4963,16 @@ impl McHandler {
                     now,
                 )
                 .unwrap_or("busy");
-            let diagnostics = historian_no_fire_diagnostics(
-                no_fire,
-                "restart_recovery",
-                HistorianNoFireCause::RestartRecoveryInProgress,
-                None,
-                None,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: no_fire.to_string(),
+                detail_kind: "restart_recovery",
+                cause: HistorianNoFireCause::RestartRecoveryInProgress,
+                extra: None,
+                reason: None,
                 state,
-                None,
+                progress: None,
                 last_failure,
-            );
+            });
             self.record_no_fire(
                 &store,
                 &parsed.session_id,
@@ -4989,16 +5016,16 @@ impl McHandler {
                     "mc-module: aborting historian trigger for {}: {detail}",
                     parsed.session_id
                 );
-                let diagnostics = historian_no_fire_diagnostics(
-                    detail,
-                    detail,
-                    HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
-                    None,
-                    None,
+                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: detail.into(),
+                    detail_kind: detail,
+                    cause: HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
+                    extra: None,
+                    reason: None,
                     state,
-                    None,
+                    progress: None,
                     last_failure,
-                );
+                });
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
@@ -5090,16 +5117,16 @@ impl McHandler {
                     context_limit,
                 )
             });
-            let diagnostics = historian_no_fire_diagnostics(
-                "trigger_false",
-                "trigger_false",
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "trigger_false".into(),
+                detail_kind: "trigger_false",
                 cause,
-                extra.as_deref(),
-                None,
+                extra: extra.as_deref(),
+                reason: None,
                 state,
                 progress,
                 last_failure,
-            );
+            });
             self.record_no_fire(
                 &store,
                 &parsed.session_id,
@@ -5117,16 +5144,16 @@ impl McHandler {
             .as_deref()
             .unwrap_or(&cfg.model_chain);
         if model_chain.is_empty() {
-            let diagnostics = historian_no_fire_diagnostics(
-                "no_models",
-                "no_models",
-                HistorianNoFireCause::NoModels,
-                None,
-                trigger_reason,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "no_models".into(),
+                detail_kind: "no_models",
+                cause: HistorianNoFireCause::NoModels,
+                extra: None,
+                reason: trigger_reason,
                 state,
                 progress,
                 last_failure,
-            );
+            });
             self.record_no_fire(
                 &store,
                 &parsed.session_id,
@@ -5139,16 +5166,16 @@ impl McHandler {
             return PreparedHistorianAction::Complete(diagnostics);
         }
         let Some(boundary) = trigger.boundary.clone() else {
-            let diagnostics = historian_no_fire_diagnostics(
-                "missing_boundary",
-                "missing_boundary",
-                HistorianNoFireCause::MissingBoundary,
-                None,
-                None,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "missing_boundary".into(),
+                detail_kind: "missing_boundary",
+                cause: HistorianNoFireCause::MissingBoundary,
+                extra: None,
+                reason: None,
                 state,
                 progress,
                 last_failure,
-            );
+            });
             self.record_no_fire(
                 &store,
                 &parsed.session_id,
@@ -5166,16 +5193,16 @@ impl McHandler {
             .failure_backoff_at_ms
             .is_some_and(|backoff_at_ms| now < backoff_at_ms)
         {
-            let diagnostics = historian_no_fire_diagnostics(
-                "backoff",
-                "backoff",
-                HistorianNoFireCause::FailureBackoff,
-                None,
-                trigger_reason,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "backoff".into(),
+                detail_kind: "backoff",
+                cause: HistorianNoFireCause::FailureBackoff,
+                extra: None,
+                reason: trigger_reason,
                 state,
                 progress,
                 last_failure,
-            );
+            });
             self.record_no_fire(
                 &store,
                 &parsed.session_id,
@@ -5217,6 +5244,10 @@ impl McHandler {
                 project_slug: project_slug.clone(),
                 model_chain: model_chain.to_vec(),
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
+                historian_context_limit_tokens: cfg
+                    .historian_context_limit_known
+                    .then_some(cfg.historian_context_limit_tokens),
+                max_output_tokens: historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
                 boundary,
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
@@ -5235,16 +5266,16 @@ impl McHandler {
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
                 let raw_no_fire = format!("assemble:{reason:?}");
                 let raw_detail = format!("detail={reason:?}");
-                let diagnostics = historian_no_fire_diagnostics(
-                    raw_no_fire,
-                    "assemble",
-                    reason.cause(),
-                    Some(&raw_detail),
-                    trigger_reason,
+                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: raw_no_fire,
+                    detail_kind: "assemble",
+                    cause: reason.cause(),
+                    extra: Some(&raw_detail),
+                    reason: trigger_reason,
                     state,
                     progress,
                     last_failure,
-                );
+                });
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
@@ -5259,16 +5290,16 @@ impl McHandler {
             Err(e) => {
                 let raw_no_fire = format!("assemble_failed:{e}");
                 let raw_detail = format!("error={e}");
-                let diagnostics = historian_no_fire_diagnostics(
-                    raw_no_fire,
-                    "assemble_failed",
-                    HistorianNoFireCause::AssemblyFailed,
-                    Some(&raw_detail),
-                    trigger_reason,
+                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: raw_no_fire,
+                    detail_kind: "assemble_failed",
+                    cause: HistorianNoFireCause::AssemblyFailed,
+                    extra: Some(&raw_detail),
+                    reason: trigger_reason,
                     state,
                     progress,
                     last_failure,
-                );
+                });
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
@@ -5294,16 +5325,16 @@ impl McHandler {
         let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
             LiveHistorianSessionClaim::Acquired(live_guard) => live_guard,
             LiveHistorianSessionClaim::Busy(completion) => {
-                let busy_diagnostics = historian_no_fire_diagnostics(
-                    "busy",
-                    "busy",
-                    HistorianNoFireCause::LiveHistorianClaimBusy,
-                    None,
-                    diagnostics.reason,
+                let busy_diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: "busy".into(),
+                    detail_kind: "busy",
+                    cause: HistorianNoFireCause::LiveHistorianClaimBusy,
+                    extra: None,
+                    reason: diagnostics.reason,
                     state,
                     progress,
                     last_failure,
-                );
+                });
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
@@ -5406,6 +5437,10 @@ impl McHandler {
                 project_slug: project_slug.clone(),
                 model_chain: cfg.model_chain,
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
+                historian_context_limit_tokens: cfg
+                    .historian_context_limit_known
+                    .then_some(cfg.historian_context_limit_tokens),
+                max_output_tokens: historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
                 boundary: boundary.clone(),
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
@@ -5544,7 +5579,19 @@ impl McHandler {
         }
     }
 
-    /// Drive a firing for an emergency pass, bounded by the completion-wait budget.
+    fn transform_historian_followup_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self
+            .transform_historian_followup_budget
+            .lock()
+            .expect("transform historian follow-up budget mutex")
+        {
+            return budget;
+        }
+        TRANSFORM_HISTORIAN_FOLLOWUP_BUDGET
+    }
+
+    /// Drive a firing for an emergency pass within the transform's remaining follow-up budget.
     ///
     /// The firing runs as a SPAWNED task and this method awaits its JoinHandle with a
     /// timeout, for two reasons:
@@ -5558,11 +5605,24 @@ impl McHandler {
     ///   would instead strand durable state for crash recovery to repair.
     async fn run_historian_firing_inline(
         &self,
+        session_id: &str,
         task: HistorianFiringTask,
+        wait_budget: Duration,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
         let factory = Arc::clone(&self.producer_factory);
         let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
-        match tokio::time::timeout(historian::completion_wait_budget(), handle).await {
+        let wait_started_at = Instant::now();
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_inline_wait event=begin budget_ms={}",
+            wait_budget.as_millis()
+        );
+        let waited = tokio::time::timeout(wait_budget, handle).await;
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_inline_wait event=end outcome={} elapsed_ms={:.1}",
+            if waited.is_ok() { "completed" } else { "timed_out" },
+            wait_started_at.elapsed().as_secs_f64() * 1_000.0
+        );
+        match waited {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(join_err)) => Err(historian::HistorianDriveError::Producer(
                 HistorianProducerError::RunFailed {
@@ -5580,11 +5640,22 @@ impl McHandler {
 
     async fn await_live_historian_completion(
         &self,
+        session_id: &str,
         completion: LiveHistorianCompletionWait,
+        wait_budget: Duration,
     ) -> bool {
-        tokio::time::timeout(historian::completion_wait_budget(), completion)
-            .await
-            .is_ok()
+        let wait_started_at = Instant::now();
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_busy_wait event=begin budget_ms={}",
+            wait_budget.as_millis()
+        );
+        let completed = tokio::time::timeout(wait_budget, completion).await.is_ok();
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_busy_wait event=end outcome={} elapsed_ms={:.1}",
+            if completed { "completed" } else { "timed_out" },
+            wait_started_at.elapsed().as_secs_f64() * 1_000.0
+        );
+        completed
     }
 
     fn wrapup_operation_budget(&self) -> Duration {
@@ -8521,18 +8592,25 @@ impl McHandler {
         {
             hook();
         }
+        let transform_followup_deadline =
+            handler_started_at + self.transform_historian_followup_budget();
+        let remaining_followup_budget = || {
+            transform_followup_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO)
+        };
         let mut trigger_timings = HistorianTriggerTimings::default();
         let diagnostics = if parsed.is_subagent {
-            historian_no_fire_diagnostics(
-                "subagent_session",
-                "subagent_session",
-                HistorianNoFireCause::SubagentSession,
-                None,
-                Some("subagent_session".to_string()),
-                "disabled".to_string(),
-                None,
-                None,
-            )
+            historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "subagent_session".into(),
+                detail_kind: "subagent_session",
+                cause: HistorianNoFireCause::SubagentSession,
+                extra: None,
+                reason: Some("subagent_session".to_string()),
+                state: "disabled".to_string(),
+                progress: None,
+                last_failure: None,
+            })
         } else if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             match self.prepare_historian_fire(
                 Arc::clone(&store),
@@ -8551,7 +8629,14 @@ impl McHandler {
                     diagnostics,
                     completion,
                 } => {
-                    if self.await_live_historian_completion(completion).await {
+                    if self
+                        .await_live_historian_completion(
+                            &parsed.session_id,
+                            completion,
+                            remaining_followup_budget(),
+                        )
+                        .await
+                    {
                         result = match run_transform() {
                             Ok(result) => result,
                             Err(e) => return reject_transform(e),
@@ -8576,7 +8661,14 @@ impl McHandler {
                             PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
                             PreparedHistorianAction::FireReady(prepared) => {
                                 let diagnostics = prepared.diagnostics.clone();
-                                match self.run_historian_firing_inline(prepared.task).await {
+                                match self
+                                    .run_historian_firing_inline(
+                                        &parsed.session_id,
+                                        prepared.task,
+                                        remaining_followup_budget(),
+                                    )
+                                    .await
+                                {
                                     Ok(_) => {
                                         result = match run_transform() {
                                             Ok(result) => result,
@@ -8602,7 +8694,14 @@ impl McHandler {
                 }
                 PreparedHistorianAction::FireReady(prepared) => {
                     let diagnostics = prepared.diagnostics.clone();
-                    match self.run_historian_firing_inline(prepared.task).await {
+                    match self
+                        .run_historian_firing_inline(
+                            &parsed.session_id,
+                            prepared.task,
+                            remaining_followup_budget(),
+                        )
+                        .await
+                    {
                         Ok(_) => {
                             result = match run_transform() {
                                 Ok(result) => result,
@@ -12112,7 +12211,7 @@ fn attach_native_messages_with_tags(
         return;
     }
     let native_messages = encode_full_native_messages(
-        response.messages(),
+        response,
         request,
         reasoning_watermark,
         tag_numbers,
@@ -12298,7 +12397,7 @@ fn native_reasoning_should_clear(
 }
 
 fn encode_full_native_messages(
-    served: &[transform::ServedMessage],
+    response: &transform::TransformResponse,
     request: &TransformRequest,
     reasoning_watermark: u64,
     tag_numbers: &BTreeMap<String, u64>,
@@ -12306,6 +12405,8 @@ fn encode_full_native_messages(
     lineage_anchor_mid: Option<&str>,
     transition_consumed: bool,
 ) -> Vec<Value> {
+    let served = response.messages();
+    let native_reasoning_keep_mids = &response.native_reasoning_keep_mids;
     let sidecar = request
         .native_messages
         .as_deref()
@@ -12343,7 +12444,28 @@ fn encode_full_native_messages(
             tag_numbers,
         );
     }
+    replay_native_reasoning_keeps(&mut native_messages, &sidecar, native_reasoning_keep_mids);
     native_messages
+}
+
+fn replay_native_reasoning_keeps(
+    messages: &mut [Value],
+    sidecar: &codec::DecodeSidecar,
+    keep_mids: &[String],
+) {
+    for message in messages {
+        let Some(mid) = message["info"]["id"].as_str() else {
+            continue;
+        };
+        if !keep_mids.iter().any(|keep| keep == mid) {
+            continue;
+        }
+        if let Some(meta) = sidecar.messages.get(mid) {
+            if let Some(parts) = meta.raw.get("parts") {
+                message["parts"] = parts.clone();
+            }
+        }
+    }
 }
 
 fn native_ingress_chunks(
@@ -12509,7 +12631,13 @@ fn attach_native_messages_incremental(
             }
             Some(hash)
         });
-        let mutation_exempt = slot.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
+        let mutation_exempt = slot.is_some_and(|mid| {
+            mutation_exempt_mids.contains(&mid)
+                || response
+                    .native_reasoning_keep_mids
+                    .iter()
+                    .any(|keep| keep == mid)
+        });
         let reasoning_exempt = slot.is_some_and(|mid| Some(mid) == newest_assistant_mid);
         let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
             served,
@@ -12623,6 +12751,11 @@ fn attach_native_messages_incremental(
             tag_numbers,
         );
     }
+    replay_native_reasoning_keeps(
+        &mut suffix_values,
+        &sidecar,
+        &response.native_reasoning_keep_mids,
+    );
     chunks.extend(
         encoded_suffix
             .into_iter()
@@ -12644,7 +12777,7 @@ fn attach_native_messages_incremental(
 
     if native_attachment_differential_enabled() {
         let full = encode_full_native_messages(
-            response.messages(),
+            response,
             request,
             reasoning_watermark,
             tag_numbers,
@@ -12755,7 +12888,7 @@ fn finalize_native_messages_response(
         fallback_reason.get_or_insert(NativeDeltaFallbackReason::MissingNativeContent);
         response.native_messages = Some(
             encode_full_native_messages(
-                response.messages(),
+                response,
                 request,
                 reasoning_watermark,
                 tag_numbers,
@@ -17486,6 +17619,7 @@ mod tests {
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: 128_000,
+            historian_context_limit_known: false,
             memory_budget_tokens: 4_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -18156,6 +18290,34 @@ mod tests {
         assert_eq!(metrics["heartbeat_stale"], json!(true));
         assert_eq!(metrics["in_flight_count"], json!(1));
         assert_eq!(metrics["completion_lag_ms"], json!(150_000));
+        assert_eq!(metrics["state"], json!("stuck"));
+        assert_eq!(metrics["stuck"], json!(true));
+    }
+
+    #[test]
+    fn transform_health_stuck_bound_is_typed_and_constant_fenced() {
+        assert_eq!(TRANSFORM_WEDGE_THRESHOLD_MS, 30_000);
+        let health = DispatchHealth::new();
+        health
+            .last_dispatch_started_at_ms
+            .store(1, Ordering::Relaxed);
+        health.in_flight_count.store(1, Ordering::Relaxed);
+
+        let within_bound = health.report(30_001);
+        assert_eq!(within_bound.status, HealthStatus::Ok);
+        let within_metrics = within_bound.metrics.unwrap();
+        assert_eq!(within_metrics["state"], json!("advancing"));
+        assert_eq!(within_metrics["stuck"], json!(false));
+
+        let past_bound = health.report(30_002);
+        assert_eq!(past_bound.status, HealthStatus::Degraded);
+        assert!(past_bound
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("lane stuck")));
+        let stuck_metrics = past_bound.metrics.unwrap();
+        assert_eq!(stuck_metrics["state"], json!("stuck"));
+        assert_eq!(stuck_metrics["stuck"], json!(true));
     }
 
     #[test]
@@ -21591,6 +21753,103 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn post_hard_defer_preserves_demoted_native_thinking_until_priced_pass() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut native = vec![
+            json!({"info":{"id":"user","role":"user"},"parts":[{"type":"text","text":"start"}]}),
+            json!({"info":{"id":"previous","role":"assistant"},"parts":[{"type":"text","text":"earlier step"}]}),
+        ];
+        let make_request = |native: &Vec<Value>, model: &str| {
+            let decoded = codec::decode_opencode(native);
+            let mut req = request(decoded.messages);
+            req["serializer_profile"] = json!("opencode-aisdk");
+            req["serve_native"] = json!(true);
+            req["tool_present"] = json!(true);
+            req["provider_id"] = json!("anthropic");
+            req["model_key"] = json!(model);
+            req["mid_turn"] = json!(false);
+            req["native_messages"] = json!(native);
+            req
+        };
+        let warm = call_transform_request(&handler, make_request(&native, "claude-opus-5")).await;
+        assert_eq!(warm["action"], "HARD");
+        let thinking = json!({"type":"reasoning","text":"signed thinking", "metadata":{"anthropic":{"signature":"fixture-signature"}}});
+        native.push(json!({"info":{"id":"thinking","role":"assistant"},"parts":[
+            thinking.clone(), {"type":"text","text":"dispatching"},
+            {"type":"tool","tool":"work","callID":"call-thinking","state":{"status":"completed","input":{"action":"run"},"output":"dispatched"}}
+        ]}));
+        native.push(json!({"info":{"id":"continue","role":"user"},"parts":[{"type":"text","text":"continue"}]}));
+        let hard =
+            call_transform_request(&handler, make_request(&native, "claude-fable-5-1")).await;
+        assert_eq!(hard["action"], "HARD");
+        let mut previous = hard["native_messages"].as_array().unwrap().clone();
+        let hash = |messages: &[Value]| -> String {
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(messages).unwrap())
+            )
+        };
+        for step in 0..2 {
+            native.push(json!({"info":{"id":format!("step-{step}"),"role":"assistant"},"parts":[
+                {"type":"reasoning","text":format!("adaptive step {step}"),"metadata":{"anthropic":{"signature":format!("signature-{step}")}}},
+                {"type":"tool","tool":"work","callID":format!("call-{step}"),"state":{"status":"completed","input":{"action":"show"},"output":"done"}}
+            ]}));
+            let deferred =
+                call_transform_request(&handler, make_request(&native, "claude-fable-5-1")).await;
+            assert_eq!(deferred["action"], "SOFT+");
+            let served = deferred["native_messages"].as_array().unwrap();
+            assert!(served.len() > previous.len());
+            assert_eq!(
+                hash(&served[..previous.len()]),
+                hash(&previous),
+                "demotion must not rewrite the served prefix: {:?}",
+                served
+                    .iter()
+                    .zip(&previous)
+                    .enumerate()
+                    .filter(|(_, (new, old))| new != old)
+                    .collect::<Vec<_>>()
+            );
+            let target = served
+                .iter()
+                .find(|message| message["info"]["id"] == "thinking")
+                .unwrap();
+            assert_eq!(target["parts"][0], thinking);
+            assert!(!store
+                .load("ses")
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:merged_reasoning:thinking"));
+            previous = served.clone();
+        }
+        let mut priced_request = make_request(&native, "claude-fable-5-1");
+        priced_request["render_config"] = json!("independent-priced-config-change");
+        let priced = call_transform_request(&handler, priced_request).await;
+        assert_eq!(priced["action"], "HARD");
+        let target = priced["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["info"]["id"] == "thinking")
+            .unwrap();
+        assert!(target["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|part| part["type"] != "reasoning"));
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:merged_reasoning:thinking"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn native_attachment_reuses_transform_tag_baseline_and_preserves_bytes() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -23136,19 +23395,20 @@ mod tests {
                 ),
             },
         ];
-        let mut snapshots = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex");
-        let generation = snapshots.begin("ses");
-        snapshots.finish_ready(
-            "ses",
-            generation,
-            Arc::new(transform_request(raw_messages, 45_000, 50_000)),
-            0,
-            0,
-        );
-        drop(snapshots);
+        {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let generation = snapshots.begin("ses");
+            snapshots.finish_ready(
+                "ses",
+                generation,
+                Arc::new(transform_request(raw_messages, 45_000, 50_000)),
+                0,
+                0,
+            );
+        }
 
         let verbose = tool_text(
             call_facade(
@@ -26265,6 +26525,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn defer_keeps_frozen_prefix_divergence_unacknowledged_across_restart_passes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
+        let request_body = request(vec![ck("m1", 1, "hello")]);
+        let initial = call_transform_request(&handler, request_body.clone()).await;
+        assert_eq!(initial["status"], "ok", "{initial}");
+
+        let mut loaded = store.load("ses").unwrap();
+        let served_fingerprint_before_restart = loaded.meta.served_output_fingerprint.clone();
+        let m1 = loaded
+            .core
+            .frozen_units
+            .iter_mut()
+            .find(|unit| unit.key == "m1")
+            .expect("initial render stores m1");
+        m1.frozen_payload.push_str("\nrestart-only drift");
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let restarted = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory {
+                state: Arc::new(ProducerState::default()),
+            }),
+            default_test_config(),
+            Arc::new(MissingSessionResolver),
+        );
+        restarted.store.set(Arc::clone(&store)).ok().unwrap();
+        restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+
+        let first_after_restart = call_transform_request(&restarted, request_body.clone()).await;
+        assert_eq!(
+            store.load("ses").unwrap().meta.served_output_fingerprint,
+            served_fingerprint_before_restart,
+            "the first divergent SOFT+ restart pass must retain the byte-identical served fingerprint"
+        );
+        let second_after_restart = call_transform_request(&restarted, request_body).await;
+
+        for response in [&first_after_restart, &second_after_restart] {
+            assert_eq!(response["decision"], "SOFT+", "{response}");
+            assert!(response["materialize_reason"].is_null(), "{response}");
+            assert_eq!(
+                response["first_divergence"]["block_id_old"], "mc_m1#0",
+                "{response}"
+            );
+            assert_eq!(
+                response["first_divergence"]["kind"], "content_changed",
+                "{response}"
+            );
+        }
+        assert_eq!(
+            store.load("ses").unwrap().meta.served_output_fingerprint,
+            served_fingerprint_before_restart,
+            "both divergent SOFT+ restart passes must retain the byte-identical served fingerprint"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn status_distinguishes_current_and_historical_divergence() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -26966,13 +27284,11 @@ mod tests {
     /// must refuse at the bootstrap fold: the minted boundary has to name a real
     /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
     /// depend on (a synthetic-anchor seed can never compose, regardless of ranges).
-
     /// Desk rehearsal of the drive's final seed shape: 20 live messages with a
     /// role=system message mid-span at ordinal 1, four imported compartments
     /// partitioning 0..=16 on real live block ids, live tail 17..=19. Must
     /// bootstrap-HARD-fold with the last covered block as the minted boundary —
     /// and the mid-span system ordinal must be absorbed, not rejected.
-
     /// Desk rehearsal of the round-3 drive seed: 18 live messages (system at
     /// ordinal 1 mid-span), four imported compartments partitioning 0..=14 on
     /// real live block ids, tail 15..=17. Must bootstrap-HARD-fold with
@@ -29898,6 +30214,36 @@ mod tests {
 
         assert!(response["action"].is_string());
         assert!(m0_text(&response).contains("autonomous summary"));
+        wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_stuck_historian_is_bounded_and_next_transform_succeeds() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        *handler
+            .transform_historian_followup_budget
+            .lock()
+            .expect("transform historian follow-up budget mutex") = Some(Duration::from_secs(1));
+        let messages = big_messages();
+
+        let started_at = Instant::now();
+        let first = call_transform_with_usage(&handler, messages.clone(), 48_000, 50_000).await;
+        assert!(first["action"].is_string());
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+        assert!(started_at.elapsed() >= Duration::from_secs(1));
+        assert!(started_at.elapsed() < Duration::from_secs(5));
+
+        let retry_started_at = Instant::now();
+        let retry = call_transform_with_usage(&handler, messages, 48_000, 50_000).await;
+        assert!(retry["action"].is_string());
+        assert!(retry_started_at.elapsed() < Duration::from_secs(5));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
         wait_for_idle(&store).await;
     }
 

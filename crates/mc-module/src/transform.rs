@@ -1473,6 +1473,9 @@ pub struct NativeMessagesDelta {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransformResponse {
+    /// Native vectors protected while newest remain unchanged until the next priced pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_reasoning_keep_mids: Vec<String>,
     pub status: TransformStatus,
     pub served_from: ServedFrom,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1569,6 +1572,7 @@ impl TransformResponse {
 
     pub fn need_full_sync(full_array_fingerprint: Option<String>) -> Self {
         Self {
+            native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::NeedFullSync,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
@@ -1606,6 +1610,7 @@ impl TransformResponse {
         full_array_fingerprint: Option<String>,
     ) -> Self {
         Self {
+            native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
@@ -1826,7 +1831,6 @@ impl PendingOverlayDecisions {
 
 struct Channel1NudgeInputs<'a, 'ctx> {
     ctx: &'a ProducerContext<'ctx>,
-    usable_window_tokens: i64,
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
@@ -3095,6 +3099,15 @@ fn apply_additive_only(
         mutation_exempt_mid: None,
         lineage_anchor_mid: None,
         response: TransformResponse {
+            native_reasoning_keep_mids: core
+                .frozen_units
+                .iter()
+                .filter_map(|unit| {
+                    unit.key
+                        .strip_prefix("strip:native_reasoning_keep:")
+                        .map(str::to_owned)
+                })
+                .collect(),
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
@@ -5307,10 +5320,6 @@ fn apply_once(
         if let Some(row) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 ctx,
-                usable_window_tokens: effective_nudge_window_tokens(
-                    req.geometry.as_ref(),
-                    context_limit_tokens,
-                ),
                 core: &core,
                 projection: &projection,
                 tag_rows: &hygiene_tag_rows,
@@ -5352,6 +5361,26 @@ fn apply_once(
         no_trim_meta = Some(output_meta);
     }
     let output_meta = no_trim_meta.as_ref().unwrap_or(&meta);
+    // OpenCode must replay the newest signed assistant's complete native vector. Its
+    // demotion is not permission to apply previously withheld overlays on a defer.
+    // Release these keeps only when the prefix is already being repriced.
+    if is_provider_prefix_mutation_pass {
+        core.frozen_units
+            .retain(|unit| !unit.key.starts_with("strip:native_reasoning_keep:"));
+    }
+    if serializer_profile == Some(SerializerProfile::OpencodeAiSdk) && req.serve_native {
+        if let Some(mid) = latest_assistant_reasoning_mutation_exempt_mid(&req.messages) {
+            if req.messages.iter().any(|message| {
+                message.mid == mid && message.ck.content.iter().any(is_reasoning_block)
+            }) {
+                let key = format!("strip:native_reasoning_keep:{mid}");
+                if !core.frozen_units.iter().any(|unit| unit.key == key) {
+                    core.frozen_units
+                        .push(strip_unit("native_reasoning_keep", mid, ""));
+                }
+            }
+        }
+    }
     let output_cache_snapshot = output_cache.map(|cache| {
         cache
             .lock()
@@ -5527,7 +5556,23 @@ fn apply_once(
     let first_divergence_json = first_divergence
         .as_ref()
         .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
-    meta.served_output_fingerprint = served_fingerprints;
+    let deferred_frozen_prefix_divergence = matches!(plan, PassPlan::Defer)
+        && first_divergence.as_ref().is_some_and(|divergence| {
+            matches!(
+                divergence.block_id_old.as_deref(),
+                Some("mc_m0#0" | "mc_m1#0")
+            ) || matches!(
+                divergence.block_id_new.as_deref(),
+                Some("mc_m0#0" | "mc_m1#0")
+            )
+        });
+    // A deferred pass cannot accept changes to the stable m0/m1 prefix. Keep the fingerprint
+    // from the last served response so retries continue to report the mismatch; only an explicit
+    // cache-invalidating pass may adopt the new prefix. The host can replay its persisted
+    // last-known-good representation while the mismatch remains.
+    if !deferred_frozen_prefix_divergence {
+        meta.served_output_fingerprint = served_fingerprints;
+    }
 
     let channel2_output = channel2_directives(
         serializer_profile,
@@ -5536,10 +5581,6 @@ fn apply_once(
         &req.channel2_nudge_state,
         ctx.now_ms,
         Channel2DirectiveInput {
-            usable_window_tokens: effective_nudge_window_tokens(
-                req.geometry.as_ref(),
-                context_limit_tokens,
-            ),
             core: &core,
             projection: &projection,
             tag_rows: &hygiene_tag_rows,
@@ -5685,6 +5726,15 @@ fn apply_once(
         mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
         lineage_anchor_mid: lineage_anchor_mid.map(str::to_string),
         response: TransformResponse {
+            native_reasoning_keep_mids: core
+                .frozen_units
+                .iter()
+                .filter_map(|unit| {
+                    unit.key
+                        .strip_prefix("strip:native_reasoning_keep:")
+                        .map(str::to_owned)
+                })
+                .collect(),
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
@@ -5962,20 +6012,6 @@ fn effective_context_limit_tokens(
     200_000.0
 }
 
-fn effective_nudge_window_tokens(
-    geometry: Option<&TransformGeometry>,
-    scheduler_context_limit_tokens: f64,
-) -> i64 {
-    // Keep the usage-reported context limit for scheduler calculations. Reminder text describes
-    // context available after host reserves, so prefer the host's `usable_soft` geometry.
-    geometry
-        .filter(|geometry| geometry.usable_soft >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT)
-        .map_or(scheduler_context_limit_tokens, |geometry| {
-            geometry.usable_soft as f64
-        })
-        .round() as i64
-}
-
 fn effective_hard_context_limit_tokens(
     geometry: Option<&TransformGeometry>,
     soft_context_limit_tokens: f64,
@@ -6031,10 +6067,94 @@ fn render_config_base(render_config: &str) -> &str {
         .unwrap_or(render_config)
 }
 
+/// Provider-cache facts for model identities whose effort can change without invalidating
+/// cached prompt bytes: Fable 5.1 was observed on 2026-09-02 and GPT-6 Astra on 2026-09-05.
+const VARIANT_CACHE_PRESERVING_MODELS: [(&str, &str); 2] = [
+    ("anthropic/claude-fable-5-1", "2026-09-02"),
+    ("openai/gpt-6-astra", "2026-09-05"),
+];
+
+fn canonical_variant_model_identity(
+    provider_id: Option<&str>,
+    model_key: Option<&str>,
+) -> Option<String> {
+    let (provider, model) = match model_key.and_then(|key| key.split_once('/')) {
+        Some(pair) => pair,
+        None => (provider_id?, model_key?),
+    };
+    let provider = provider.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    let anthropic_family = provider == "anthropic"
+        || provider == "google-vertex-anthropic"
+        || provider.contains("bedrock");
+    static FABLE_51: OnceLock<Regex> = OnceLock::new();
+    if anthropic_family
+        && FABLE_51
+            .get_or_init(|| Regex::new(r"(?:^|[-_.])fable[-_.]?5[-_.]1(?:$|[-_.])").unwrap())
+            .is_match(&model)
+    {
+        return Some("anthropic/claude-fable-5-1".to_string());
+    }
+    if model == "gpt-6-astra"
+        && matches!(
+            provider.as_str(),
+            "openai" | "openai-codex" | "github-copilot"
+        )
+    {
+        return Some("openai/gpt-6-astra".to_string());
+    }
+    let provider = match provider.as_str() {
+        "openai-codex" => "openai",
+        "google-antigravity" => "google",
+        "opencode-zen" => "opencode",
+        other => other,
+    };
+    Some(format!("{provider}/{model}"))
+}
+
+fn variant_change_busts_provider_cache(provider_id: Option<&str>, model_key: Option<&str>) -> bool {
+    let Some(identity) = canonical_variant_model_identity(provider_id, model_key) else {
+        return false;
+    };
+    if VARIANT_CACHE_PRESERVING_MODELS
+        .iter()
+        .any(|(model, _verified_at)| *model == identity)
+    {
+        return false;
+    }
+    let provider = identity
+        .split_once('/')
+        .map(|(provider, _)| provider)
+        .unwrap_or("");
+    provider == "anthropic" || provider == "google-vertex-anthropic" || provider.contains("bedrock")
+}
+
+/// Keep the host's effort observation only when it represents a natural provider bust.
+/// Removing it here prevents a cache-preserving flip from changing the durable render identity.
+fn cache_relevant_render_config<'a>(req: &'a TransformRequest) -> Cow<'a, str> {
+    if req.render_config.is_empty()
+        || variant_change_busts_provider_cache(req.provider_id.as_deref(), req.model_key.as_deref())
+        || !req
+            .render_config
+            .split('|')
+            .any(|part| part.starts_with("variant:"))
+    {
+        return Cow::Borrowed(&req.render_config);
+    }
+    Cow::Owned(
+        req.render_config
+            .split('|')
+            .filter(|part| !part.starts_with("variant:"))
+            .collect::<Vec<_>>()
+            .join("|"),
+    )
+}
+
 fn render_identity_base(req: &TransformRequest, prompt_surface_epoch: &str) -> String {
     let mut parts = Vec::new();
-    if !req.render_config.is_empty() {
-        parts.push(req.render_config.clone());
+    let render_config = cache_relevant_render_config(req);
+    if !render_config.is_empty() {
+        parts.push(render_config.into_owned());
     }
     if let Some(provider) = req.provider_id.as_deref().filter(|value| !value.is_empty()) {
         parts.push(format!("provider:{provider}"));
@@ -9675,7 +9795,6 @@ fn active_tags_for_channel2(
 
 #[derive(Clone, Copy)]
 struct Channel2DirectiveInput<'a> {
-    usable_window_tokens: i64,
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
@@ -10294,6 +10413,9 @@ mod nudge_formula_tests {
         ))
         .expect("parse ctx_reduce nudge copy golden");
         assert_eq!(golden.schema, 1);
+        let approximate_tokens = Regex::new(r"~\d+(?:\.\d+)?k\b").unwrap();
+        let percentage = Regex::new(r"\b\d+(?:\.\d+)?\s*%").unwrap();
+        let window = Regex::new(r"(?i)\bwindow\b").unwrap();
 
         for reminder in golden.cases {
             let hint = reminder
@@ -10329,23 +10451,18 @@ mod nudge_formula_tests {
                 reminder.id
             );
             assert_eq!(
-                Regex::new(r"~\d+(?:\.\d+)?k\b")
-                    .unwrap()
-                    .find_iter(&rendered)
-                    .count(),
+                approximate_tokens.find_iter(&rendered).count(),
                 1,
                 "{} exposed more than the reclaimable token mass",
                 reminder.id
             );
             assert!(
-                !Regex::new(r"\b\d+(?:\.\d+)?\s*%")
-                    .unwrap()
-                    .is_match(&rendered),
+                !percentage.is_match(&rendered),
                 "{} exposed a percentage",
                 reminder.id
             );
             assert!(
-                !Regex::new(r"(?i)\bwindow\b").unwrap().is_match(&rendered),
+                !window.is_match(&rendered),
                 "{} exposed context capacity",
                 reminder.id
             );
@@ -10454,7 +10571,6 @@ mod nudge_formula_tests {
             None,
             10 + CHANNEL2_DIRECTIVE_LEASE_TTL_MS,
             Channel2DirectiveInput {
-                usable_window_tokens: 128_000,
                 core: &core,
                 projection: &projection,
                 tag_rows: &tags,
@@ -10475,7 +10591,6 @@ mod nudge_formula_tests {
             Some(&delivered_id),
             20,
             Channel2DirectiveInput {
-                usable_window_tokens: 128_000,
                 core: &core,
                 projection: &projection,
                 tag_rows: &tags,
@@ -12501,14 +12616,14 @@ fn heal_poisoned_trailing_blank_decisions(
         .collect::<HashSet<_>>();
     let mut healed_ids = source_decisions
         .iter()
-        .filter_map(|(mid, (decision, _))| {
-            (*decision == FrozenTrailingBlankDecision::Strip
+        .filter(|&(mid, (decision, _))| {
+            *decision == FrozenTrailingBlankDecision::Strip
                 && newest_assistant_mid != Some(mid.as_str())
                 && visible_assistant_ids.contains(mid.as_str())
                 && frozen_trailing_blank_decision(core, mid)
-                    == Some(FrozenTrailingBlankDecision::Keep))
-            .then(|| mid.clone())
+                    == Some(FrozenTrailingBlankDecision::Keep)
         })
+        .map(|(mid, _)| mid.clone())
         .collect::<Vec<_>>();
     healed_ids.sort();
     if healed_ids.is_empty() {
@@ -14101,30 +14216,6 @@ pub(crate) mod tests {
             effective_context_limit_tokens(&ModuleUsage::default(), Some(&implausible)),
             200_000.0
         );
-    }
-
-    #[test]
-    fn nudge_display_denominator_prefers_geometry_usable_soft() {
-        let geometry = TransformGeometry {
-            usable_soft: 872_000,
-            usable_hard: 1_000_000,
-            derivation: "models.dev/1000000; usableSoft=872000".to_string(),
-        };
-        let scheduler_denominator = effective_context_limit_tokens(
-            &ModuleUsage {
-                current_total_input_tokens: 600_000,
-                context_limit_tokens: 1_000_000,
-                ..ModuleUsage::default()
-            },
-            Some(&geometry),
-        );
-
-        assert_eq!(scheduler_denominator, 1_000_000.0);
-        assert_eq!(
-            effective_nudge_window_tokens(Some(&geometry), scheduler_denominator),
-            872_000
-        );
-        assert_eq!(effective_nudge_window_tokens(None, 128_000.0), 128_000);
     }
 
     #[test]
@@ -16845,6 +16936,59 @@ pub(crate) mod tests {
                 input.mid
             );
         }
+    }
+
+    #[test]
+    fn variant_cache_predicate_canonicalizes_astra_aliases_and_preserves_defaults() {
+        for model_key in [
+            "openai/gpt-6-astra",
+            "openai-codex/gpt-6-astra",
+            "github-copilot/gpt-6-astra",
+        ] {
+            assert!(!variant_change_busts_provider_cache(None, Some(model_key)));
+        }
+        assert!(!variant_change_busts_provider_cache(
+            Some("anthropic"),
+            Some("anthropic/claude-fable-5-1")
+        ));
+        assert!(!variant_change_busts_provider_cache(
+            Some("bedrock"),
+            Some("bedrock/anthropic.claude-fable-5-1-v1:0")
+        ));
+        assert!(variant_change_busts_provider_cache(
+            Some("anthropic"),
+            Some("anthropic/claude-opus-4-1")
+        ));
+        assert!(!variant_change_busts_provider_cache(
+            Some("openai"),
+            Some("openai/gpt-5.6-sol")
+        ));
+        assert!(!variant_change_busts_provider_cache(None, None));
+    }
+
+    #[test]
+    fn astra_variant_flip_next_defer_keeps_served_array_sha256_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = req(
+            "astra-variant",
+            "provider:openai|model:openai/gpt-6-astra|variant:xhigh",
+            vec![item("a", 1, "keep me")],
+        );
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.provider_id = Some("openai".to_string());
+        request.model_key = Some("openai/gpt-6-astra".to_string());
+        run(&s, &request, &spine());
+        let before = run(&s, &request, &spine());
+        assert_eq!(before.scheduler_decision.as_deref(), Some("defer"));
+        let before_hash = canonical_response_hash(&before);
+        s.append_pending_agent_drops("astra-variant", &["a#0".to_string()], 1)
+            .unwrap();
+
+        request.render_config = "provider:openai|model:openai/gpt-6-astra|variant:high".to_string();
+        let after = run(&s, &request, &spine());
+        assert_eq!(after.scheduler_decision.as_deref(), Some("defer"));
+        assert_eq!(canonical_response_hash(&after), before_hash);
     }
 
     #[test]
@@ -22806,7 +22950,7 @@ pub(crate) mod tests {
                 }
             ]
         });
-        let decoded = crate::codec::decode_opencode(&[native_tool_message.clone()]);
+        let decoded = crate::codec::decode_opencode(std::slice::from_ref(&native_tool_message));
         let mut tool_message = decoded.messages[0].clone();
         // The live CK ingress is projected by the host independently of the native sidecar, so it
         // does not carry the Rust decoder's private block-origin stamps.
@@ -31825,11 +31969,13 @@ pub(crate) mod tests {
             },
             &SelectionConfig::default(),
         );
-        let mut core = CoreState::default();
-        core.frozen_units = decisions
-            .iter()
-            .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
-            .collect();
+        let core = CoreState {
+            frozen_units: decisions
+                .iter()
+                .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
+                .collect(),
+            ..CoreState::default()
+        };
         let served = build_output(
             &core,
             &ModuleMeta::default(),
@@ -31972,11 +32118,13 @@ pub(crate) mod tests {
             reasoning_adjacency_fixture(true, true, true),
         );
         let projection = project_messages(&request.messages).unwrap();
-        let mut core = CoreState::default();
-        core.frozen_units = vec![
-            red_unit("reasoning-adjacency-left#2", "drop", "[dropped]"),
-            red_unit("reasoning-adjacency-result#0", "drop", "[dropped]"),
-        ];
+        let core = CoreState {
+            frozen_units: vec![
+                red_unit("reasoning-adjacency-left#2", "drop", "[dropped]"),
+                red_unit("reasoning-adjacency-result#0", "drop", "[dropped]"),
+            ],
+            ..CoreState::default()
+        };
         let meta = ModuleMeta::default();
         let first = build_output_with_tags(
             &core,

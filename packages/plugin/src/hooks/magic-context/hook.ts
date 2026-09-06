@@ -8,6 +8,7 @@ import {
     DEFAULT_HISTORIAN_TIMEOUT_MS,
     type DreamerConfig,
     type HistorianConfig,
+    type MagicContextConfig,
     type SidekickConfig,
 } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
@@ -65,6 +66,7 @@ import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embed
 import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
+import type { ConfigParseFailure } from "../../shared/config-diagnostics";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import { resolveHistorianModel } from "../../shared/model-resolution";
@@ -74,7 +76,11 @@ import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications
 import type { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
-import { deriveHistorianChunkTokens, resolveHistorianContextLimit } from "./derive-budgets";
+import {
+    deriveHistorianChunkTokens,
+    resolveHistorianContextLimit,
+    resolveKnownHistorianContextLimit,
+} from "./derive-budgets";
 import {
     autoEmbedAttemptedBySession,
     clearEmbedSessionState,
@@ -144,7 +150,9 @@ export interface MagicContextDeps {
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
-        cache_ttl: string | Record<string, string>;
+        cache_ttl: MagicContextConfig["cache_ttl"];
+        cacheTtlConfigured?: boolean;
+        configParseFailures?: ConfigParseFailure[];
         prompt_surface?: PromptSurfaceConfig;
 
         historian?: HistorianConfig;
@@ -370,6 +378,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             resolveHistorianContextLimit(resolveHistorianAttempts().primary?.model),
         );
     const historianModel = resolveHistorianAttempts().primary;
+    const historianContextLimit = resolveKnownHistorianContextLimit(historianModel?.model);
+    const historianMaxOutputTokens = deps.config.historian?.maxTokens ?? 32_000;
     const historianFallbackModels = resolveHistorianAttempts().fallbacks;
 
     // Three independent cache-busting signal sets, sourced from the
@@ -523,6 +533,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         memoryEnabled: deps.config.memory?.enabled ?? true,
         autoPromote: deps.config.memory?.auto_promote ?? true,
         historianModel,
+        historianContextLimit,
+        historianMaxOutputTokens,
         fallbackModels: historianFallbackModels,
         language: deps.config.language,
         fallbackModelId: (() => {
@@ -1122,6 +1134,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deferredHistoryRefreshSessions,
         pendingMaterializationSessions,
         deferredMaterializationSessions,
+        variantBySession,
         lastHeuristicsTurnId,
         commitSeenLastPass,
         internalChildSessions,
@@ -1145,6 +1158,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeThresholdTokens: deps.config.execute_threshold_tokens,
         historianTimeoutMs: deps.config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
         historianModel,
+        historianContextLimit,
+        historianMaxOutputTokens,
         fallbackModels: historianFallbackModels,
         getNotificationParams: (sessionId) =>
             getLiveNotificationParams(
@@ -1349,6 +1364,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         rustModeModuleClient,
         projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
+        cacheTtlConfig: deps.config.cache_ttl,
+        cacheTtlConfigured: deps.config.cacheTtlConfigured === true,
+        configParseFailures: deps.config.configParseFailures ?? [],
         getLiveModelKey: (sessionId) => {
             // Use DB fallback so /ctx-status shows the correct model-specific
             // threshold even before the first transform pass has populated
@@ -1556,6 +1574,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
             commandHandler,
+            cacheTtlConfig: deps.config.cache_ttl,
             // E5 — only offer the upgrade reminder when historian can run (so
             // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable

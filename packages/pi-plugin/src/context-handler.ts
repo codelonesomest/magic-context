@@ -159,7 +159,10 @@ import {
 	setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { invalidateTrueRawTokenCache } from "@magic-context/core/hooks/magic-context/read-session-true-raw-tokens";
-import { modelAcceptsEmptyContent } from "@magic-context/core/hooks/magic-context/sentinel";
+import {
+	modelAcceptsEmptyContent,
+	variantChangeBustsProviderCache,
+} from "@magic-context/core/hooks/magic-context/sentinel";
 import {
 	buildEditSupersessionReclaim,
 	buildSupersessionReclaimOps,
@@ -190,6 +193,7 @@ import { sendCtxStatusMessage } from "./commands/pi-command-utils";
 import {
 	type ApplyDeferredPiCompactionMarkerDeps,
 	applyDeferredPiCompactionMarker,
+	resolvePiAppendCompaction,
 } from "./compaction-marker-manager-pi";
 import {
 	commitPiCompactionModeRecord,
@@ -223,7 +227,7 @@ import {
 	resolvePiUsableContextLimit,
 	resolvePiWindowGeometry,
 } from "./pi-context-limit";
-import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
+import { runPiHistorian } from "./pi-historian-runner";
 import {
 	clearPiLkgSessionState,
 	createPiLkgCoordinator,
@@ -306,6 +310,7 @@ let mutationGateObserverForTests:
 	  }) => void)
 	| undefined;
 let lkgRecoveryLogObserverForTests: ((message: string) => void) | undefined;
+let variantChangeLogObserverForTests: ((message: string) => void) | undefined;
 
 function logPiLkgRecovery(sessionId: string, message: string): void {
 	lkgRecoveryLogObserverForTests?.(message);
@@ -378,6 +383,21 @@ export const __test = {
 		mutationGateObserverForTests = fn;
 		return () => {
 			mutationGateObserverForTests = undefined;
+		};
+	},
+	variantRefreshStateForTests(sessionId: string) {
+		return {
+			history: historyRefreshSessions.has(sessionId),
+			systemPrompt: systemPromptRefreshSessions.has(sessionId),
+			materialization: pendingMaterializationSessions.has(sessionId),
+		};
+	},
+	setVariantChangeLogObserverForTests(
+		fn: typeof variantChangeLogObserverForTests,
+	): () => void {
+		variantChangeLogObserverForTests = fn;
+		return () => {
+			variantChangeLogObserverForTests = undefined;
 		};
 	},
 	setLkgRecoveryLogObserverForTests(
@@ -639,6 +659,13 @@ function logTransformTiming(
 		sessionId,
 		`transform stage: stage=${stage} elapsed=${elapsed}ms${suffix}`,
 	);
+}
+
+export function piVariantChangeBustsProviderCache(
+	providerID?: string,
+	modelID?: string,
+): boolean {
+	return variantChangeBustsProviderCache(providerID, modelID);
 }
 
 function resolvePiContextModelKey(ctx: ExtensionContext): string | undefined {
@@ -957,8 +984,10 @@ export interface PiHistorianOptions {
 	model: string;
 	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
 	fallbackModels?: readonly ModelInput[];
-	/** Historian context window — used to derive chunk token budget. */
+	/** Historian chunk budget derived from its context window. */
 	historianChunkTokens: number;
+	/** Known context limit for the resolved historian model. */
+	historianContextLimit?: number;
 	/** Optional per-call timeout (default 600s). */
 	timeoutMs?: number;
 	/** Provider sampling temperature; when omitted, uses the temperature configured for historian runs. */
@@ -2123,6 +2152,28 @@ export function registerPiContextHandler(
 		return s;
 	};
 
+	pi.on("thinking_level_select", async (event, ctx) => {
+		if (event.previousLevel === event.level) return;
+		const sessionId = resolveSessionId(ctx);
+		if (!sessionId) return;
+		const providerID = ctx.model?.provider;
+		const modelID = ctx.model?.id;
+		if (piVariantChangeBustsProviderCache(providerID, modelID)) {
+			sessionLog(
+				sessionId,
+				`variant changed (${event.previousLevel} -> ${event.level}), triggering flush`,
+			);
+			historyRefreshSessions.add(sessionId);
+			systemPromptRefreshSessions.add(sessionId);
+			pendingMaterializationSessions.add(sessionId);
+			lastHeuristicsTurnIdBySession.delete(sessionId);
+			return;
+		}
+		const message = `variant changed (${event.previousLevel} -> ${event.level}) on ${providerID ?? "unknown"}/${modelID ?? "unknown"} without a proven natural cache bust; deferring flush to next natural bust`;
+		variantChangeLogObserverForTests?.(message);
+		sessionLog(sessionId, message);
+	});
+
 	pi.on("context", async (event, ctx) => {
 		const transformStartTime = performance.now();
 		let rawMessageCount = 0;
@@ -2787,8 +2838,7 @@ export function registerPiContextHandler(
 				`[boundary-exec] base=${schedulerDecisionEarly} bypass=${bypassReason} midTurn=${midTurn} effective=${midTurnAdjustedSchedulerDecision} sideEffect=${sideEffect}`,
 			);
 
-			// At the derived force band, enable aggressive drop-all-tools mode.
-			// Mirrors OpenCode transform-postprocess-phase.ts:145-146.
+			// At the derived force band, evaluate tiered target-headroom reclaim.
 			const forceMaterialization =
 				!options.compactionOff &&
 				usagePercentage >= forceMaterializationPercentage;
@@ -2802,25 +2852,10 @@ export function registerPiContextHandler(
 				clearEmergencyDropSample(options.db, sessionId);
 			}
 
-			// 95% emergency block: usage is dangerous enough that we
-			// MUST wait for any in-flight historian to finish so its
-			// queued drops can materialize on this pass, AND we apply
-			// drop-all-tools cleanup to shrink the prompt as much as
-			// possible before the LLM call. Mirrors OpenCode's >=95%
-			// emergency path in transform.ts (~line 514+).
-			//
-			// Pi differences vs OpenCode:
-			//   - We can't `client.session.abort()` mid-pass (Pi
-			//     doesn't expose that surface to extensions). The next
-			//     best is to await the in-flight historian here so the
-			//     LLM call still happens, but with a freshly-shrunk
-			//     prompt. If no historian is in flight we still apply
-			//     dropAllTools via forceMaterialization so the prompt
-			//     shrinks regardless.
-			//   - We cap the wait at 30s to avoid stalling the user's
-			//     turn forever if historian hangs. After 30s we fall
-			//     through to the normal pipeline (with drop-all-tools
-			//     still active via the derived force-band branch).
+			// At 95%, wait up to 30s for an in-flight historian, then evaluate
+			// tiered reclaim with only open arcs and ctx_reduce exemplars protected.
+			// The wait does not abort the child: its own runner timeout still bounds
+			// execution, and a late publication can materialize on the next pass.
 			const hardUsagePercentage = needsEmergencyBump
 				? Math.max(EMERGENCY_BLOCK_PERCENTAGE, usagePercentage)
 				: windowGeometry?.usableHard && usageInputTokens > 0
@@ -2846,7 +2881,7 @@ export function registerPiContextHandler(
 					);
 					sessionLog(
 						sessionId,
-						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — notified user, awaiting in-flight historian + applying drop-all-tools`,
+						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — notified user, awaiting in-flight historian + evaluating tiered emergency reclaim`,
 					);
 				}
 
@@ -3855,6 +3890,7 @@ function spawnPiHistorianRun(args: {
 				fallbackModels: historian.fallbackModels,
 				fallbackModelId,
 				historianChunkTokens: historian.historianChunkTokens,
+				historianContextLimit: historian.historianContextLimit,
 				boundarySnapshot,
 				refreshBoundarySnapshot,
 				currentContextLimit,
@@ -3951,24 +3987,6 @@ function spawnPiHistorianRun(args: {
 		});
 	inFlightHistorian.set(sessionId, runPromise);
 	historian.onStatusChange?.(ctx, sessionId);
-}
-
-function resolvePiAppendCompaction(
-	ctx: ExtensionContext,
-): PiHistorianDeps["appendCompaction"] {
-	const sm = ctx.sessionManager as
-		| {
-				appendCompaction?: (
-					summary: string,
-					firstKeptEntryId: string,
-					tokensBefore: number,
-					details?: unknown,
-					fromHook?: boolean,
-				) => string | undefined;
-		  }
-		| undefined;
-	if (typeof sm?.appendCompaction !== "function") return undefined;
-	return sm.appendCompaction.bind(sm);
 }
 
 function resolvePiReadBranchEntries(
@@ -4436,9 +4454,8 @@ interface RunPipelineArgs {
 	/** The defer reason is computed once when the scheduler decision is made; preserve it so refusal logs report the actual reason instead of recomputing it. */
 	schedulerDeferReason: SchedulerDeferReason | null;
 	/**
-	 * Force-materialization signal: when true, drop-all-tools mode
-	 * activates (mirrors OpenCode's derived force-band emergency cleanup). Caller
-	 * computes from current usage percentage.
+	 * Enables tiered emergency selection when usage reaches the derived force band.
+	 * The pressure-episode latch still prevents repeated originating batches.
 	 */
 	forceMaterialization?: boolean;
 	/** Resolved escalation band for this pass (defaults to 85 for test/direct callers). */
@@ -5394,6 +5411,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 							? {
 									currentTotalInputTokens: args.contextUsage.inputTokens,
 									ceilingTokens: args.emergencyCeilingTokens,
+									usagePercentage: args.contextUsage.percentage,
 								}
 							: undefined,
 					caveman: args.isSubagent ? undefined : args.heuristics.caveman,

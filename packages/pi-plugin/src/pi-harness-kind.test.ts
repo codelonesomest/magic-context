@@ -1,35 +1,100 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 import {
 	__setPiHarnessKindForTesting,
+	resolvePiHarnessDetection,
 	resolvePiHarnessKind,
 } from "./pi-harness-kind";
 
 const originalArgv1 = process.argv[1];
 const originalPackageDir = process.env.PI_PACKAGE_DIR;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalProcessTitle = process.title;
 const temporaryRoots: string[] = [];
 
-function fakeHost(appName?: string): string {
+interface BunGlobalHost {
+	launcher: string;
+	hostEntry: string;
+}
+
+function temporaryRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "mc-pi-harness-kind-"));
 	temporaryRoots.push(root);
+	return root;
+}
+
+function writeJson(path: string, value: unknown): void {
+	writeFileSync(path, `${JSON.stringify(value)}\n`);
+}
+
+function packageHost(packageName?: string): string {
+	const root = temporaryRoot();
 	const hostEntry = join(root, "host.js");
 	writeFileSync(hostEntry, "// fake host entry\n");
-	if (appName !== undefined) {
-		const moduleRoot = join(root, "node_modules", "@oh-my-pi", "pi-utils");
-		mkdirSync(moduleRoot, { recursive: true });
-		writeFileSync(
-			join(moduleRoot, "package.json"),
-			JSON.stringify({ name: "@oh-my-pi/pi-utils", main: "index.cjs" }),
-		);
-		writeFileSync(
-			join(moduleRoot, "index.cjs"),
-			`exports.APP_NAME = ${JSON.stringify(appName)};\n`,
-		);
+	if (packageName !== undefined) {
+		writeJson(join(root, "package.json"), { name: packageName });
 	}
+	return hostEntry;
+}
+
+function writeEsmOnlyOmpUtils(nodeModules: string): void {
+	const moduleRoot = join(nodeModules, "@oh-my-pi", "pi-utils");
+	mkdirSync(join(moduleRoot, "src"), { recursive: true });
+	writeJson(join(moduleRoot, "package.json"), {
+		name: "@oh-my-pi/pi-utils",
+		type: "module",
+		exports: {
+			".": {
+				types: "./src/index.ts",
+				import: "./src/index.ts",
+			},
+		},
+	});
+	writeFileSync(
+		join(moduleRoot, "src", "index.ts"),
+		'export const APP_NAME = "omp";\n',
+	);
+}
+
+function bunGlobalHost(): BunGlobalHost {
+	const root = temporaryRoot();
+	const nodeModules = join(root, "install", "global", "node_modules");
+	const hostRoot = join(nodeModules, "@oh-my-pi", "pi-coding-agent");
+	const hostEntry = join(hostRoot, "dist", "cli.js");
+	mkdirSync(dirname(hostEntry), { recursive: true });
+	writeJson(join(hostRoot, "package.json"), {
+		name: "@oh-my-pi/pi-coding-agent",
+		type: "module",
+	});
+	writeFileSync(hostEntry, "// fake OMP CLI entry\n");
+	writeEsmOnlyOmpUtils(nodeModules);
+
+	const binDirectory = join(root, "bin");
+	const launcher = join(binDirectory, "omp");
+	mkdirSync(binDirectory, { recursive: true });
+	symlinkSync(relative(binDirectory, hostEntry), launcher);
+	return { launcher, hostEntry };
+}
+
+function esmOnlyUtilsHost(): string {
+	const root = temporaryRoot();
+	const hostRoot = join(root, "custom-host");
+	const hostEntry = join(hostRoot, "entry.js");
+	mkdirSync(hostRoot, { recursive: true });
+	writeJson(join(hostRoot, "package.json"), { name: "custom-host" });
+	writeFileSync(hostEntry, "// custom host entry\n");
+	writeEsmOnlyOmpUtils(join(root, "node_modules"));
 	return hostEntry;
 }
 
@@ -37,6 +102,7 @@ beforeEach(() => {
 	__setPiHarnessKindForTesting(undefined);
 	delete process.env.PI_PACKAGE_DIR;
 	delete process.env.PI_CODING_AGENT_DIR;
+	process.title = "magic-context-test";
 });
 
 afterEach(() => {
@@ -45,6 +111,7 @@ afterEach(() => {
 	else process.env.PI_PACKAGE_DIR = originalPackageDir;
 	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+	process.title = originalProcessTitle;
 	if (originalArgv1 === undefined) process.argv.splice(1, 1);
 	else process.argv[1] = originalArgv1;
 	for (const root of temporaryRoots.splice(0)) {
@@ -52,65 +119,108 @@ afterEach(() => {
 	}
 });
 
-describe("resolvePiHarnessKind", () => {
-	it("detects OMP from APP_NAME resolved through the running host module graph", () => {
-		process.argv[1] = fakeHost("omp");
+describe("resolvePiHarnessDetection", () => {
+	it("uses the host process title exposed before extension loading", async () => {
+		process.title = "omp";
+		process.argv[1] = packageHost("@earendil-works/pi-coding-agent");
 
-		expect(resolvePiHarnessKind()).toBe("omp");
+		expect(await resolvePiHarnessDetection()).toEqual({
+			kind: "omp",
+			via: "process-title",
+		});
 	});
 
-	it("falls back to Pi when @oh-my-pi/pi-utils is absent", () => {
-		process.argv[1] = fakeHost();
+	it("detects bun-global OMP from launcher and broker-style host argv without CJS resolution", async () => {
+		const fixture = bunGlobalHost();
 
-		expect(resolvePiHarnessKind()).toBe("pi");
-	});
-
-	it("detects an OMP package override without host-resolvable utilities", () => {
-		process.argv[1] = fakeHost();
-		const packageRoot = join(process.argv[1], "..");
-		writeFileSync(
-			join(packageRoot, "package.json"),
-			JSON.stringify({
-				name: "@oh-my-pi/pi-coding-agent",
-			}),
+		expect(() =>
+			createRequire(fixture.launcher).resolve("@oh-my-pi/pi-utils"),
+		).toThrow();
+		expect(realpathSync(fixture.launcher)).toBe(
+			realpathSync(fixture.hostEntry),
 		);
-		process.env.PI_PACKAGE_DIR = packageRoot;
-		process.argv[1] = fakeHost();
+		expect(() =>
+			createRequire(fixture.hostEntry).resolve("@oh-my-pi/pi-utils"),
+		).toThrow();
 
-		expect(resolvePiHarnessKind()).toBe("omp");
+		for (const argv1 of [fixture.launcher, fixture.hostEntry]) {
+			__setPiHarnessKindForTesting(undefined);
+			process.argv[1] = argv1;
+			expect(await resolvePiHarnessDetection()).toEqual({
+				kind: "omp",
+				via: "package-name",
+			});
+		}
 	});
 
-	it("detects an OMP running package without host-resolvable utilities", () => {
-		process.argv[1] = fakeHost();
-		writeFileSync(
-			join(process.argv[1], "..", "package.json"),
-			JSON.stringify({
-				name: "@oh-my-pi/pi-coding-agent",
-			}),
+	it("honors a positively identified OMP package override in both detection lanes", async () => {
+		process.env.PI_PACKAGE_DIR = dirname(
+			packageHost("@oh-my-pi/pi-coding-agent"),
 		);
-
+		process.argv[1] = packageHost();
 		expect(resolvePiHarnessKind()).toBe("omp");
+		__setPiHarnessKindForTesting(undefined);
+		expect((await resolvePiHarnessDetection()).kind).toBe("omp");
 	});
 
-	it("does not identify plain Pi from an agent directory or Pi package override", () => {
-		process.argv[1] = fakeHost();
-		const packageRoot = join(process.argv[1], "..");
-		writeFileSync(
-			join(packageRoot, "package.json"),
-			JSON.stringify({
-				name: "@earendil-works/pi-coding-agent",
-			}),
+	it("does not infer OMP from an agent directory or a plain Pi package override", async () => {
+		process.env.PI_PACKAGE_DIR = dirname(
+			packageHost("@earendil-works/pi-coding-agent"),
 		);
-		process.env.PI_PACKAGE_DIR = packageRoot;
 		process.env.PI_CODING_AGENT_DIR = "/tmp/omp-agent";
-
+		process.argv[1] = packageHost();
 		expect(resolvePiHarnessKind()).toBe("pi");
+		expect((await resolvePiHarnessDetection()).kind).toBe("pi");
 	});
 
-	it("memoizes the detected harness for the process", () => {
-		process.argv[1] = fakeHost("omp");
-		expect(resolvePiHarnessKind()).toBe("omp");
-		process.argv[1] = fakeHost();
+	it("loads APP_NAME through an ESM-only export relative to the host entry", async () => {
+		process.argv[1] = esmOnlyUtilsHost();
+
+		expect(await resolvePiHarnessDetection()).toEqual({
+			kind: "omp",
+			via: "app-name",
+		});
+	});
+
+	it("recognizes current and legacy Pi host package names", async () => {
+		for (const packageName of [
+			"@earendil-works/pi-coding-agent",
+			"@mariozechner/pi-coding-agent",
+		]) {
+			__setPiHarnessKindForTesting(undefined);
+			process.argv[1] = packageHost(packageName);
+			expect(await resolvePiHarnessDetection()).toEqual({
+				kind: "pi",
+				via: "package-name",
+			});
+		}
+	});
+
+	it("uses the shared executable vocabulary as the last positive rung", async () => {
+		process.argv[1] = join(temporaryRoot(), "oh-my-pi");
+
+		expect(await resolvePiHarnessDetection()).toEqual({
+			kind: "omp",
+			via: "executable-name",
+		});
+	});
+
+	it("falls back to Pi when no OMP identity is available", async () => {
+		process.argv[1] = packageHost();
+
+		expect(await resolvePiHarnessDetection()).toEqual({
+			kind: "pi",
+			via: "default",
+		});
+	});
+
+	it("memoizes the detected harness for synchronous runtime consumers", async () => {
+		process.argv[1] = packageHost("@oh-my-pi/pi-coding-agent");
+		expect(await resolvePiHarnessDetection()).toEqual({
+			kind: "omp",
+			via: "package-name",
+		});
+		process.argv[1] = packageHost();
 
 		expect(resolvePiHarnessKind()).toBe("omp");
 	});

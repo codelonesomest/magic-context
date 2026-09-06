@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ import {
     getMagicContextStorageDir,
     getMagicContextStorageResolution,
 } from "@magic-context/core/shared/data-path";
+import { parseJsoncRecovering } from "@magic-context/core/shared/jsonc-parser";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
 import {
@@ -43,6 +44,7 @@ import {
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import { formatGithubIssueFallback, submitGithubIssue } from "../lib/github-issue";
+import { formatLogFileInspection, inspectMagicContextLogs } from "../lib/log-lines";
 import { bundleIssueReport } from "../lib/logs-opencode";
 import { migrateDreamerV2ForDoctor } from "../lib/migrate-dreamer-v2-doctor";
 import { migrateExperimentalPinKeyFilesForDoctor } from "../lib/migrate-experimental-doctor";
@@ -57,7 +59,7 @@ import {
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
 import { inspectPinnedOpenCodePluginSchemaFences } from "../lib/opencode-plugin-schema-fence";
-import { detectConfigPaths, getMagicContextLogPath } from "../lib/paths";
+import { detectConfigPaths } from "../lib/paths";
 import { confirm, intro, log, outro, selectOne, spinner, text } from "../lib/prompts";
 import {
     sanitizeDiagnosticEndpoint,
@@ -767,7 +769,13 @@ export async function runDoctor(
                 text: raw.text,
                 configPath: paths.magicContextConfig,
             }).text;
-            parse(substituted);
+            const parsed = parseJsoncRecovering(substituted);
+            const issue = parsed.issues[0];
+            if (issue) {
+                throw new Error(
+                    `${paths.magicContextConfig}:${issue.line}:${issue.column}: ${issue.message} (runtime recovery does not make the file valid)`,
+                );
+            }
             pass("magic-context.jsonc parses as valid JSONC");
         } catch (err) {
             fail(
@@ -1459,13 +1467,16 @@ export async function runDoctor(
 
     // 10. Show diagnostics info (log file, historian dumps)
 
-    const logPath = getMagicContextLogPath("opencode");
-    if (existsSync(logPath)) {
-        const logStat = statSync(logPath);
-        const sizeKb = (logStat.size / 1024).toFixed(0);
-        log.info(`Log file: ${logPath} (${sizeKb} KB)`);
+    const logFiles = inspectMagicContextLogs("opencode");
+    const existingLogFiles = logFiles.filter((file) => file.exists);
+    if (existingLogFiles.length === 0) {
+        log.info(
+            `No plugin log file yet; checked: ${logFiles.map((file) => file.path).join(", ")}`,
+        );
     } else {
-        log.info(`Log file: ${logPath} (not yet created)`);
+        for (const file of existingLogFiles) {
+            log.info(`Log file read: ${formatLogFileInspection(file)}`);
+        }
     }
 
     // Historian dumps live per-project under `<dir>/.cortexkit/magic-context/historian/`.

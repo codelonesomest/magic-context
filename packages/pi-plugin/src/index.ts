@@ -67,6 +67,7 @@ import { setCtxReduceRegisteredGlobally } from "@magic-context/core/hooks/magic-
 import {
 	deriveHistorianChunkTokens,
 	resolveHistorianContextLimit,
+	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import {
@@ -87,6 +88,11 @@ import {
 	markAnnouncementSeen,
 	shouldShowAnnouncement,
 } from "@magic-context/core/shared/announcement";
+import { seedSessionCacheTtlIfUnsynced } from "@magic-context/core/shared/cache-ttl-seed";
+import {
+	claimConfigParseFailuresOnce,
+	formatConfigParseNotice,
+} from "@magic-context/core/shared/config-diagnostics";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
@@ -164,7 +170,10 @@ import {
 } from "./omp-task-child-runtime";
 import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
-import { type PiHarnessKind, resolvePiHarnessKind } from "./pi-harness-kind";
+import {
+	type PiHarnessKind,
+	resolvePiHarnessDetection,
+} from "./pi-harness-kind";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
@@ -193,7 +202,8 @@ import {
 	setTodoSnapshot,
 } from "./tools/todo-view-pi";
 
-const PI_HARNESS_KIND = resolvePiHarnessKind();
+const PI_HARNESS_DETECTION = await resolvePiHarnessDetection();
+const PI_HARNESS_KIND = PI_HARNESS_DETECTION.kind;
 const PREFIX = `[magic-context][${PI_HARNESS_KIND}]`;
 const PI_BOOT_DEADLINE_MS = 15_000;
 
@@ -353,9 +363,10 @@ export function persistPiMessageEndModelMeta(args: {
 	if (!recordPiLiveModel(args.sessionId, modelKey, msg.timestamp)) return;
 	const cacheTtl = resolveCacheTtl(args.cacheTtlConfig, modelKey);
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
-	if (currentMeta.cacheTtl !== cacheTtl) {
-		updateSessionMeta(args.db, args.sessionId, { cacheTtl });
-	}
+	updateSessionMeta(args.db, args.sessionId, {
+		...(currentMeta.cacheTtl === cacheTtl ? {} : { cacheTtl }),
+		lastObservedModelKey: modelKey,
+	});
 }
 
 type TodoOverlayUpdater = { update: (sessionId?: string) => void };
@@ -715,6 +726,7 @@ export function resolveHistorianFromConfig(
 		model,
 		fallbackModels,
 		historianChunkTokens,
+		historianContextLimit: resolveKnownHistorianContextLimit(model),
 		timeoutMs: config.historian_timeout_ms,
 		temperature: historian?.temperature,
 		maxOutputTokens: historian?.maxTokens ?? 32_000,
@@ -1005,10 +1017,16 @@ async function startPiMagicContextRuntime(
 	// them in the magic-context log. Loading never throws — bad config
 	// gracefully degrades to defaults.
 	ensureConfigLocationsMigrated(projectDir);
-	const { config, warnings, loadedFromPaths, registrationPromptSurface } =
-		loadPiConfig({
-			cwd: projectDir,
-		});
+	const {
+		config,
+		warnings,
+		loadedFromPaths,
+		registrationPromptSurface,
+		configParseFailures,
+		cacheTtlConfigured,
+	} = loadPiConfig({
+		cwd: projectDir,
+	});
 	const promptSurfaceRuntime = createPromptSurfaceRuntime({
 		harness: PI_HARNESS_KIND,
 		directory: projectDir,
@@ -1021,7 +1039,7 @@ async function startPiMagicContextRuntime(
 		"";
 	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
 	info(
-		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} | db=${dbPath} | ` +
+		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} (via ${PI_HARNESS_DETECTION.via}) | db=${dbPath} | ` +
 			`project=${projectIdentity} | dir=${projectDir}`,
 	);
 	// Pi tools are registered once per process, so this mode is intentionally
@@ -1094,6 +1112,8 @@ async function startPiMagicContextRuntime(
 		sidekickConfig: PiSidekickConfig | undefined;
 		dreamerConfig: DreamerConfig | undefined;
 		dreamerEnabled: boolean;
+		configParseFailures: typeof configParseFailures;
+		cacheTtlConfigured: boolean;
 	};
 
 	// Per-cwd runtime deps. Pi can switch projects mid-process (`/cd`,
@@ -1162,6 +1182,10 @@ async function startPiMagicContextRuntime(
 		dir: string,
 		identity: string,
 		cfg: MagicContextConfig,
+		loadMetadata: {
+			configParseFailures: typeof configParseFailures;
+			cacheTtlConfigured: boolean;
+		},
 	): ResolvedPiProjectDeps {
 		const hist = resolveHistorianFromConfig(cfg);
 		if (hist) {
@@ -1185,6 +1209,8 @@ async function startPiMagicContextRuntime(
 			sidekickConfig: resolveSidekickFromConfig(cfg),
 			dreamerConfig: resolveDreamerFromConfig(cfg),
 			dreamerEnabled: isDreamerRunnable(cfg),
+			configParseFailures: loadMetadata.configParseFailures,
+			cacheTtlConfigured: loadMetadata.cacheTtlConfigured,
 		};
 	}
 
@@ -1210,7 +1236,10 @@ async function startPiMagicContextRuntime(
 				switchedConfig.allow_home_project,
 			) ??
 			"";
-		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
+		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig, {
+			configParseFailures: switchedLoad.configParseFailures,
+			cacheTtlConfigured: switchedLoad.cacheTtlConfigured,
+		});
 		projectDepsByDir.set(dir, built);
 		return built;
 	}
@@ -1227,7 +1256,15 @@ async function startPiMagicContextRuntime(
 		return resolveProjectDepsForDir(dir).contextOptions;
 	}
 
-	const bootProjectDeps = buildProjectDeps(projectDir, projectIdentity, config);
+	const bootProjectDeps = buildProjectDeps(
+		projectDir,
+		projectIdentity,
+		config,
+		{
+			configParseFailures,
+			cacheTtlConfigured,
+		},
+	);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
 	// OMP Task children are created in-process and reload this extension. Keep
 	// lifecycle attestation on the process-owned primary runtime, independent of
@@ -1360,6 +1397,25 @@ async function startPiMagicContextRuntime(
 		const current = resolveCurrentProjectDeps(ctx);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
+		const failuresToShow = claimConfigParseFailuresOnce(
+			"pi",
+			current.configParseFailures,
+		);
+		if (ctx.hasUI && failuresToShow.length > 0) {
+			ctx.ui.notify(formatConfigParseNotice(failuresToShow), "error");
+		}
+
+		const sessionId = resolveSessionId(ctx);
+		const model = ctx.model;
+		if (sessionId && model?.provider && model.id) {
+			seedSessionCacheTtlIfUnsynced({
+				db,
+				sessionId,
+				configured: current.config.cache_ttl,
+				modelKey: canonicalPiModelKey(model.provider, model.id),
+			});
+		}
+
 		await handlePiCloneSessionStart(event, ctx, {
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
@@ -1441,6 +1497,9 @@ async function startPiMagicContextRuntime(
 			scheduleSummary: summarizeDreamSchedule(bootProjectDeps.config.dreamer),
 		},
 		activeProfile: bootProjectDeps.config.profile,
+		cacheTtlConfig: bootProjectDeps.config.cache_ttl,
+		cacheTtlConfigured: bootProjectDeps.cacheTtlConfigured,
+		configParseFailures: bootProjectDeps.configParseFailures,
 		resolveStatusDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			return {
@@ -1457,6 +1516,9 @@ async function startPiMagicContextRuntime(
 					scheduleSummary: summarizeDreamSchedule(current.config.dreamer),
 				},
 				activeProfile: current.config.profile,
+				cacheTtlConfig: current.config.cache_ttl,
+				cacheTtlConfigured: current.cacheTtlConfigured,
+				configParseFailures: current.configParseFailures,
 			};
 		},
 	});

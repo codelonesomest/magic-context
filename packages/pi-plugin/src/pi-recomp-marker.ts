@@ -4,7 +4,10 @@ import {
 	clearPendingPiCompactionMarkerStateIf,
 	setPendingPiCompactionMarkerState,
 } from "@magic-context/core/features/magic-context/storage";
-import { applyDeferredPiCompactionMarker } from "./compaction-marker-manager-pi";
+import {
+	applyDeferredPiCompactionMarker,
+	resolvePiAppendCompaction,
+} from "./compaction-marker-manager-pi";
 import { signalPiDeferredHistoryRefresh } from "./context-handler";
 import {
 	buildPiCompactionSummary,
@@ -133,32 +136,6 @@ export function queueAndApplyPiRecompMarker(args: {
 	) {
 		signalPiDeferredHistoryRefresh(args.sessionId);
 	}
-}
-
-function resolvePiAppendCompaction(
-	ctx: unknown,
-):
-	| ((
-			summary: string,
-			firstKeptEntryId: string,
-			tokensBefore: number,
-			details?: unknown,
-			fromHook?: boolean,
-	  ) => string | undefined)
-	| undefined {
-	const sm = (ctx as { sessionManager?: unknown })?.sessionManager as
-		| {
-				appendCompaction?: (
-					summary: string,
-					firstKeptEntryId: string,
-					tokensBefore: number,
-					details?: unknown,
-					fromHook?: boolean,
-				) => string | undefined;
-		  }
-		| undefined;
-	if (typeof sm?.appendCompaction !== "function") return undefined;
-	return sm.appendCompaction.bind(sm);
 }
 
 function resolvePiReadBranchEntries(

@@ -1,3 +1,4 @@
+import type { MagicContextConfig } from "../../config/schema/magic-context";
 import {
     clearSessionTracking,
     scheduleIncrementalIndex,
@@ -21,6 +22,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
 import type { PluginContext } from "../../plugin/types";
+import { seedSessionCacheTtlIfUnsynced } from "../../shared/cache-ttl-seed";
 import { sessionLog } from "../../shared/logger";
 import { clearAutoSearchForSession } from "./auto-search-runner";
 import type { CommandExecuteInput, CommandExecuteOutput } from "./command-handler";
@@ -193,6 +195,7 @@ export function createChatMessageHook(args: {
     upgradeReminder?: (sessionId: string) => Promise<void>;
     /** The native slash-command handler, reused when Desktop removes the slash. */
     commandHandler?: MagicContextCommandHandler;
+    cacheTtlConfig?: MagicContextConfig["cache_ttl"];
 }) {
     return async (
         input: {
@@ -245,6 +248,14 @@ export function createChatMessageHook(args: {
                 providerID: input.model.providerID,
                 modelID: input.model.modelID,
             });
+            if (args.cacheTtlConfig) {
+                seedSessionCacheTtlIfUnsynced({
+                    db: args.db,
+                    sessionId,
+                    configured: args.cacheTtlConfig,
+                    modelKey: `${input.model.providerID}/${input.model.modelID}`,
+                });
+            }
         }
 
         // The tool-heavy "sticky turn reminder" was replaced by the in-turn
@@ -262,9 +273,9 @@ export function createChatMessageHook(args: {
             previousVariant !== input.variant
         ) {
             // Variant changes alter cached thinking blocks on some models. Fable
-            // 5.1 instead applies effort only at message boundaries, leaving the
-            // existing prefix unchanged. Use both live IDs to decide; if either is
-            // unknown, leave the cache unchanged rather than flushing speculatively.
+            // 5.1 and GPT-6 Astra carry effort outside the cached prefix, leaving
+            // existing prompt bytes unchanged. Use both live IDs to decide; if either
+            // is unknown, leave the cache unchanged rather than flushing speculatively.
             const liveModel = args.liveModelBySession.get(sessionId);
             const providerID = input.model?.providerID ?? liveModel?.providerID;
             const modelID = input.model?.modelID ?? liveModel?.modelID;
